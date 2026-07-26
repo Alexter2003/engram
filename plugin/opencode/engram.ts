@@ -478,11 +478,14 @@ export const Engram: Plugin = async (ctx) => {
           return
         }
 
-        // No observations yet — nothing to nudge about
-        if (lastObsEpoch === 0) return
-
-        // Only nudge if last save was more than 15 minutes ago
-        if (nowSecs - lastObsEpoch < 900) return
+        // No observations exist yet for this project. This is the "never
+        // saved" case, not "session just started" (session age was already
+        // gated to >= 5 minutes above) — treat it as maximally stale so the
+        // nudge can fire and break the cycle where a project with zero
+        // observations can never reach its first one.
+        //
+        // Only nudge if last save was more than 15 minutes ago (or never).
+        if (lastObsEpoch !== 0 && nowSecs - lastObsEpoch < 900) return
 
         // Append the nudge to the last system message
         const nudge =

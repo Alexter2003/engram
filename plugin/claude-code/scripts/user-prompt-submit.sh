@@ -148,9 +148,14 @@ parse_epoch() {
     date -j -u -f "%Y-%m-%dT%H:%M:%S" "$Z_TS" "+%s" 2>/dev/null && return 0
   fi
 
-  date -j -f "%Y-%m-%dT%H:%M:%S" "$TS" "+%s" 2>/dev/null \
-    || date -j -f "%Y-%m-%d %H:%M:%S" "$TS" "+%s" 2>/dev/null \
-    || date -d "$TS" "+%s" 2>/dev/null
+  # No timezone marker at all — these are naive timestamps from sqlite's
+  # datetime('now'), which is always UTC. Must parse with -u; parsing as
+  # local time skews the result by the host's UTC offset (e.g. on a UTC-6
+  # host, session age comes out ~6h in the future, so it's always seen as
+  # "just started" and the save-nudge can never fire).
+  date -j -u -f "%Y-%m-%dT%H:%M:%S" "$TS" "+%s" 2>/dev/null \
+    || date -j -u -f "%Y-%m-%d %H:%M:%S" "$TS" "+%s" 2>/dev/null \
+    || date -u -d "$TS" "+%s" 2>/dev/null
 }
 
 # Default: no injection
@@ -238,20 +243,24 @@ fi
 
 LAST_SAVE_AT=$(echo "$LAST_SAVE_JSON" | jq -r '.[0].created_at // empty' 2>/dev/null)
 
-if [ -z "$LAST_SAVE_AT" ]; then
-  # No observations yet — no nudge (session might just be starting)
-  echo "$OUTPUT"
-  exit 0
-fi
-
-# Parse last save timestamp and compare to now
-LAST_EPOCH=$(parse_epoch "$LAST_SAVE_AT")
-if [ -z "$LAST_EPOCH" ]; then
-  echo "$OUTPUT"
-  exit 0
-fi
 NOW_EPOCH=$(date "+%s")
-ELAPSED=$(( NOW_EPOCH - LAST_EPOCH ))
+
+if [ -z "$LAST_SAVE_AT" ]; then
+  # No observations exist yet for this project. This is the "never saved"
+  # case, not "session just started" (session age was already gated to
+  # >= 5 minutes above) — treat it as maximally stale so the nudge can fire
+  # and break the cycle where a project with zero observations can never
+  # reach its first one.
+  ELAPSED=901
+else
+  # Parse last save timestamp and compare to now
+  LAST_EPOCH=$(parse_epoch "$LAST_SAVE_AT")
+  if [ -z "$LAST_EPOCH" ]; then
+    echo "$OUTPUT"
+    exit 0
+  fi
+  ELAPSED=$(( NOW_EPOCH - LAST_EPOCH ))
+fi
 
 # Nudge if last save was > 15 minutes ago (900 seconds), but debounce so we do
 # not repeat the reminder on every message while the agent has nothing to save.
