@@ -327,8 +327,15 @@ func (s *Server) handleAddObservation(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
-	if body.SessionID == "" || body.Title == "" || body.Content == "" {
-		jsonError(w, http.StatusBadRequest, "session_id, title, and content are required")
+	// Validate the title before the session lookup so a bad session or project
+	// cannot mask the documented title-validation 400 (#459). A whitespace-only
+	// title survives a raw `== ""` check, so it needs the shared predicate.
+	if err := store.ValidateObservationTitle(body.Title); err != nil {
+		jsonError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if body.SessionID == "" || body.Content == "" {
+		jsonError(w, http.StatusBadRequest, "session_id and content are required")
 		return
 	}
 	if !s.validateSessionProject(w, body.SessionID, body.Project) {

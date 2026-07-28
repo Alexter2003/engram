@@ -2201,3 +2201,59 @@ func TestHandleAddObservationRejectsBlankTitle(t *testing.T) {
 		t.Fatalf("expected 0 onWrite calls for rejected writes, got %d", writeCount.Load())
 	}
 }
+
+// TestHandleAddObservationBlankTitleNotMaskedBySessionError pins that the title
+// check runs before the session/project lookup. A whitespace-only title passes
+// the raw required-fields check, so before #459's follow-up the request was
+// answered with the session error instead of the documented title 400.
+func TestHandleAddObservationBlankTitleNotMaskedBySessionError(t *testing.T) {
+	st := newServerTestStore(t)
+	srv := New(st, 0)
+	h := srv.Handler()
+
+	var writeCount atomic.Int32
+	srv.SetOnWrite(func() { writeCount.Add(1) })
+
+	// Exists, but bound to a different project than the request claims.
+	if err := st.CreateSession("s-mismatched", "engram", t.TempDir()); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{
+			name: "nonexistent session",
+			body: `{"session_id":"s-does-not-exist","type":"note","title":"   ","content":"body","project":"engram"}`,
+		},
+		{
+			name: "mismatched project",
+			body: `{"session_id":"s-mismatched","type":"note","title":"   ","content":"body","project":"other"}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/observations", strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d (%s)", rec.Code, rec.Body.String())
+			}
+
+			var resp map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode response: %v (body %s)", err, rec.Body.String())
+			}
+			msg, _ := resp["error"].(string)
+			if msg != store.ErrObservationTitleRequired.Error() {
+				t.Fatalf("expected the title error, got %q — the session lookup masked it", msg)
+			}
+		})
+	}
+
+	if writeCount.Load() != 0 {
+		t.Fatalf("expected 0 onWrite calls for rejected writes, got %d", writeCount.Load())
+	}
+}
