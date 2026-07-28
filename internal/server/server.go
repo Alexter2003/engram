@@ -337,6 +337,11 @@ func (s *Server) handleAddObservation(w http.ResponseWriter, r *http.Request) {
 
 	id, err := s.store.AddObservation(body)
 	if err != nil {
+		// A titleless observation is a client mistake, not a server failure.
+		if errors.Is(err, store.ErrObservationTitleRequired) {
+			jsonError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

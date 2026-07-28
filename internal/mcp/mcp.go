@@ -1195,6 +1195,11 @@ func handleSave(s *store.Store, cfg MCPConfig, activity *SessionActivity) server
 		if strings.TrimSpace(content) == "" {
 			return mcp.NewToolResultError("content is required for mem_save (use content, or observation for backward-compatible clients)"), nil
 		}
+		// Reject titleless saves before any project resolution or session
+		// creation (#459). The store applies the same rule as a backstop.
+		if err := store.ValidateObservationTitle(title); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 		typ, _ := req.GetArguments()["type"].(string)
 		sessionID, _ := req.GetArguments()["session_id"].(string)
 		scope, _ := req.GetArguments()["scope"].(string)

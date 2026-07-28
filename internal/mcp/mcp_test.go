@@ -7452,3 +7452,60 @@ func TestHandleSearch_MatchModeInvalidError(t *testing.T) {
 		t.Fatalf("parameter-validation error must not contain query-advice suffix \"Try simpler keywords\", got: %s", text)
 	}
 }
+
+// TestHandleSaveRejectsEmptyTitle pins that mem_save refuses a titleless save
+// (#459) instead of persisting an observation whose cloud upsert would block
+// the project's mutation queue.
+func TestHandleSaveRejectsEmptyTitle(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		title any
+	}{
+		{"missing title", nil},
+		{"empty title", ""},
+		{"whitespace only title", "   "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newMCPTestStore(t)
+			h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+
+			args := map[string]any{
+				"content": "Body that would otherwise be saved",
+				"type":    "note",
+				"project": "engram",
+			}
+			if tc.title != nil {
+				args["title"] = tc.title
+			}
+
+			res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: args}})
+			if err != nil {
+				t.Fatalf("handler error: %v", err)
+			}
+			if !res.IsError {
+				t.Fatalf("expected tool error, got %q", callResultText(t, res))
+			}
+			if !strings.Contains(callResultText(t, res), "observation title is required") {
+				t.Fatalf("unexpected error text: %q", callResultText(t, res))
+			}
+
+			obs, err := s.RecentObservations("engram", "project", 5)
+			if err != nil {
+				t.Fatalf("recent observations: %v", err)
+			}
+			if len(obs) != 0 {
+				t.Fatalf("expected no observation persisted, got %#v", obs)
+			}
+
+			mutations, err := s.ListPendingSyncMutations(store.DefaultSyncTargetKey, 100)
+			if err != nil {
+				t.Fatalf("list pending sync mutations: %v", err)
+			}
+			for _, mutation := range mutations {
+				if mutation.Entity == store.SyncEntityObservation {
+					t.Fatalf("expected no observation mutation enqueued, got %#v", mutation)
+				}
+			}
+		})
+	}
+}

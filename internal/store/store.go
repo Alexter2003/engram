@@ -2256,6 +2256,15 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 	title := stripPrivateTags(p.Title)
 	content := stripPrivateTags(p.Content)
 
+	// Reject titleless observations before any persistence. The check runs on
+	// the post-strip title so redaction cannot turn a valid title into an empty
+	// one behind our back. Persisting an empty title also enqueues a cloud
+	// observation upsert that the sync validators reject, which blocks every
+	// later mutation for the project.
+	if err := ValidateObservationTitle(title); err != nil {
+		return 0, err
+	}
+
 	if len(content) > s.cfg.MaxObservationLength {
 		content = content[:s.cfg.MaxObservationLength] + "... [truncated]"
 	}

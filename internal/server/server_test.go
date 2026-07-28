@@ -2168,3 +2168,36 @@ func TestMigrateProjectCaseOnlySkipped(t *testing.T) {
 		t.Fatalf("expected status=skipped for case-only difference, got %v (full response: %#v)", resp["status"], resp)
 	}
 }
+
+// TestHandleAddObservationRejectsBlankTitle pins that POST /observations answers
+// 400 (client mistake) rather than 500 or 201 when the title is blank (#459).
+func TestHandleAddObservationRejectsBlankTitle(t *testing.T) {
+	st := newServerTestStore(t)
+	srv := New(st, 0)
+	h := srv.Handler()
+
+	var writeCount atomic.Int32
+	srv.SetOnWrite(func() { writeCount.Add(1) })
+
+	if err := st.CreateSession("s-blank-title", "engram", t.TempDir()); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	for _, body := range []string{
+		`{"session_id":"s-blank-title","type":"note","title":"","content":"body","project":"engram"}`,
+		`{"session_id":"s-blank-title","type":"note","title":"   ","content":"body","project":"engram"}`,
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/observations", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("body %s: expected 400, got %d (%s)", body, rec.Code, rec.Body.String())
+		}
+	}
+
+	if writeCount.Load() != 0 {
+		t.Fatalf("expected 0 onWrite calls for rejected writes, got %d", writeCount.Load())
+	}
+}

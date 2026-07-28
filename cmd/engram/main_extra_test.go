@@ -4325,3 +4325,24 @@ func TestCmdMCPAutosyncPollTickerPullsDuringServe(t *testing.T) {
 		t.Fatalf("expected MCP autosync poll ticker proof to complete cleanly, panic=%v stderr=%q", recovered, stderr)
 	}
 }
+
+// TestCmdSaveRejectsEmptyTitle pins that `engram save` exits non-zero with an
+// actionable message instead of persisting a titleless observation (#459).
+func TestCmdSaveRejectsEmptyTitle(t *testing.T) {
+	cfg := testConfig(t)
+	stubExitWithPanic(t)
+
+	for _, title := range []string{"", "   "} {
+		withArgs(t, "engram", "save", title, "content body")
+		_, stderr, recovered := captureOutputAndRecover(t, func() { cmdSave(cfg) })
+		if _, ok := recovered.(exitCode); !ok {
+			t.Fatalf("title %q: expected exit panic, got %v", title, recovered)
+		}
+		if !strings.Contains(stderr, "observation title is required") {
+			t.Fatalf("title %q: stderr missing title guard message: %q", title, stderr)
+		}
+		if !strings.Contains(stderr, "cloud sync") {
+			t.Fatalf("title %q: stderr should explain the cloud sync impact: %q", title, stderr)
+		}
+	}
+}

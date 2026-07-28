@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -129,6 +130,31 @@ func (s *Store) listPendingProjectMutationsTxLike(q rowQuerier, project string) 
 	return mutations, rows.Err()
 }
 
+// ErrObservationTitleRequired is returned by write paths that would otherwise
+// persist an observation without a usable title. Cloud sync rejects observation
+// upserts whose payload carries an empty title, and because the mutation queue
+// is an ordered log, a single rejected row blocks every later mutation for the
+// same project.
+var ErrObservationTitleRequired = errors.New("observation title is required: an empty or whitespace-only title is rejected by cloud sync and would block every later mutation for the project")
+
+// observationTitleIsPresent is the single definition of "an observation upsert
+// has a title". Both ValidateSyncMutationPayload (pull/doctor side) and
+// ValidateObservationTitle (write side) call it so the rule lives in one place.
+func observationTitleIsPresent(title string) bool {
+	return strings.TrimSpace(title) != ""
+}
+
+// ValidateObservationTitle enforces, before persistence, the same non-empty
+// title rule that ValidateSyncMutationPayload enforces for observation upserts.
+// It returns ErrObservationTitleRequired when the title is empty or
+// whitespace-only.
+func ValidateObservationTitle(title string) error {
+	if !observationTitleIsPresent(title) {
+		return ErrObservationTitleRequired
+	}
+	return nil
+}
+
 // ValidateSyncMutationPayload performs pure required-field validation for sync
 // payloads. It is intentionally conservative: malformed/empty/unsupported
 // payloads are reported as manual blocks, while complete payloads return an
@@ -184,7 +210,9 @@ func ValidateSyncMutationPayload(entity, op, payload, entityKey string) SyncMuta
 		if op == SyncOpUpsert {
 			require("session_id")
 			require("type")
-			require("title")
+			if !observationTitleIsPresent(field("title")) {
+				missing = append(missing, "title")
+			}
 			require("content")
 			require("scope")
 		}

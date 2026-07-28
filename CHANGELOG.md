@@ -21,6 +21,10 @@ Breaking changes are always marked with a `type:breaking-change` label and docum
 
 <!-- Changes that are merged but not yet released are tracked here until the next tag. -->
 
+### Memory core
+
+- **fix(store):** reject empty or whitespace-only observation titles at write time (`engram save`, `mem_save`, `POST /observations`, `store.AddObservation`). Persisting a titleless observation also enqueued a cloud upsert that sync validators reject, which blocked every later mutation for the project.
+
 ### Cloud sync
 
 - **fix(cloud):** make chunk and mutation push payload limits configurable with `ENGRAM_CLOUD_MAX_PUSH_BYTES` while preserving the 8 MiB default.
