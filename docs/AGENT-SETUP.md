@@ -88,6 +88,8 @@ Other write tools still primarily use cwd/repo detection unless their schema say
 
 OpenCode binds `mem_save`, `mem_save_prompt`, `mem_session_summary`, and `mem_capture_passive` to its confirmed top-level runtime session and maps subagents to their authoritative parent.
 
+Pi's native HTTP wrappers use only `ctx.sessionManager.getSessionId()` for session-attributed writes. Model-supplied session IDs are ignored, and a missing or unconfirmed runtime ID fails safely.
+
 To lock write tools to the canonical project for a repo, add `.engram/config.json` at the repo root:
 
 ```json
