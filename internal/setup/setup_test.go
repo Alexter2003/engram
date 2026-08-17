@@ -1,6 +1,7 @@
 package setup
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"os"
@@ -10,6 +11,20 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestEmbeddedOpenCodePluginMatchesSourceByteForByte(t *testing.T) {
+	source, err := os.ReadFile(filepath.Join("..", "..", "plugin", "opencode", "engram.ts"))
+	if err != nil {
+		t.Fatalf("read OpenCode source plugin: %v", err)
+	}
+	embedded, err := os.ReadFile(filepath.Join("plugins", "opencode", "engram.ts"))
+	if err != nil {
+		t.Fatalf("read embedded OpenCode plugin: %v", err)
+	}
+	if !bytes.Equal(source, embedded) {
+		t.Fatal("embedded OpenCode plugin drifted from plugin/opencode/engram.ts; regenerate the embedded copy")
+	}
+}
 
 func resetSetupSeams(t *testing.T) {
 	t.Helper()
@@ -3400,7 +3415,7 @@ func TestInstallOpenCodeBakesENGRAMBIN(t *testing.T) {
 // contains the necessary logic to:
 //
 //	a) read session data from event.properties.info (not event.properties)
-//	b) suppress Task() sub-agent sessions via parentID or title suffix check
+//	b) suppress child sessions only when authoritative parentID is present
 //	c) track sub-agent IDs in subAgentSessions for cross-hook suppression
 func TestPluginSubAgentFiltering(t *testing.T) {
 	resetSetupSeams(t)
@@ -3430,9 +3445,9 @@ func TestPluginSubAgentFiltering(t *testing.T) {
 		t.Fatalf("plugin must check parentID to detect sub-agent sessions")
 	}
 
-	// b) title suffix check: secondary signal for sub-agent detection
-	if !strings.Contains(content, `subagent)`) {
-		t.Fatalf("plugin must check title suffix ' subagent)' as secondary sub-agent signal")
+	// b) Titles are descriptive only and must not determine session ownership.
+	if strings.Contains(content, `title.endsWith(" subagent)")`) {
+		t.Fatal("plugin must not use title suffixes to detect child sessions")
 	}
 
 	// b) isSubAgent gate: must guard ensureSession() call
@@ -3450,8 +3465,19 @@ func TestPluginSubAgentFiltering(t *testing.T) {
 		t.Fatalf("ensureSession must check subAgentSessions before registering")
 	}
 
-	// session.deleted must clean up subAgentSessions too
-	if !strings.Contains(content, `subAgentSessions.delete(sessionId)`) {
-		t.Fatalf("session.deleted handler must clean up subAgentSessions set")
+	// session.deleted must invalidate the full hierarchy, retaining tombstones
+	// while clearing every invalidated session from runtime caches.
+	for _, snippet := range []string{
+		`invalidateSessionTree(sessionId)`,
+		`invalidSessions.add(invalidID)`,
+		`knownSessions.delete(invalidID)`,
+		`subAgentSessions.delete(invalidID)`,
+		`parentSessions.delete(invalidID)`,
+		`toolCounts.delete(invalidID)`,
+		`lastNudgeTime.delete(invalidID)`,
+	} {
+		if !strings.Contains(content, snippet) {
+			t.Fatalf("session.deleted hierarchy invalidation must contain %q", snippet)
+		}
 	}
 }
