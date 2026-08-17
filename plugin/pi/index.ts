@@ -414,17 +414,33 @@ let projectResolutionError: string | undefined;
 let projectDetectionPending = false;
 
 const knownSessions = new Set<string>();
+const sessionRegistrationsInFlight = new Map<string, Promise<void>>();
 const toolCounts = new Map<string, number>();
 
 async function ensureSession(sessionId: string, sessionProject = project): Promise<void> {
   const key = `${sessionProject}:${sessionId}`;
   if (!sessionId || knownSessions.has(key)) return;
-  const body: SessionBody = { id: sessionId, project: sessionProject, directory };
-  const acknowledgement = await engramFetch("/sessions", { method: "POST", body });
-  if (acknowledgement === null) {
-    throw new Error(`gentle-engram could not confirm session registration for Pi runtime session ${sessionId}`);
+
+  const existingRegistration = sessionRegistrationsInFlight.get(key);
+  if (existingRegistration) return existingRegistration;
+
+  const registration = (async () => {
+    const body: SessionBody = { id: sessionId, project: sessionProject, directory };
+    const acknowledgement = await engramFetch("/sessions", { method: "POST", body });
+    if (acknowledgement === null) {
+      throw new Error(`gentle-engram could not confirm session registration for Pi runtime session ${sessionId}`);
+    }
+    knownSessions.add(key);
+  })();
+  sessionRegistrationsInFlight.set(key, registration);
+
+  try {
+    await registration;
+  } finally {
+    if (sessionRegistrationsInFlight.get(key) === registration) {
+      sessionRegistrationsInFlight.delete(key);
+    }
   }
-  knownSessions.add(key);
 }
 
 async function detectServerProject(cwd: string): Promise<CurrentProjectResponse | undefined> {

@@ -105,14 +105,18 @@ function buildScheduleEngramSelfHealForTest({ waitUnref, isEngramRunning, maxAtt
 
 function buildEnsureSessionForTest(engramFetch) {
   const body = extractFunctionBody("ensureSession", "{\n  const key")
-    .replace("const body: SessionBody", "const body")
-  const factory = new Function("knownSessions", "engramFetch", "project", "directory", `
+    .replace("const body: SessionBody", "const body");
+  const factory = new Function("knownSessions", "sessionRegistrationsInFlight", "engramFetch", "project", "directory", `
     return async function ensureSession(sessionId, sessionProject = project) {
       ${body}
     };
   `);
   const knownSessions = new Set();
-  return { ensureSession: factory(knownSessions, engramFetch, "engram", "/work/engram"), knownSessions };
+  const sessionRegistrationsInFlight = new Map();
+  return {
+    ensureSession: factory(knownSessions, sessionRegistrationsInFlight, engramFetch, "engram", "/work/engram"),
+    knownSessions,
+  };
 }
 
 function sessionCtx(id, sink) {
