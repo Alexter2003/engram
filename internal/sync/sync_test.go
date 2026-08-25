@@ -949,6 +949,10 @@ func TestUpgradeBootstrapCheckpointResume(t *testing.T) {
 		Project:     "proj-a",
 		Stage:       store.UpgradeStageBootstrapEnrolled,
 		RepairClass: store.UpgradeRepairClassRepairable,
+		Snapshot: store.CloudUpgradeSnapshot{
+			Captured:        true,
+			ProjectEnrolled: false,
+		},
 	}); err != nil {
 		t.Fatalf("seed checkpoint stage: %v", err)
 	}
@@ -976,6 +980,21 @@ func TestUpgradeBootstrapCheckpointResume(t *testing.T) {
 	if transport.writeChunkCalls != writeCallsBefore {
 		t.Fatalf("expected no additional push writes on rerun, before=%d after=%d", writeCallsBefore, transport.writeChunkCalls)
 	}
+
+	state, err := s.GetCloudUpgradeState("proj-a")
+	if err != nil {
+		t.Fatalf("load checkpoint state: %v", err)
+	}
+	if state == nil || !state.Snapshot.Captured || state.Snapshot.ProjectEnrolled {
+		t.Fatalf("expected checkpoints to preserve the pre-bootstrap snapshot, got %+v", state)
+	}
+	var snapshotJSON string
+	if err := s.DB().QueryRow(`SELECT snapshot_json FROM cloud_upgrade_state WHERE project = ?`, "proj-a").Scan(&snapshotJSON); err != nil {
+		t.Fatalf("read persisted checkpoint snapshot: %v", err)
+	}
+	if strings.Contains(snapshotJSON, `"token"`) || strings.Contains(snapshotJSON, "cloud_config") {
+		t.Fatalf("checkpoint persisted credential material: %s", snapshotJSON)
+	}
 }
 
 func TestRollbackProjectInvokesAutosyncHooksAndHonorsBoundary(t *testing.T) {
@@ -985,8 +1004,8 @@ func TestRollbackProjectInvokesAutosyncHooksAndHonorsBoundary(t *testing.T) {
 		Stage:       store.UpgradeStageBootstrapPushed,
 		RepairClass: store.UpgradeRepairClassRepairable,
 		Snapshot: store.CloudUpgradeSnapshot{
-			CloudConfigPresent: true,
-			ProjectEnrolled:    false,
+			Captured:        true,
+			ProjectEnrolled: false,
 		},
 	}); err != nil {
 		t.Fatalf("seed rollback state: %v", err)

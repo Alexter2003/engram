@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"net/url"
@@ -498,7 +497,7 @@ func cmdCloudUpgradeBootstrap(cfg store.Config) {
 		return
 	}
 	cc.ServerURL = validatedURL
-	if err := captureUpgradeSnapshotBeforeBootstrap(s, cfg, project); err != nil {
+	if err := captureUpgradeSnapshotBeforeBootstrap(s, project); err != nil {
 		fatal(err)
 		return
 	}
@@ -528,14 +527,14 @@ func cmdCloudUpgradeBootstrap(cfg store.Config) {
 	fmt.Printf("noop: %t\n", result.NoOp)
 }
 
-func captureUpgradeSnapshotBeforeBootstrap(s *store.Store, cfg store.Config, project string) error {
+func captureUpgradeSnapshotBeforeBootstrap(s *store.Store, project string) error {
 	state, err := s.GetCloudUpgradeState(project)
 	if err != nil {
 		return fmt.Errorf("load cloud upgrade state before bootstrap snapshot: %w", err)
 	}
 	if state != nil {
 		snapshot := state.Snapshot
-		if snapshot.CloudConfigPresent || strings.TrimSpace(snapshot.CloudConfigJSON) != "" || snapshot.ProjectEnrolled {
+		if snapshot.Captured {
 			return nil
 		}
 	}
@@ -545,15 +544,7 @@ func captureUpgradeSnapshotBeforeBootstrap(s *store.Store, cfg store.Config, pro
 		return fmt.Errorf("load project enrollment before bootstrap snapshot: %w", err)
 	}
 
-	var snapshot store.CloudUpgradeSnapshot
-	configBytes, err := os.ReadFile(cloudConfigPath(cfg))
-	if err == nil {
-		snapshot.CloudConfigPresent = true
-		snapshot.CloudConfigJSON = string(configBytes)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("read cloud config for bootstrap snapshot: %w", err)
-	}
-	snapshot.ProjectEnrolled = enrolled
+	snapshot := store.CloudUpgradeSnapshot{Captured: true, ProjectEnrolled: enrolled}
 
 	next := store.CloudUpgradeState{Project: project, Stage: store.UpgradeStagePlanned, RepairClass: store.UpgradeRepairClassNone, Snapshot: snapshot}
 	if state != nil {
@@ -629,14 +620,6 @@ func cmdCloudUpgradeRollback(cfg store.Config) {
 		fmt.Fprintln(os.Stderr, "rollback is unavailable post-bootstrap; use explicit disconnect/unenroll flows")
 		exitFunc(1)
 		return
-	}
-	if state.Snapshot.CloudConfigPresent {
-		if err := os.WriteFile(cloudConfigPath(cfg), []byte(state.Snapshot.CloudConfigJSON), 0o644); err != nil {
-			fatal(err)
-			return
-		}
-	} else {
-		_ = os.Remove(cloudConfigPath(cfg))
 	}
 	rolledBack, err := engramsync.RollbackProject(s, engramsync.UpgradeRollbackOptions{Project: project})
 	if err != nil {

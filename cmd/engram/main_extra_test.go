@@ -1139,11 +1139,8 @@ func TestCmdCloudUpgradeBootstrapStatusAndRollbackSemantics(t *testing.T) {
 			if state == nil {
 				return nil, fmt.Errorf("expected pre-bootstrap state snapshot")
 			}
-			if !state.Snapshot.CloudConfigPresent {
-				return nil, fmt.Errorf("expected snapshot cloud config presence to be true")
-			}
-			if !strings.Contains(state.Snapshot.CloudConfigJSON, "cloud.example.test") {
-				return nil, fmt.Errorf("expected snapshot cloud config json to include configured server")
+			if !state.Snapshot.Captured {
+				return nil, fmt.Errorf("expected pre-bootstrap snapshot to be captured")
 			}
 			if state.Snapshot.ProjectEnrolled {
 				return nil, fmt.Errorf("expected snapshot to preserve pre-bootstrap unenrolled state")
@@ -1164,6 +1161,36 @@ func TestCmdCloudUpgradeBootstrapStatusAndRollbackSemantics(t *testing.T) {
 			t.Fatalf("expected verified bootstrap stage output, got %q", stdout)
 		}
 	})
+}
+
+func TestCmdCloudUpgradeBootstrapSnapshotExcludesCloudCredentials(t *testing.T) {
+	stubExitWithPanic(t)
+	stubRuntimeHooks(t)
+
+	const token = "test-bootstrap-token-must-not-reach-sqlite"
+	cfg := testConfig(t)
+	if err := saveCloudConfig(cfg, &cloudConfig{ServerURL: "https://cloud.example.test", Token: token}); err != nil {
+		t.Fatalf("save cloud config: %v", err)
+	}
+
+	oldBootstrap := runUpgradeBootstrap
+	runUpgradeBootstrap = func(s *store.Store, project string, _ *cloudConfig) (*engramsync.UpgradeBootstrapResult, error) {
+		var snapshotJSON string
+		if err := s.DB().QueryRow(`SELECT snapshot_json FROM cloud_upgrade_state WHERE project = ?`, project).Scan(&snapshotJSON); err != nil {
+			return nil, fmt.Errorf("read persisted bootstrap snapshot: %w", err)
+		}
+		if strings.Contains(snapshotJSON, token) || strings.Contains(snapshotJSON, `"token"`) || strings.Contains(snapshotJSON, "cloud_config") {
+			return nil, fmt.Errorf("bootstrap snapshot persisted credential material: %s", snapshotJSON)
+		}
+		return &engramsync.UpgradeBootstrapResult{Project: project, Stage: store.UpgradeStageBootstrapVerified}, nil
+	}
+	t.Cleanup(func() { runUpgradeBootstrap = oldBootstrap })
+
+	withArgs(t, "engram", "cloud", "upgrade", "bootstrap", "--project", "proj-a")
+	_, stderr, recovered := captureOutputAndRecover(t, func() { cmdCloud(cfg) })
+	if recovered != nil || stderr != "" {
+		t.Fatalf("bootstrap should not persist cloud credentials, panic=%v stderr=%q", recovered, stderr)
+	}
 }
 
 func TestCmdCloudUpgradeRepairStatusAndRollbackBranches(t *testing.T) {
@@ -1248,8 +1275,12 @@ func TestCmdCloudUpgradeRepairStatusAndRollbackBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("rollback restores cloud config when snapshot captured it", func(t *testing.T) {
+	t.Run("rollback leaves existing cloud config in place", func(t *testing.T) {
+		const token = "test-rollback-token-must-not-reach-sqlite"
 		cfg := testConfig(t)
+		if err := saveCloudConfig(cfg, &cloudConfig{ServerURL: "https://rollback.example.test", Token: token}); err != nil {
+			t.Fatalf("seed current cloud config: %v", err)
+		}
 		s, err := store.New(cfg)
 		if err != nil {
 			t.Fatalf("open store: %v", err)
@@ -1259,9 +1290,8 @@ func TestCmdCloudUpgradeRepairStatusAndRollbackBranches(t *testing.T) {
 			Stage:       store.UpgradeStageBootstrapPushed,
 			RepairClass: store.UpgradeRepairClassRepairable,
 			Snapshot: store.CloudUpgradeSnapshot{
-				CloudConfigPresent: true,
-				CloudConfigJSON:    `{"server_url":"https://rollback.example.test"}`,
-				ProjectEnrolled:    false,
+				Captured:        true,
+				ProjectEnrolled: false,
 			},
 		}); err != nil {
 			_ = s.Close()
@@ -1279,46 +1309,23 @@ func TestCmdCloudUpgradeRepairStatusAndRollbackBranches(t *testing.T) {
 		}
 		data, err := os.ReadFile(filepath.Join(cfg.DataDir, "cloud.json"))
 		if err != nil {
-			t.Fatalf("expected restored cloud config file: %v", err)
+			t.Fatalf("read existing cloud config after rollback: %v", err)
 		}
-		if !strings.Contains(string(data), "rollback.example.test") {
-			t.Fatalf("expected restored cloud config content, got %q", string(data))
+		if !strings.Contains(string(data), "rollback.example.test") || !strings.Contains(string(data), token) {
+			t.Fatalf("expected rollback to leave existing cloud config intact, got %q", string(data))
 		}
-	})
 
-	t.Run("rollback removes cloud config when snapshot had none", func(t *testing.T) {
-		cfg := testConfig(t)
-		if err := saveCloudConfig(cfg, &cloudConfig{ServerURL: "https://cloud.example.test"}); err != nil {
-			t.Fatalf("seed current cloud config: %v", err)
-		}
-		s, err := store.New(cfg)
+		s, err = store.New(cfg)
 		if err != nil {
-			t.Fatalf("open store: %v", err)
+			t.Fatalf("reopen store: %v", err)
 		}
-		if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{
-			Project:     "proj-a",
-			Stage:       store.UpgradeStageBootstrapPushed,
-			RepairClass: store.UpgradeRepairClassRepairable,
-			Snapshot: store.CloudUpgradeSnapshot{
-				CloudConfigPresent: false,
-				ProjectEnrolled:    false,
-			},
-		}); err != nil {
-			_ = s.Close()
-			t.Fatalf("seed rollback state: %v", err)
+		t.Cleanup(func() { _ = s.Close() })
+		var snapshotJSON string
+		if err := s.DB().QueryRow(`SELECT snapshot_json FROM cloud_upgrade_state WHERE project = ?`, "proj-a").Scan(&snapshotJSON); err != nil {
+			t.Fatalf("read rolled back snapshot: %v", err)
 		}
-		_ = s.Close()
-
-		withArgs(t, "engram", "cloud", "upgrade", "rollback", "--project", "proj-a")
-		stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdCloud(cfg) })
-		if recovered != nil || stderr != "" {
-			t.Fatalf("rollback should succeed, panic=%v stderr=%q", recovered, stderr)
-		}
-		if !strings.Contains(stdout, "stage: rolled_back") {
-			t.Fatalf("expected rolled_back stage output, got %q", stdout)
-		}
-		if _, err := os.Stat(filepath.Join(cfg.DataDir, "cloud.json")); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("expected cloud config to be removed, err=%v", err)
+		if strings.Contains(snapshotJSON, token) || strings.Contains(snapshotJSON, `"token"`) || strings.Contains(snapshotJSON, "cloud_config") {
+			t.Fatalf("rollback state persisted credential material: %s", snapshotJSON)
 		}
 	})
 }
