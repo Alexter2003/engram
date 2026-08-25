@@ -20,17 +20,24 @@ func TestClaudeCodeWindowsPromptResolverRejectsMalformedCanonicalProject(t *test
 
 	for _, test := range []struct {
 		name       string
+		status     int
 		resolution string
 	}{
-		{name: "non-string project", resolution: `{"project":42,"project_source":"config"}`},
-		{name: "incorrectly cased project property", resolution: `{"Project":"canonical-project","project_source":"config"}`},
-		{name: "incorrectly cased project source property", resolution: `{"project":"canonical-project","Project_Source":"config"}`},
-		{name: "incorrectly cased project source value", resolution: `{"project":"canonical-project","project_source":"CONFIG"}`},
+		{name: "non-string project", status: http.StatusOK, resolution: `{"project":42,"project_source":"config"}`},
+		{name: "incorrectly cased project property", status: http.StatusOK, resolution: `{"Project":"canonical-project","project_source":"config"}`},
+		{name: "incorrectly cased project source property", status: http.StatusOK, resolution: `{"project":"canonical-project","Project_Source":"config"}`},
+		{name: "incorrectly cased project source value", status: http.StatusOK, resolution: `{"project":"canonical-project","project_source":"CONFIG"}`},
+		{name: "blank project", status: http.StatusOK, resolution: `{"project":"","project_source":"config"}`},
+		{name: "error hint", status: http.StatusOK, resolution: `{"project":"canonical-project","project_source":"config","error_hint":"choose a project"}`},
+		{name: "ambiguous response", status: http.StatusOK, resolution: `{"project":"","project_source":"ambiguous","available_projects":["one","two"]}`},
+		{name: "non-2xx response", status: http.StatusServiceUnavailable, resolution: `unavailable`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var mu sync.Mutex
 			resolutionRequests := 0
 			promptWrites := 0
+			requestedCWD := ""
+			cwd := "C:/workspace/reserved &?#%+"
 			port := claudeCodeWindowsPromptServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				mu.Lock()
 				defer mu.Unlock()
@@ -38,6 +45,8 @@ func TestClaudeCodeWindowsPromptResolverRejectsMalformedCanonicalProject(t *test
 				switch r.URL.Path {
 				case "/project/current":
 					resolutionRequests++
+					requestedCWD = r.URL.Query().Get("cwd")
+					w.WriteHeader(test.status)
 					_, _ = w.Write([]byte(test.resolution))
 				case "/prompts":
 					promptWrites++
@@ -48,12 +57,15 @@ func TestClaudeCodeWindowsPromptResolverRejectsMalformedCanonicalProject(t *test
 				}
 			}))
 
-			runClaudeCodeWindowsPromptHook(t, powershellPath, adapterPath, port, "resolver-malformed", "persist this prompt")
+			runClaudeCodeWindowsPromptHook(t, powershellPath, adapterPath, port, "resolver-malformed", cwd, "persist this prompt")
 
 			mu.Lock()
 			defer mu.Unlock()
 			if resolutionRequests != 1 {
 				t.Fatalf("canonical resolution requests = %d, want 1", resolutionRequests)
+			}
+			if requestedCWD != cwd {
+				t.Fatalf("canonical request cwd = %q, want %q", requestedCWD, cwd)
 			}
 			if promptWrites != 0 {
 				t.Fatalf("prompt writes = %d, want 0 for malformed canonical project", promptWrites)
@@ -69,6 +81,8 @@ func TestClaudeCodeWindowsPromptResolverPersistsCanonicalProject(t *testing.T) {
 	var mu sync.Mutex
 	resolutionRequests := 0
 	promptWrites := 0
+	requestedCWD := ""
+	cwd := "C:/workspace/reserved &?#%+"
 	var promptPayload struct {
 		SessionID string `json:"session_id"`
 		Project   string `json:"project"`
@@ -81,6 +95,7 @@ func TestClaudeCodeWindowsPromptResolverPersistsCanonicalProject(t *testing.T) {
 		switch r.URL.Path {
 		case "/project/current":
 			resolutionRequests++
+			requestedCWD = r.URL.Query().Get("cwd")
 			_, _ = w.Write([]byte(`{"project":"canonical-project","project_source":"config"}`))
 		case "/prompts":
 			promptWrites++
@@ -97,12 +112,15 @@ func TestClaudeCodeWindowsPromptResolverPersistsCanonicalProject(t *testing.T) {
 		}
 	}))
 
-	runClaudeCodeWindowsPromptHook(t, powershellPath, adapterPath, port, "canonical-persistence", "persist this prompt")
+	runClaudeCodeWindowsPromptHook(t, powershellPath, adapterPath, port, "canonical-persistence", cwd, "persist this prompt")
 
 	mu.Lock()
 	defer mu.Unlock()
 	if resolutionRequests != 1 {
 		t.Fatalf("canonical resolution requests = %d, want 1", resolutionRequests)
+	}
+	if requestedCWD != cwd {
+		t.Fatalf("canonical request cwd = %q, want %q", requestedCWD, cwd)
 	}
 	if promptWrites != 1 {
 		t.Fatalf("prompt writes = %d, want 1", promptWrites)
@@ -130,7 +148,7 @@ func claudeCodeWindowsPromptServer(t *testing.T, handler http.Handler) string {
 	return strconv.Itoa(tcpAddr.Port)
 }
 
-func runClaudeCodeWindowsPromptHook(t *testing.T, powershellPath, adapterPath, port, sessionID, prompt string) {
+func runClaudeCodeWindowsPromptHook(t *testing.T, powershellPath, adapterPath, port, sessionID, cwd, prompt string) {
 	t.Helper()
 	stateFile := filepath.Join(os.TempDir(), "engram-claude-"+sessionID+"-tools-loaded")
 	_ = os.Remove(stateFile)
@@ -139,7 +157,15 @@ func runClaudeCodeWindowsPromptHook(t *testing.T, powershellPath, adapterPath, p
 	run := exec.Command(powershellPath, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", adapterPath)
 	run.Env = withoutEngramPort(os.Environ())
 	run.Env = append(run.Env, "ENGRAM_PORT="+port)
-	run.Stdin = strings.NewReader(`{"session_id":"` + sessionID + `","cwd":"C:/workspace","prompt":"` + prompt + `"}`)
+	input, err := json.Marshal(map[string]string{
+		"session_id": sessionID,
+		"cwd":        cwd,
+		"prompt":     prompt,
+	})
+	if err != nil {
+		t.Fatalf("marshal prompt hook input: %v", err)
+	}
+	run.Stdin = strings.NewReader(string(input))
 	if output, err := run.CombinedOutput(); err != nil {
 		t.Fatalf("run UserPromptSubmit adapter: %v: %s", err, output)
 	}
