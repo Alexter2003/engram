@@ -65,6 +65,7 @@ func TestLifecycleScriptsUseCanonicalProjectResolution(t *testing.T) {
 			{name: "empty", status: http.StatusOK, body: `{"project":"","project_source":"config"}`},
 			{name: "ambiguous", status: http.StatusOK, body: `{"project":"","project_source":"ambiguous","available_projects":["one","two"]}`},
 			{name: "invalid", status: http.StatusOK, body: `{"project":"configured-project","project_source":"unexpected"}`},
+			{name: "error hint", status: http.StatusOK, body: `{"project":"configured-project","project_source":"config","error_hint":"choose a project"}`},
 		} {
 			t.Run(agent+" fails closed when canonical resolution is "+response.name, func(t *testing.T) {
 				cwd := lifecycleProjectDirectory(t)

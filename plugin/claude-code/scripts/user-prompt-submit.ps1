@@ -32,8 +32,13 @@ function Resolve-EngramProject {
   try {
     $encodedCwd = [System.Uri]::EscapeDataString($Cwd)
     $resolution = Invoke-RestMethod -Method Get -Uri "$EngramUrl/project/current?cwd=$encodedCwd" -TimeoutSec 1
-    $project = [string]$resolution.project
-    $source = [string]$resolution.project_source
+    $projectProperty = $resolution.PSObject.Properties['project']
+    $sourceProperty = $resolution.PSObject.Properties['project_source']
+    if ($null -eq $projectProperty -or $null -eq $sourceProperty -or $projectProperty.Value -isnot [string] -or $sourceProperty.Value -isnot [string]) {
+      return $null
+    }
+    $project = [string]$projectProperty.Value
+    $source = [string]$sourceProperty.Value
     $validSources = @('config', 'git_remote', 'git_root', 'git_child', 'dir_basename')
     if ([string]::IsNullOrWhiteSpace($project) -or $source -notin $validSources -or $null -ne $resolution.PSObject.Properties['error_hint']) {
       return $null
