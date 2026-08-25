@@ -183,6 +183,43 @@ func TestApplyPulledChunk_DefersMissingRelationAndContinues(t *testing.T) {
 	}
 }
 
+func TestApplyPulledMutation_DefersMissingRelationAndAdvancesCursor(t *testing.T) {
+	s, syncA, _ := setupSyncApplyStore(t)
+	relSyncID := newSyncID("rel-missing")
+	m := buildRelationMutation(t, syncRelationPayload{
+		SyncID:         relSyncID,
+		SourceID:       syncA,
+		TargetID:       "obs-ghost-" + newSyncID("x"),
+		Relation:       RelationRelated,
+		JudgmentStatus: JudgmentStatusJudged,
+		Project:        "proj-apply",
+		CreatedAt:      "2026-04-26T10:00:00Z",
+		UpdatedAt:      "2026-04-26T10:00:00Z",
+	})
+	m.Seq = 1
+
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, m); err != nil {
+		t.Fatalf("ApplyPulledMutation: %v", err)
+	}
+	if got := countDeferredRows(t, s, relSyncID); got != 1 {
+		t.Fatalf("expected missing relation to defer, got %d rows", got)
+	}
+	status, _ := getDeferredRow(t, s, relSyncID)
+	if status != "deferred" {
+		t.Fatalf("apply_status: want deferred, got %q", status)
+	}
+	if got := countRelationRows(t, s, relSyncID); got != 0 {
+		t.Fatalf("expected missing relation to remain unapplied, got %d rows", got)
+	}
+	var lastPulled int64
+	if err := s.db.QueryRow(`SELECT last_pulled_seq FROM sync_state WHERE target_key = ?`, DefaultSyncTargetKey).Scan(&lastPulled); err != nil {
+		t.Fatalf("read last_pulled_seq: %v", err)
+	}
+	if lastPulled != m.Seq {
+		t.Fatalf("last_pulled_seq: want %d, got %d", m.Seq, lastPulled)
+	}
+}
+
 func TestApplyPulledChunk_MarksMalformedRelationDeadAndContinues(t *testing.T) {
 	s, syncA, syncB := setupSyncApplyStore(t)
 	validID := newSyncID("rel-valid")
