@@ -517,6 +517,10 @@ func (m *Manager) push(ctx context.Context) error {
 
 	var failures []error
 	for _, project := range order {
+		if err := ctx.Err(); err != nil {
+			failures = append(failures, err)
+			return errors.Join(failures...)
+		}
 		batch := groups[project]
 		entries := make([]MutationEntry, len(batch))
 		seqs := make([]int64, len(batch))
@@ -545,7 +549,8 @@ func (m *Manager) push(ctx context.Context) error {
 			continue
 		}
 		if err := m.store.AckSyncMutationSeqs(m.cfg.TargetKey, seqs); err != nil {
-			return fmt.Errorf("ack project %q: %w", project, err)
+			failures = append(failures, fmt.Errorf("ack project %q: %w", project, err))
+			return errors.Join(failures...)
 		}
 	}
 

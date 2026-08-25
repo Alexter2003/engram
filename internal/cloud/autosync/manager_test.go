@@ -155,6 +155,7 @@ type fakeCloudTransport struct {
 	pushCalls           int32
 	pullCalls           int32
 	pushResult          *PushMutationsResult
+	pushHook            func(string)
 	pullResult          *PullMutationsResponse
 	pushed              [][]MutationEntry
 	attempted           [][]MutationEntry
@@ -182,6 +183,9 @@ func (t *fakeCloudTransport) PushMutations(mutations []MutationEntry) (*PushMuta
 	project := ""
 	if len(mutations) > 0 {
 		project = mutations[0].Project
+	}
+	if t.pushHook != nil {
+		t.pushHook(project)
 	}
 	if err, ok := t.pushErrByProject[project]; ok {
 		return nil, err
@@ -421,28 +425,58 @@ func TestManagerPushReportsAllProjectLocalFailures(t *testing.T) {
 	}
 }
 
-func TestManagerPushStopsImmediatelyWhenLocalAckFails(t *testing.T) {
+func TestManagerPushPreservesPriorFailureWhenLocalAckFails(t *testing.T) {
 	ls := newFakeLocalStore()
-	ls.ackErr = errors.New("disk full")
+	alphaErr := errors.New("alpha rejected")
+	ackErr := errors.New("disk full")
+	ls.ackErr = ackErr
+	ls.mutations = []store.SyncMutation{
+		{Seq: 1, Entity: "obs", EntityKey: "alpha", Op: "upsert", Project: "alpha"},
+		{Seq: 2, Entity: "obs", EntityKey: "beta", Op: "upsert", Project: "beta"},
+		{Seq: 3, Entity: "obs", EntityKey: "gamma", Op: "upsert", Project: "gamma"},
+	}
+	tr := newFakeTransport()
+	tr.pushErrByProject = map[string]error{"alpha": alphaErr}
+	tr.pushResultByProject = map[string]*PushMutationsResult{
+		"beta":  {AcceptedSeqs: []int64{2}},
+		"gamma": {AcceptedSeqs: []int64{3}},
+	}
+
+	err := New(ls, tr, DefaultConfig()).push(context.Background())
+	if !errors.Is(err, alphaErr) || !errors.Is(err, ackErr) {
+		t.Fatalf("expected joined alpha and beta ack errors, got %v", err)
+	}
+	if got := attemptedProjects(tr); fmt.Sprint(got) != "[alpha beta]" {
+		t.Fatalf("expected ack failure to stop before gamma, got attempts %v", got)
+	}
+	if len(ls.ackedSeqs) != 0 {
+		t.Fatalf("expected failed local ack to remain unrecorded, got %v", ls.ackedSeqs)
+	}
+}
+
+func TestManagerPushStopsBeforeLaterProjectsWhenCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	alphaErr := errors.New("alpha rejected")
+	ls := newFakeLocalStore()
 	ls.mutations = []store.SyncMutation{
 		{Seq: 1, Entity: "obs", EntityKey: "alpha", Op: "upsert", Project: "alpha"},
 		{Seq: 2, Entity: "obs", EntityKey: "beta", Op: "upsert", Project: "beta"},
 	}
 	tr := newFakeTransport()
-	tr.pushResultByProject = map[string]*PushMutationsResult{
-		"alpha": {AcceptedSeqs: []int64{1}},
-		"beta":  {AcceptedSeqs: []int64{2}},
+	tr.pushErrByProject = map[string]error{"alpha": alphaErr}
+	tr.pushHook = func(project string) {
+		if project == "alpha" {
+			cancel()
+		}
 	}
 
-	err := New(ls, tr, DefaultConfig()).push(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "ack project \"alpha\": disk full") {
-		t.Fatalf("expected immediate local ack error, got %v", err)
+	err := New(ls, tr, DefaultConfig()).push(ctx)
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, alphaErr) {
+		t.Fatalf("expected joined cancellation and alpha errors, got %v", err)
 	}
 	if got := attemptedProjects(tr); fmt.Sprint(got) != "[alpha]" {
-		t.Fatalf("expected ack failure to stop before beta, got attempts %v", got)
-	}
-	if len(ls.ackedSeqs) != 0 {
-		t.Fatalf("expected failed local ack to remain unrecorded, got %v", ls.ackedSeqs)
+		t.Fatalf("expected cancellation to stop before beta, got attempts %v", got)
 	}
 }
 
