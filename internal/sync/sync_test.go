@@ -2476,7 +2476,7 @@ func TestCloudImportAppliesObservationsBeforeEarlierRelationInSameChunk(t *testi
 	}
 }
 
-func TestCloudImportRollsBackRelationFirstChunkWhenEndpointIsMissing(t *testing.T) {
+func TestCloudImportDefersRelationWhenEndpointIsMissing(t *testing.T) {
 	dst := newTestStore(t)
 	if err := dst.EnrollProject("proj-a"); err != nil {
 		t.Fatalf("enroll destination project: %v", err)
@@ -2514,22 +2514,35 @@ func TestCloudImportRollsBackRelationFirstChunkWhenEndpointIsMissing(t *testing.
 	if _, err := dst.GetObservationBySyncID("obs-missing-target"); err == nil {
 		t.Fatal("missing relation target must be absent from the destination before import")
 	}
-	if _, err := NewCloudWithTransport(dst, transport, "proj-a").Import(); !errors.Is(err, store.ErrRelationFKMissing) {
-		t.Fatalf("expected import to fail for the missing relation endpoint, got %v", err)
+	result, err := NewCloudWithTransport(dst, transport, "proj-a").Import()
+	if err != nil {
+		t.Fatalf("import should defer the missing relation endpoint, got %v", err)
 	}
-
-	if _, err := dst.GetObservationBySyncID("obs-rollback-source"); err == nil {
-		t.Fatal("expected source observation upsert to roll back after failed relation import")
+	if result.ChunksImported != 1 || result.SessionsImported != 1 || result.ObservationsImported != 1 {
+		t.Fatalf("unexpected import result: %+v", result)
 	}
-	if _, err := dst.GetSession("sess-relation-rollback"); err == nil {
-		t.Fatal("expected session upsert to roll back after failed relation import")
+	if _, err := dst.GetObservationBySyncID("obs-rollback-source"); err != nil {
+		t.Fatalf("expected source observation to import: %v", err)
 	}
-	synced, err := dst.GetSyncedChunks()
+	if _, err := dst.GetSession("sess-relation-rollback"); err != nil {
+		t.Fatalf("expected session to import: %v", err)
+	}
+	if _, err := dst.GetRelation("rel-missing-endpoint"); err == nil {
+		t.Fatal("expected unresolved relation to remain unapplied")
+	}
+	deferred, dead, err := dst.CountDeferredAndDead()
+	if err != nil {
+		t.Fatalf("count deferred relation: %v", err)
+	}
+	if deferred != 1 || dead != 0 {
+		t.Fatalf("expected one deferred relation and no dead relations, got deferred=%d dead=%d", deferred, dead)
+	}
+	synced, err := dst.GetSyncedChunksForTarget(cloudTargetKey("proj-a"))
 	if err != nil {
 		t.Fatalf("get synced chunks: %v", err)
 	}
-	if synced[chunkID] {
-		t.Fatalf("failed chunk %q must not be marked synced", chunkID)
+	if !synced[chunkID] {
+		t.Fatalf("expected chunk %q with a deferred relation to be marked synced", chunkID)
 	}
 }
 
