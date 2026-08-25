@@ -221,22 +221,27 @@ func TestUpdateObservationRejectsBlankTitleBeforePersistenceAndSync(t *testing.T
 }
 
 func TestAddPromptRejectsBlankContentBeforePersistenceAndSync(t *testing.T) {
+	type addResult struct {
+		err      error
+		inserted *bool
+	}
+
 	for _, tc := range []struct {
 		name string
-		add  func(*Store) error
+		add  func(*Store) addResult
 	}{
 		{
 			name: "add prompt",
-			add: func(s *Store) error {
+			add: func(s *Store) addResult {
 				_, err := s.AddPrompt(AddPromptParams{SessionID: "s-prompt-admission", Content: " \t\n ", Project: "engram"})
-				return err
+				return addResult{err: err}
 			},
 		},
 		{
 			name: "add prompt if missing",
-			add: func(s *Store) error {
-				_, _, err := s.AddPromptIfMissing(AddPromptParams{SessionID: "s-prompt-admission", Content: " \t\n ", Project: "engram"})
-				return err
+			add: func(s *Store) addResult {
+				_, inserted, err := s.AddPromptIfMissing(AddPromptParams{SessionID: "s-prompt-admission", Content: " \t\n ", Project: "engram"})
+				return addResult{err: err, inserted: &inserted}
 			},
 		},
 	} {
@@ -254,9 +259,12 @@ func TestAddPromptRejectsBlankContentBeforePersistenceAndSync(t *testing.T) {
 				t.Fatalf("count sync mutations before invalid write: %v", err)
 			}
 
-			err := tc.add(s)
-			if !errors.Is(err, ErrPromptContentRequired) {
-				t.Fatalf("expected ErrPromptContentRequired, got %v", err)
+			result := tc.add(s)
+			if !errors.Is(result.err, ErrPromptContentRequired) {
+				t.Fatalf("expected ErrPromptContentRequired, got %v", result.err)
+			}
+			if result.inserted != nil && *result.inserted {
+				t.Fatal("expected invalid AddPromptIfMissing call not to insert")
 			}
 
 			var promptsAfter, mutationsAfter int
