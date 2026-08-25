@@ -24,6 +24,8 @@ func TestClaudeCodeWindowsPromptResolverRejectsMalformedCanonicalProject(t *test
 		resolution string
 	}{
 		{name: "non-string project", status: http.StatusOK, resolution: `{"project":42,"project_source":"config"}`},
+		{name: "malformed JSON", status: http.StatusOK, resolution: `not-json`},
+		{name: "non-string project source", status: http.StatusOK, resolution: `{"project":"canonical-project","project_source":42}`},
 		{name: "incorrectly cased project property", status: http.StatusOK, resolution: `{"Project":"canonical-project","project_source":"config"}`},
 		{name: "incorrectly cased project source property", status: http.StatusOK, resolution: `{"project":"canonical-project","Project_Source":"config"}`},
 		{name: "incorrectly cased project source value", status: http.StatusOK, resolution: `{"project":"canonical-project","project_source":"CONFIG"}`},
