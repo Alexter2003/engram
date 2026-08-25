@@ -7442,7 +7442,7 @@ func seedMCPMatchModeFixture(t *testing.T, s *store.Store) {
 		t.Fatalf("create session: %v", err)
 	}
 	obs := []store.AddObservationParams{
-		{SessionID: "s-mcp-matchmode", Type: "decision", Title: "Auth session middleware", Content: "", Project: "engram", Scope: "project"},
+		{SessionID: "s-mcp-matchmode", Type: "decision", Title: "Auth session middleware", Content: "request routing layer", Project: "engram", Scope: "project"},
 		{SessionID: "s-mcp-matchmode", Type: "decision", Title: "Compliance audit notes", Content: "session policy", Project: "engram", Scope: "project"},
 		{SessionID: "s-mcp-matchmode", Type: "decision", Title: "OAuth tokens", Content: "auth and compliance", Project: "engram", Scope: "project"},
 	}

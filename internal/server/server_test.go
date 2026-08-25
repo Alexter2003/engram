@@ -381,7 +381,9 @@ func TestWriteHandlersRejectWhitespaceOnlyRequiredFields(t *testing.T) {
 	}
 
 	assertBadRequest(http.MethodPost, "/observations", `{"session_id":"s-whitespace","type":"decision","title":" \t\n ","content":"Invalid observation","project":"engram"}`)
+	assertBadRequest(http.MethodPost, "/observations", `{"session_id":"s-whitespace","type":"decision","title":"Valid title","content":" \t\n ","project":"engram"}`)
 	assertBadRequest(http.MethodPatch, fmt.Sprintf("/observations/%d", observationID), `{"title":" \t\n "}`)
+	assertBadRequest(http.MethodPatch, fmt.Sprintf("/observations/%d", observationID), `{"content":" \t\n "}`)
 	assertBadRequest(http.MethodPost, "/prompts", `{"session_id":"s-whitespace","content":" \t\n ","project":"engram"}`)
 
 	var observationCount, promptCount int
@@ -404,6 +406,9 @@ func TestWriteHandlersRejectWhitespaceOnlyRequiredFields(t *testing.T) {
 	}
 	if observation.Title != "Original title" {
 		t.Fatalf("expected invalid observation update not to persist, got title %q", observation.Title)
+	}
+	if observation.Content != "Original content" {
+		t.Fatalf("expected invalid observation update not to persist, got content %q", observation.Content)
 	}
 }
 

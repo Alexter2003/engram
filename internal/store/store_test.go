@@ -220,6 +220,112 @@ func TestUpdateObservationRejectsBlankTitleBeforePersistenceAndSync(t *testing.T
 	}
 }
 
+func TestAddObservationRejectsBlankContentBeforePersistenceAndSync(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s-content-admission", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	seedID, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-content-admission",
+		Type:      "decision",
+		Title:     "Existing title",
+		Content:   "Existing content",
+		Project:   "engram",
+		Scope:     "project",
+		TopicKey:  "architecture/content-admission",
+	})
+	if err != nil {
+		t.Fatalf("seed observation: %v", err)
+	}
+
+	var observationsBefore, mutationsBefore int
+	if err := s.db.QueryRow(`SELECT count(*) FROM observations`).Scan(&observationsBefore); err != nil {
+		t.Fatalf("count observations before invalid write: %v", err)
+	}
+	if err := s.db.QueryRow(`SELECT count(*) FROM sync_mutations`).Scan(&mutationsBefore); err != nil {
+		t.Fatalf("count sync mutations before invalid write: %v", err)
+	}
+
+	_, err = s.AddObservation(AddObservationParams{
+		SessionID: "s-content-admission",
+		Type:      "decision",
+		Title:     "Replacement title",
+		Content:   " \t\n ",
+		Project:   "engram",
+		Scope:     "project",
+		TopicKey:  "architecture/content-admission",
+	})
+	if !errors.Is(err, ErrObservationContentRequired) {
+		t.Fatalf("expected ErrObservationContentRequired, got %v", err)
+	}
+
+	var observationsAfter, mutationsAfter int
+	if err := s.db.QueryRow(`SELECT count(*) FROM observations`).Scan(&observationsAfter); err != nil {
+		t.Fatalf("count observations after invalid write: %v", err)
+	}
+	if err := s.db.QueryRow(`SELECT count(*) FROM sync_mutations`).Scan(&mutationsAfter); err != nil {
+		t.Fatalf("count sync mutations after invalid write: %v", err)
+	}
+	if observationsAfter != observationsBefore || mutationsAfter != mutationsBefore {
+		t.Fatalf("invalid observation changed persistence: observations %d->%d, mutations %d->%d", observationsBefore, observationsAfter, mutationsBefore, mutationsAfter)
+	}
+
+	seed, err := s.GetObservation(seedID)
+	if err != nil {
+		t.Fatalf("get seeded observation: %v", err)
+	}
+	if seed.Title != "Existing title" || seed.Content != "Existing content" {
+		t.Fatalf("invalid topic-key upsert changed existing observation: %#v", seed)
+	}
+}
+
+func TestUpdateObservationRejectsBlankContentBeforePersistenceAndSync(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s-update-content-admission", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	id, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-update-content-admission",
+		Type:      "decision",
+		Title:     "Original title",
+		Content:   "Original content",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("seed observation: %v", err)
+	}
+
+	var mutationsBefore int
+	if err := s.db.QueryRow(`SELECT count(*) FROM sync_mutations`).Scan(&mutationsBefore); err != nil {
+		t.Fatalf("count sync mutations before invalid update: %v", err)
+	}
+
+	blankContent := " \t\n "
+	_, err = s.UpdateObservation(id, UpdateObservationParams{Content: &blankContent})
+	if !errors.Is(err, ErrObservationContentRequired) {
+		t.Fatalf("expected ErrObservationContentRequired, got %v", err)
+	}
+
+	var mutationsAfter int
+	if err := s.db.QueryRow(`SELECT count(*) FROM sync_mutations`).Scan(&mutationsAfter); err != nil {
+		t.Fatalf("count sync mutations after invalid update: %v", err)
+	}
+	if mutationsAfter != mutationsBefore {
+		t.Fatalf("invalid observation update enqueued a sync mutation: %d->%d", mutationsBefore, mutationsAfter)
+	}
+
+	obs, err := s.GetObservation(id)
+	if err != nil {
+		t.Fatalf("get seeded observation: %v", err)
+	}
+	if obs.Content != "Original content" {
+		t.Fatalf("invalid update changed content to %q", obs.Content)
+	}
+}
+
 func TestAddPromptRejectsBlankContentBeforePersistenceAndSync(t *testing.T) {
 	type addResult struct {
 		err      error
@@ -8804,7 +8910,7 @@ func TestMostRecentActiveSessionScopedByProject(t *testing.T) {
 // seedMatchModeFixture creates a session and three observations with partial
 // token overlap — no single observation contains all three query tokens.
 //
-//	obs1: title "Auth session middleware"       content ""
+//	obs1: title "Auth session middleware"       content "request routing layer"
 //	obs2: title "Compliance audit notes"        content "session policy"
 //	obs3: title "OAuth tokens"                  content "auth and compliance"
 func seedMatchModeFixture(t *testing.T, s *Store) {
@@ -8813,7 +8919,7 @@ func seedMatchModeFixture(t *testing.T, s *Store) {
 		t.Fatalf("create session: %v", err)
 	}
 	obs := []AddObservationParams{
-		{SessionID: "s-matchmode", Type: "decision", Title: "Auth session middleware", Content: "", Project: "engram", Scope: "project"},
+		{SessionID: "s-matchmode", Type: "decision", Title: "Auth session middleware", Content: "request routing layer", Project: "engram", Scope: "project"},
 		{SessionID: "s-matchmode", Type: "decision", Title: "Compliance audit notes", Content: "session policy", Project: "engram", Scope: "project"},
 		{SessionID: "s-matchmode", Type: "decision", Title: "OAuth tokens", Content: "auth and compliance", Project: "engram", Scope: "project"},
 	}
