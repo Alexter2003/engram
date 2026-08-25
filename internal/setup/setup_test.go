@@ -2404,40 +2404,27 @@ func TestClaudeCodeUserPromptHookUsesCurrentMCPServerID(t *testing.T) {
 	}
 }
 
-func TestClaudeCodeUserPromptHookDefersProjectDetectionUntilNeeded(t *testing.T) {
+func TestClaudeCodeUserPromptHookUsesProcessLocalFallbackKeyAndCanonicalResolution(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join("..", "..", "plugin", "claude-code", "scripts", "user-prompt-submit.sh"))
 	if err != nil {
 		t.Fatalf("read user prompt hook: %v", err)
 	}
 	text := string(data)
 
-	sessionParse := strings.Index(text, "SESSION_ID=$(echo \"$INPUT\" | jq -r '.session_id // empty')")
-	if sessionParse < 0 {
-		t.Fatalf("user prompt hook missing expected session parsing structure")
-	}
-	sessionKeyBranchRel := strings.Index(text[sessionParse:], "if [ -n \"$SESSION_ID\" ]; then")
-	sessionKeyBranch := -1
-	if sessionKeyBranchRel >= 0 {
-		sessionKeyBranch = sessionParse + sessionKeyBranchRel
-	}
-	if sessionParse < 0 || sessionKeyBranch < 0 {
-		t.Fatalf("user prompt hook missing expected session parsing/keying structure")
-	}
-	if preKey := text[sessionParse:sessionKeyBranch]; strings.Contains(preKey, "detect_project") {
-		t.Fatalf("user prompt hook must not detect project before session_id-first keying")
+	if strings.Contains(text, "detect_project") {
+		t.Fatal("user prompt hook must not use Git/basename project detection")
 	}
 
-	fallbackDetect := "PROJECT=$(detect_project \"$CWD\")\n  SAFE_PROJECT="
-	if !strings.Contains(text, fallbackDetect) {
-		t.Fatalf("user prompt hook should detect project only for the no-session_id fallback key")
+	if !strings.Contains(text, "SESSION_KEY=\"engram-claude-unknown-$$-tools-loaded\"") {
+		t.Fatal("user prompt hook must use a process-local fallback key when session_id is absent")
 	}
 
 	subsequentMarker := strings.Index(text, "# SUBSEQUENT MESSAGES")
 	if subsequentMarker < 0 {
 		t.Fatalf("user prompt hook missing subsequent-message section")
 	}
-	if !strings.Contains(text[subsequentMarker:], "PROJECT=$(detect_project \"$CWD\")") {
-		t.Fatalf("user prompt hook should detect project for subsequent nudge logic after first-message handling")
+	if !strings.Contains(text[subsequentMarker:], "PROJECT=$(resolve_project \"$CWD\") || PROJECT=\"\"") {
+		t.Fatal("user prompt hook must resolve the nudge project canonically after first-message handling")
 	}
 }
 
