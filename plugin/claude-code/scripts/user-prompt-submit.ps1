@@ -32,15 +32,15 @@ function Resolve-EngramProject {
   try {
     $encodedCwd = [System.Uri]::EscapeDataString($Cwd)
     $resolution = Invoke-RestMethod -Method Get -Uri "$EngramUrl/project/current?cwd=$encodedCwd" -TimeoutSec 1
-    $projectProperty = $resolution.PSObject.Properties['project']
-    $sourceProperty = $resolution.PSObject.Properties['project_source']
-    if ($null -eq $projectProperty -or $null -eq $sourceProperty -or $projectProperty.Value -isnot [string] -or $sourceProperty.Value -isnot [string]) {
+    $projectProperty = @($resolution.PSObject.Properties | Where-Object { $_.Name -ceq 'project' })
+    $sourceProperty = @($resolution.PSObject.Properties | Where-Object { $_.Name -ceq 'project_source' })
+    if ($projectProperty.Count -ne 1 -or $sourceProperty.Count -ne 1 -or $projectProperty[0].Value -isnot [string] -or $sourceProperty[0].Value -isnot [string]) {
       return $null
     }
-    $project = [string]$projectProperty.Value
-    $source = [string]$sourceProperty.Value
+    $project = $projectProperty[0].Value
+    $source = $sourceProperty[0].Value
     $validSources = @('config', 'git_remote', 'git_root', 'git_child', 'dir_basename')
-    if ([string]::IsNullOrWhiteSpace($project) -or $source -notin $validSources -or $null -ne $resolution.PSObject.Properties['error_hint']) {
+    if ([string]::IsNullOrWhiteSpace($project) -or $validSources -cnotcontains $source -or $null -ne $resolution.PSObject.Properties['error_hint']) {
       return $null
     }
     return $project
