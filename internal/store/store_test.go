@@ -114,6 +114,165 @@ func TestAddObservationDeduplicatesWithinWindow(t *testing.T) {
 	}
 }
 
+func TestAddObservationRejectsBlankTitleBeforePersistenceAndSync(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s-admission", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	seedID, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-admission",
+		Type:      "decision",
+		Title:     "Existing title",
+		Content:   "Existing content",
+		Project:   "engram",
+		Scope:     "project",
+		TopicKey:  "architecture/admission",
+	})
+	if err != nil {
+		t.Fatalf("seed observation: %v", err)
+	}
+
+	var observationsBefore, mutationsBefore int
+	if err := s.db.QueryRow(`SELECT count(*) FROM observations`).Scan(&observationsBefore); err != nil {
+		t.Fatalf("count observations before invalid write: %v", err)
+	}
+	if err := s.db.QueryRow(`SELECT count(*) FROM sync_mutations`).Scan(&mutationsBefore); err != nil {
+		t.Fatalf("count sync mutations before invalid write: %v", err)
+	}
+
+	_, err = s.AddObservation(AddObservationParams{
+		SessionID: "s-admission",
+		Type:      "decision",
+		Title:     " \t\n ",
+		Content:   "Replacement content",
+		Project:   "engram",
+		Scope:     "project",
+		TopicKey:  "architecture/admission",
+	})
+	if !errors.Is(err, ErrObservationTitleRequired) {
+		t.Fatalf("expected ErrObservationTitleRequired, got %v", err)
+	}
+
+	var observationsAfter, mutationsAfter int
+	if err := s.db.QueryRow(`SELECT count(*) FROM observations`).Scan(&observationsAfter); err != nil {
+		t.Fatalf("count observations after invalid write: %v", err)
+	}
+	if err := s.db.QueryRow(`SELECT count(*) FROM sync_mutations`).Scan(&mutationsAfter); err != nil {
+		t.Fatalf("count sync mutations after invalid write: %v", err)
+	}
+	if observationsAfter != observationsBefore || mutationsAfter != mutationsBefore {
+		t.Fatalf("invalid observation changed persistence: observations %d->%d, mutations %d->%d", observationsBefore, observationsAfter, mutationsBefore, mutationsAfter)
+	}
+
+	seed, err := s.GetObservation(seedID)
+	if err != nil {
+		t.Fatalf("get seeded observation: %v", err)
+	}
+	if seed.Title != "Existing title" || seed.Content != "Existing content" {
+		t.Fatalf("invalid topic-key upsert changed existing observation: %#v", seed)
+	}
+}
+
+func TestUpdateObservationRejectsBlankTitleBeforePersistenceAndSync(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s-update-admission", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	id, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-update-admission",
+		Type:      "decision",
+		Title:     "Original title",
+		Content:   "Original content",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("seed observation: %v", err)
+	}
+
+	var mutationsBefore int
+	if err := s.db.QueryRow(`SELECT count(*) FROM sync_mutations`).Scan(&mutationsBefore); err != nil {
+		t.Fatalf("count sync mutations before invalid update: %v", err)
+	}
+
+	blankTitle := " \t\n "
+	_, err = s.UpdateObservation(id, UpdateObservationParams{Title: &blankTitle})
+	if !errors.Is(err, ErrObservationTitleRequired) {
+		t.Fatalf("expected ErrObservationTitleRequired, got %v", err)
+	}
+
+	var mutationsAfter int
+	if err := s.db.QueryRow(`SELECT count(*) FROM sync_mutations`).Scan(&mutationsAfter); err != nil {
+		t.Fatalf("count sync mutations after invalid update: %v", err)
+	}
+	if mutationsAfter != mutationsBefore {
+		t.Fatalf("invalid observation update enqueued a sync mutation: %d->%d", mutationsBefore, mutationsAfter)
+	}
+
+	obs, err := s.GetObservation(id)
+	if err != nil {
+		t.Fatalf("get seeded observation: %v", err)
+	}
+	if obs.Title != "Original title" {
+		t.Fatalf("invalid update changed title to %q", obs.Title)
+	}
+}
+
+func TestAddPromptRejectsBlankContentBeforePersistenceAndSync(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		add  func(*Store) error
+	}{
+		{
+			name: "add prompt",
+			add: func(s *Store) error {
+				_, err := s.AddPrompt(AddPromptParams{SessionID: "s-prompt-admission", Content: " \t\n ", Project: "engram"})
+				return err
+			},
+		},
+		{
+			name: "add prompt if missing",
+			add: func(s *Store) error {
+				_, _, err := s.AddPromptIfMissing(AddPromptParams{SessionID: "s-prompt-admission", Content: " \t\n ", Project: "engram"})
+				return err
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStore(t)
+			if err := s.CreateSession("s-prompt-admission", "engram", "/tmp/engram"); err != nil {
+				t.Fatalf("create session: %v", err)
+			}
+
+			var promptsBefore, mutationsBefore int
+			if err := s.db.QueryRow(`SELECT count(*) FROM user_prompts`).Scan(&promptsBefore); err != nil {
+				t.Fatalf("count prompts before invalid write: %v", err)
+			}
+			if err := s.db.QueryRow(`SELECT count(*) FROM sync_mutations`).Scan(&mutationsBefore); err != nil {
+				t.Fatalf("count sync mutations before invalid write: %v", err)
+			}
+
+			err := tc.add(s)
+			if !errors.Is(err, ErrPromptContentRequired) {
+				t.Fatalf("expected ErrPromptContentRequired, got %v", err)
+			}
+
+			var promptsAfter, mutationsAfter int
+			if err := s.db.QueryRow(`SELECT count(*) FROM user_prompts`).Scan(&promptsAfter); err != nil {
+				t.Fatalf("count prompts after invalid write: %v", err)
+			}
+			if err := s.db.QueryRow(`SELECT count(*) FROM sync_mutations`).Scan(&mutationsAfter); err != nil {
+				t.Fatalf("count sync mutations after invalid write: %v", err)
+			}
+			if promptsAfter != promptsBefore || mutationsAfter != mutationsBefore {
+				t.Fatalf("invalid prompt changed persistence: prompts %d->%d, mutations %d->%d", promptsBefore, promptsAfter, mutationsBefore, mutationsAfter)
+			}
+		})
+	}
+}
+
 func TestScopeFiltersSearchAndContext(t *testing.T) {
 	s := newTestStore(t)
 
