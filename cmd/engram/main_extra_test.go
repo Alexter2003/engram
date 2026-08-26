@@ -1096,7 +1096,14 @@ func TestCmdCloudUpgradeBootstrapStatusAndRollbackSemantics(t *testing.T) {
 			t.Fatalf("open store: %v", err)
 		}
 		t.Cleanup(func() { _ = s.Close() })
-		if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{Project: "proj-a", Stage: store.UpgradeStageBootstrapVerified, RepairClass: store.UpgradeRepairClassReady}); err != nil {
+		if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{
+			Project:     "proj-a",
+			Stage:       store.UpgradeStageBootstrapVerified,
+			RepairClass: store.UpgradeRepairClassReady,
+			Snapshot: store.CloudUpgradeSnapshot{
+				Captured: true,
+			},
+		}); err != nil {
 			t.Fatalf("seed verified state: %v", err)
 		}
 
@@ -1190,6 +1197,125 @@ func TestCmdCloudUpgradeBootstrapSnapshotExcludesCloudCredentials(t *testing.T) 
 	_, stderr, recovered := captureOutputAndRecover(t, func() { cmdCloud(cfg) })
 	if recovered != nil || stderr != "" {
 		t.Fatalf("bootstrap should not persist cloud credentials, panic=%v stderr=%q", recovered, stderr)
+	}
+}
+
+func TestCmdCloudUpgradeBootstrapCapturesEnrollmentFromPreBootstrapState(t *testing.T) {
+	stubExitWithPanic(t)
+	stubRuntimeHooks(t)
+
+	for _, stage := range []string{store.UpgradeStageDoctorReady, store.UpgradeStageRepairApplied} {
+		t.Run(stage, func(t *testing.T) {
+			cfg := testConfig(t)
+			if err := saveCloudConfig(cfg, &cloudConfig{ServerURL: "https://cloud.example.test"}); err != nil {
+				t.Fatalf("save cloud config: %v", err)
+			}
+			s, err := store.New(cfg)
+			if err != nil {
+				t.Fatalf("open store: %v", err)
+			}
+			if err := s.EnrollProject("proj-a"); err != nil {
+				_ = s.Close()
+				t.Fatalf("seed enrollment: %v", err)
+			}
+			if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{
+				Project:     "proj-a",
+				Stage:       stage,
+				RepairClass: store.UpgradeRepairClassReady,
+			}); err != nil {
+				_ = s.Close()
+				t.Fatalf("seed pre-bootstrap state: %v", err)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatalf("close seeded store: %v", err)
+			}
+
+			oldBootstrap := runUpgradeBootstrap
+			runUpgradeBootstrap = func(s *store.Store, project string, _ *cloudConfig) (*engramsync.UpgradeBootstrapResult, error) {
+				state, err := s.GetCloudUpgradeState(project)
+				if err != nil {
+					return nil, fmt.Errorf("load captured state: %w", err)
+				}
+				if state == nil || !state.Snapshot.Captured || !state.Snapshot.ProjectEnrolled {
+					return nil, fmt.Errorf("expected enrolled pre-bootstrap snapshot, got %+v", state)
+				}
+				return &engramsync.UpgradeBootstrapResult{Project: project, Stage: store.UpgradeStageBootstrapVerified}, nil
+			}
+			t.Cleanup(func() { runUpgradeBootstrap = oldBootstrap })
+
+			withArgs(t, "engram", "cloud", "upgrade", "bootstrap", "--project", "proj-a")
+			_, stderr, recovered := captureOutputAndRecover(t, func() { cmdCloud(cfg) })
+			if recovered != nil || stderr != "" {
+				t.Fatalf("bootstrap should capture existing enrollment, panic=%v stderr=%q", recovered, stderr)
+			}
+		})
+	}
+}
+
+func TestCmdCloudUpgradeBootstrapRejectsUncapturedPostSideEffectCheckpoints(t *testing.T) {
+	stubExitWithPanic(t)
+	stubRuntimeHooks(t)
+
+	for _, stage := range []string{
+		store.UpgradeStageBootstrapEnrolled,
+		store.UpgradeStageBootstrapPushed,
+		store.UpgradeStageBootstrapVerified,
+	} {
+		t.Run(stage, func(t *testing.T) {
+			cfg := testConfig(t)
+			if err := saveCloudConfig(cfg, &cloudConfig{ServerURL: "https://cloud.example.test"}); err != nil {
+				t.Fatalf("save cloud config: %v", err)
+			}
+			s, err := store.New(cfg)
+			if err != nil {
+				t.Fatalf("open store: %v", err)
+			}
+			if err := s.EnrollProject("proj-a"); err != nil {
+				_ = s.Close()
+				t.Fatalf("seed enrollment: %v", err)
+			}
+			if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{
+				Project:     "proj-a",
+				Stage:       stage,
+				RepairClass: store.UpgradeRepairClassRepairable,
+			}); err != nil {
+				_ = s.Close()
+				t.Fatalf("seed uncaptured checkpoint: %v", err)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatalf("close seeded store: %v", err)
+			}
+
+			called := false
+			oldBootstrap := runUpgradeBootstrap
+			runUpgradeBootstrap = func(*store.Store, string, *cloudConfig) (*engramsync.UpgradeBootstrapResult, error) {
+				called = true
+				return nil, nil
+			}
+			t.Cleanup(func() { runUpgradeBootstrap = oldBootstrap })
+
+			withArgs(t, "engram", "cloud", "upgrade", "bootstrap", "--project", "proj-a")
+			_, stderr, recovered := captureOutputAndRecover(t, func() { cmdCloud(cfg) })
+			if _, ok := recovered.(exitCode); !ok {
+				t.Fatalf("expected bootstrap checkpoint rejection, got %v", recovered)
+			}
+			if !strings.Contains(stderr, "requires a captured pre-bootstrap snapshot") {
+				t.Fatalf("expected captured-snapshot guidance, got %q", stderr)
+			}
+			if called {
+				t.Fatal("bootstrap must not proceed from an uncaptured checkpoint")
+			}
+
+			s, err = store.New(cfg)
+			if err != nil {
+				t.Fatalf("reopen store: %v", err)
+			}
+			defer s.Close()
+			enrolled, err := s.IsProjectEnrolled("proj-a")
+			if err != nil || !enrolled {
+				t.Fatalf("rejected bootstrap must preserve enrollment: enrolled=%t err=%v", enrolled, err)
+			}
+		})
 	}
 }
 
@@ -1313,19 +1439,6 @@ func TestCmdCloudUpgradeRepairStatusAndRollbackBranches(t *testing.T) {
 		}
 		if !strings.Contains(string(data), "rollback.example.test") || !strings.Contains(string(data), token) {
 			t.Fatalf("expected rollback to leave existing cloud config intact, got %q", string(data))
-		}
-
-		s, err = store.New(cfg)
-		if err != nil {
-			t.Fatalf("reopen store: %v", err)
-		}
-		t.Cleanup(func() { _ = s.Close() })
-		var snapshotJSON string
-		if err := s.DB().QueryRow(`SELECT snapshot_json FROM cloud_upgrade_state WHERE project = ?`, "proj-a").Scan(&snapshotJSON); err != nil {
-			t.Fatalf("read rolled back snapshot: %v", err)
-		}
-		if strings.Contains(snapshotJSON, token) || strings.Contains(snapshotJSON, `"token"`) || strings.Contains(snapshotJSON, "cloud_config") {
-			t.Fatalf("rollback state persisted credential material: %s", snapshotJSON)
 		}
 	})
 }

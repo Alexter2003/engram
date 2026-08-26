@@ -533,8 +533,13 @@ func captureUpgradeSnapshotBeforeBootstrap(s *store.Store, project string) error
 		return fmt.Errorf("load cloud upgrade state before bootstrap snapshot: %w", err)
 	}
 	if state != nil {
-		snapshot := state.Snapshot
-		if snapshot.Captured {
+		if (state.Stage == store.UpgradeStageBootstrapEnrolled ||
+			state.Stage == store.UpgradeStageBootstrapPushed ||
+			state.Stage == store.UpgradeStageBootstrapVerified) &&
+			!state.Snapshot.Captured {
+			return fmt.Errorf("bootstrap checkpoint requires a captured pre-bootstrap snapshot")
+		}
+		if state.Snapshot.Captured {
 			return nil
 		}
 	}

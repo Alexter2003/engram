@@ -1107,8 +1107,17 @@ func (s *Store) redactCloudUpgradeSnapshots() error {
 			WHEN 1 THEN CASE
 				WHEN json_type(snapshot_json, '$.cloud_config_present') IS NOT NULL
 					OR json_type(snapshot_json, '$.cloud_config_json') IS NOT NULL
-					THEN '{"captured":true,"project_enrolled":' ||
-						CASE json_extract(snapshot_json, '$.project_enrolled') WHEN 1 THEN 'true' ELSE 'false' END || '}'
+					THEN CASE
+						WHEN stage IN ('planned', 'doctor_ready', 'doctor_blocked', 'repair_applied')
+							AND (
+								json_extract(snapshot_json, '$.cloud_config_present') = 1
+								OR ifnull(json_extract(snapshot_json, '$.cloud_config_json'), '') != ''
+								OR json_extract(snapshot_json, '$.project_enrolled') = 1
+							)
+							THEN '{"captured":true,"project_enrolled":' ||
+								CASE json_extract(snapshot_json, '$.project_enrolled') WHEN 1 THEN 'true' ELSE 'false' END || '}'
+						ELSE '{"captured":false,"project_enrolled":false}'
+					END
 				ELSE '{"captured":' ||
 					CASE json_extract(snapshot_json, '$.captured') WHEN 1 THEN 'true' ELSE 'false' END ||
 					',"project_enrolled":' ||
@@ -1206,7 +1215,7 @@ func (s *Store) CanRollbackCloudUpgrade(project string) (bool, error) {
 	if state == nil {
 		return false, nil
 	}
-	return state.Stage != UpgradeStageBootstrapVerified, nil
+	return state.Snapshot.Captured && state.Stage != UpgradeStageBootstrapVerified, nil
 }
 
 func (s *Store) RollbackCloudUpgrade(project string) (CloudUpgradeState, error) {
@@ -1223,7 +1232,7 @@ func (s *Store) RollbackCloudUpgrade(project string) (CloudUpgradeState, error) 
 	if state == nil {
 		return CloudUpgradeState{}, fmt.Errorf("rollback requires existing upgrade checkpoint state")
 	}
-	if state.Stage == UpgradeStageBootstrapVerified {
+	if !state.Snapshot.Captured || state.Stage == UpgradeStageBootstrapVerified {
 		return CloudUpgradeState{}, fmt.Errorf("rollback is unavailable post-bootstrap; use explicit disconnect/unenroll flows")
 	}
 
