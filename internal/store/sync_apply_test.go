@@ -173,6 +173,7 @@ func TestApplyPulledChunk_DefersMissingRelationAndContinues(t *testing.T) {
 	if status != "deferred" {
 		t.Fatalf("apply_status: want deferred, got %q", status)
 	}
+	assertDeferredScope(t, s, missingID, DefaultSyncTargetKey, "proj-apply", "scoped")
 	if got := countRelationRows(t, s, missingID); got != 0 {
 		t.Fatalf("expected missing relation to remain unapplied, got %d rows", got)
 	}
@@ -217,6 +218,7 @@ func TestApplyPulledMutation_DefersMissingRelationAndAdvancesCursor(t *testing.T
 	if status != "deferred" {
 		t.Fatalf("apply_status: want deferred, got %q", status)
 	}
+	assertDeferredScope(t, s, relSyncID, DefaultSyncTargetKey, "proj-apply", "scoped")
 	if got := countRelationRows(t, s, relSyncID); got != 0 {
 		t.Fatalf("expected missing relation to remain unapplied, got %d rows", got)
 	}
@@ -440,6 +442,32 @@ func getDeferredRow(t *testing.T, s *Store, syncID string) (applyStatus string, 
 	return applyStatus, retryCount
 }
 
+func assertDeferredScope(t *testing.T, s *Store, syncID, targetKey, project, scopeClass string) {
+	t.Helper()
+	var gotTargetKey, gotProject, gotScopeClass string
+	if err := s.db.QueryRow(`
+		SELECT target_key, project, scope_class
+		FROM sync_apply_deferred
+		WHERE sync_id = ?
+	`, syncID).Scan(&gotTargetKey, &gotProject, &gotScopeClass); err != nil {
+		t.Fatalf("read deferred scope for %q: %v", syncID, err)
+	}
+	if gotTargetKey != targetKey || gotProject != project || gotScopeClass != scopeClass {
+		t.Fatalf("deferred scope: got target=%q project=%q class=%q, want target=%q project=%q class=%q", gotTargetKey, gotProject, gotScopeClass, targetKey, project, scopeClass)
+	}
+}
+
+func insertScopedDeferredRow(t *testing.T, s *Store, syncID, payload, targetKey, project string, retryCount int) {
+	t.Helper()
+	if _, err := s.db.Exec(`
+		INSERT INTO sync_apply_deferred
+			(sync_id, entity, payload, target_key, project, scope_class, retry_count, apply_status, first_seen_at)
+		VALUES (?, 'relation', ?, ?, ?, 'scoped', ?, 'deferred', datetime('now'))
+	`, syncID, payload, targetKey, project, retryCount); err != nil {
+		t.Fatalf("insertScopedDeferredRow %q: %v", syncID, err)
+	}
+}
+
 // TestReplayDeferred_RetrySucceeds: A deferred row; after the missing obs arrives
 // and ReplayDeferred runs, the row is applied and removed.
 func TestReplayDeferred_RetrySucceeds(t *testing.T) {
@@ -634,6 +662,62 @@ func TestCountDeferredAndDead(t *testing.T) {
 	}
 	if dead != 1 {
 		t.Errorf("dead: want 1, got %d", dead)
+	}
+}
+
+func TestReplayDeferredForScope_IsolatesTargetAndProject(t *testing.T) {
+	s, syncA, _ := setupSyncApplyStore(t)
+	actor := "test-actor"
+	kind := "test"
+	missingPayload := func(syncID, project string) string {
+		payload, err := json.Marshal(syncRelationPayload{
+			SyncID: syncID, SourceID: syncA, TargetID: "obs-missing-" + syncID,
+			Relation: RelationRelated, JudgmentStatus: JudgmentStatusJudged,
+			MarkedByActor: &actor, MarkedByKind: &kind, Project: project,
+		})
+		if err != nil {
+			t.Fatalf("marshal deferred payload: %v", err)
+		}
+		return string(payload)
+	}
+
+	cloudA := "rel-cloud-a"
+	cloudB := "rel-cloud-b"
+	localA := "rel-local-a"
+	insertScopedDeferredRow(t, s, cloudA, missingPayload(cloudA, "project-a"), "cloud", "project-a", 4)
+	insertScopedDeferredRow(t, s, cloudB, missingPayload(cloudB, "project-b"), "cloud", "project-b", 4)
+	insertScopedDeferredRow(t, s, localA, missingPayload(localA, "project-a"), LocalChunkTargetKey, "project-a", 4)
+
+	result, err := s.ReplayDeferredForScope("cloud", "project-b")
+	if err != nil {
+		t.Fatalf("ReplayDeferredForScope cloud project-b: %v", err)
+	}
+	if result.Retried != 1 || result.Dead != 1 {
+		t.Fatalf("cloud project-b replay = %+v, want one dead retry", result)
+	}
+	statusA, retriesA := getDeferredRow(t, s, cloudA)
+	if statusA != "deferred" || retriesA != 4 {
+		t.Fatalf("cloud project-a row changed by project-b replay: status=%q retries=%d", statusA, retriesA)
+	}
+	statusLocal, retriesLocal := getDeferredRow(t, s, localA)
+	if statusLocal != "deferred" || retriesLocal != 4 {
+		t.Fatalf("local row changed by cloud replay: status=%q retries=%d", statusLocal, retriesLocal)
+	}
+	deferred, dead, err := s.CountDeferredAndDeadForScope("cloud", "project-b")
+	if err != nil || deferred != 0 || dead != 1 {
+		t.Fatalf("cloud project-b counts = deferred=%d dead=%d err=%v", deferred, dead, err)
+	}
+
+	result, err = s.ReplayDeferredForScope(LocalChunkTargetKey, "project-a")
+	if err != nil {
+		t.Fatalf("ReplayDeferredForScope local project-a: %v", err)
+	}
+	if result.Retried != 1 || result.Dead != 1 {
+		t.Fatalf("local project-a replay = %+v, want one dead retry", result)
+	}
+	statusA, retriesA = getDeferredRow(t, s, cloudA)
+	if statusA != "deferred" || retriesA != 4 {
+		t.Fatalf("cloud row changed by local replay: status=%q retries=%d", statusA, retriesA)
 	}
 }
 

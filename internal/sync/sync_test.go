@@ -2710,6 +2710,47 @@ func TestCloudImportDefersRelationWhenEndpointIsMissing(t *testing.T) {
 	}
 }
 
+func TestCloudImportEmptyProjectDoesNotReplayAnotherProjectDeferredRelation(t *testing.T) {
+	dst := newTestStore(t)
+	for _, project := range []string{"project-a", "project-b"} {
+		if err := dst.EnrollProject(project); err != nil {
+			t.Fatalf("enroll %s: %v", project, err)
+		}
+	}
+
+	if err := dst.ApplyPulledMutation(cloudTargetKey("project-a"), store.SyncMutation{
+		Seq:       1,
+		Entity:    store.SyncEntityRelation,
+		EntityKey: "rel-project-a-deferred",
+		Op:        store.SyncOpUpsert,
+		Payload:   `{"sync_id":"rel-project-a-deferred","source_id":"obs-project-a-source","target_id":"obs-project-a-missing","relation":"related","judgment_status":"judged","marked_by_actor":"test-actor","marked_by_kind":"test","project":"project-a"}`,
+	}); err != nil {
+		t.Fatalf("seed project-a deferred relation: %v", err)
+	}
+
+	transport := newFakeCloudTransport()
+	transport.manifest = &Manifest{Version: 1}
+	result, err := NewCloudWithTransport(dst, transport, "project-b").Import()
+	if err != nil {
+		t.Fatalf("empty project-b import: %v", err)
+	}
+	if result.RelationsReplayed != 0 || result.RelationsDeferred != 0 || result.RelationsDead != 0 {
+		t.Fatalf("unexpected project-b import result: %+v", result)
+	}
+
+	rows, err := dst.ListDeferred(store.ListDeferredOptions{Status: "deferred"})
+	if err != nil {
+		t.Fatalf("list deferred rows: %v", err)
+	}
+	if len(rows) != 1 || rows[0].TargetKey != cloudTargetKey("project-a") || rows[0].Project != "project-a" || rows[0].RetryCount != 0 {
+		t.Fatalf("project-a deferred row changed by empty project-b import: %+v", rows)
+	}
+	deferred, dead, err := dst.CountDeferredAndDeadForScope(cloudTargetKey("project-b"), "project-b")
+	if err != nil || deferred != 0 || dead != 0 {
+		t.Fatalf("project-b scoped counts = deferred=%d dead=%d err=%v", deferred, dead, err)
+	}
+}
+
 func TestCloudImportMixedChunkAppliesDirectArrayDependenciesBeforeMutations(t *testing.T) {
 	dst := newTestStore(t)
 	if err := dst.EnrollProject("proj-a"); err != nil {

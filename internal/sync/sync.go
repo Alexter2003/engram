@@ -208,6 +208,15 @@ func NewLocal(s *store.Store, syncDir string) *Syncer {
 	return New(s, syncDir)
 }
 
+// NewLocalWithProject creates a filesystem Syncer whose deferred replay is
+// limited to the supplied project. An empty project preserves all-project mode.
+func NewLocalWithProject(s *store.Store, syncDir, project string) *Syncer {
+	sy := New(s, syncDir)
+	project, _ = store.NormalizeProject(project)
+	sy.project = strings.TrimSpace(project)
+	return sy
+}
+
 // NewWithTransport creates a Syncer with a custom Transport implementation.
 // This is used for remote (cloud) sync where chunks travel over HTTP.
 func NewWithTransport(s *store.Store, transport Transport) *Syncer {
@@ -542,12 +551,13 @@ func (sy *Syncer) Import() (*ImportResult, error) {
 // finalizeImport drives the bounded deferred-relation lifecycle after every
 // successful import, including imports with no new chunks.
 func (sy *Syncer) finalizeImport(result *ImportResult) (*ImportResult, error) {
-	replay, err := sy.store.ReplayDeferred()
+	targetKey := sy.chunkTrackingTargetKey("")
+	replay, err := sy.store.ReplayDeferredForScope(targetKey, sy.project)
 	if err != nil {
 		return nil, fmt.Errorf("replay deferred relations: %w", err)
 	}
 	result.RelationsReplayed = replay.Succeeded
-	result.RelationsDeferred, result.RelationsDead, err = sy.store.CountDeferredAndDead()
+	result.RelationsDeferred, result.RelationsDead, err = sy.store.CountDeferredAndDeadForScope(targetKey, sy.project)
 	if err != nil {
 		return nil, fmt.Errorf("count deferred relations: %w", err)
 	}

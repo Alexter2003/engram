@@ -1075,6 +1075,9 @@ func (s *Store) migrate() error {
 			sync_id           TEXT    PRIMARY KEY,
 			entity            TEXT    NOT NULL,
 			payload           TEXT    NOT NULL,
+			target_key        TEXT    NOT NULL DEFAULT '',
+			project           TEXT    NOT NULL DEFAULT '',
+			scope_class       TEXT    NOT NULL DEFAULT 'legacy_unscoped',
 			apply_status      TEXT    NOT NULL DEFAULT 'deferred',
 			retry_count       INTEGER NOT NULL DEFAULT 0,
 			last_error        TEXT,
@@ -1083,6 +1086,25 @@ func (s *Store) migrate() error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_sad_status_seen
 			ON sync_apply_deferred(apply_status, first_seen_at);
+	`); err != nil {
+		return err
+	}
+	deferredColumns := []struct {
+		name       string
+		definition string
+	}{
+		{name: "target_key", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "project", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "scope_class", definition: "TEXT NOT NULL DEFAULT 'legacy_unscoped'"},
+	}
+	for _, c := range deferredColumns {
+		if err := s.addColumnIfNotExists("sync_apply_deferred", c.name, c.definition); err != nil {
+			return err
+		}
+	}
+	if _, err := s.execHook(s.db, `
+		CREATE INDEX IF NOT EXISTS idx_sad_scope_status_seen
+			ON sync_apply_deferred(target_key, project, apply_status, first_seen_at);
 	`); err != nil {
 		return err
 	}
@@ -4230,7 +4252,7 @@ func (s *Store) ApplyPulledMutation(targetKey string, mutation SyncMutation) err
 
 		applyErr := s.applyPulledMutationTx(tx, mutation)
 		if applyErr != nil {
-			if handled, err := s.recordRelationApplyFailureTx(tx, mutation, applyErr); err != nil {
+			if handled, err := s.recordRelationApplyFailureTx(tx, targetKey, mutation, applyErr); err != nil {
 				return err
 			} else if !handled {
 				return applyErr
@@ -4250,7 +4272,7 @@ func (s *Store) ApplyPulledMutation(targetKey string, mutation SyncMutation) err
 // recordRelationApplyFailureTx records relation failures that are safe to
 // acknowledge while preserving the existing fail-fast behavior for other
 // entities and errors.
-func (s *Store) recordRelationApplyFailureTx(tx *sql.Tx, mutation SyncMutation, applyErr error) (bool, error) {
+func (s *Store) recordRelationApplyFailureTx(tx *sql.Tx, targetKey string, mutation SyncMutation, applyErr error) (bool, error) {
 	if mutation.Entity != SyncEntityRelation {
 		return false, nil
 	}
@@ -4265,18 +4287,34 @@ func (s *Store) recordRelationApplyFailureTx(tx *sql.Tx, mutation SyncMutation, 
 		return false, nil
 	}
 
+	project := strings.TrimSpace(mutation.Project)
+	if project == "" {
+		var payload syncRelationPayload
+		if err := json.Unmarshal([]byte(mutation.Payload), &payload); err == nil {
+			project = strings.TrimSpace(payload.Project)
+		}
+	}
+	project, _ = NormalizeProject(project)
+	scopeClass := "target_scoped"
+	if project != "" {
+		scopeClass = "scoped"
+	}
+
 	if _, err := s.execHook(tx, `
 		INSERT INTO sync_apply_deferred
-			(sync_id, entity, payload, apply_status, retry_count, first_seen_at)
-		VALUES (?, ?, ?, ?, 0, datetime('now'))
+			(sync_id, entity, payload, target_key, project, scope_class, apply_status, retry_count, first_seen_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 0, datetime('now'))
 		ON CONFLICT(sync_id) DO UPDATE SET
 			payload           = excluded.payload,
+			target_key        = excluded.target_key,
+			project           = excluded.project,
+			scope_class       = excluded.scope_class,
 			apply_status      = CASE
 				WHEN excluded.apply_status = 'dead' THEN 'dead'
 				ELSE sync_apply_deferred.apply_status
 			END,
 			last_attempted_at = datetime('now')
-	`, mutation.EntityKey, mutation.Entity, mutation.Payload, status); err != nil {
+	`, mutation.EntityKey, mutation.Entity, mutation.Payload, targetKey, project, scopeClass, status); err != nil {
 		return false, fmt.Errorf("write relation apply failure: %w", err)
 	}
 
@@ -4320,7 +4358,7 @@ func (s *Store) ApplyPulledChunk(targetKey, chunkID string, mutations []SyncMuta
 			mutation.TargetKey = targetKey
 			mutation.Source = SyncSourceRemote
 			if applyErr := s.applyPulledMutationTx(tx, mutation); applyErr != nil {
-				if handled, err := s.recordRelationApplyFailureTx(tx, mutation, applyErr); err != nil {
+				if handled, err := s.recordRelationApplyFailureTx(tx, targetKey, mutation, applyErr); err != nil {
 					return fmt.Errorf("apply chunk mutation %d: %w", i, err)
 				} else if !handled {
 					return fmt.Errorf("apply chunk mutation %d: %w", i, applyErr)
@@ -6881,7 +6919,18 @@ type ReplayDeferredResult struct {
 	Dead      int
 }
 
-// ReplayDeferred retries all rows in sync_apply_deferred with apply_status='deferred'
+// ReplayDeferred retries every deferred row, including legacy-unscoped rows. It is
+// reserved for deliberate administrative operations such as conflict recovery.
+func (s *Store) ReplayDeferred() (ReplayDeferredResult, error) {
+	return s.ReplayDeferredForScope("", "")
+}
+
+// ReplayDeferredForScope retries deferred rows for one sync target and optional
+// project. An empty project includes all safely target-scoped rows for that target;
+// an empty target is reserved for ReplayDeferred's administrative global replay.
+// Legacy-unscoped rows are excluded whenever a target or project scope is supplied.
+//
+// It retries rows with apply_status='deferred'
 // (up to 50 per call, ordered by first_seen_at). For each row:
 //   - Calls applyPulledMutationTx inside a transaction.
 //   - On success: the apply itself deletes the deferred row (applyRelationUpsertTx
@@ -6895,17 +6944,29 @@ type ReplayDeferredResult struct {
 // in place.
 //
 // Returns counts (retried, succeeded, failed, dead) for caller logging.
-func (s *Store) ReplayDeferred() (result ReplayDeferredResult, err error) {
+func (s *Store) ReplayDeferredForScope(targetKey, project string) (result ReplayDeferredResult, err error) {
 	const limit = 50
 	const deadThreshold = 5
+	targetKey = strings.TrimSpace(targetKey)
+	project, _ = NormalizeProject(strings.TrimSpace(project))
 
-	rows, err := s.db.Query(`
+	query := `
 		SELECT sync_id, entity, payload, retry_count
 		FROM sync_apply_deferred
-		WHERE apply_status = 'deferred'
-		ORDER BY first_seen_at
-		LIMIT ?
-	`, limit)
+		WHERE apply_status = 'deferred'`
+	args := []any{}
+	if targetKey != "" {
+		query += ` AND target_key = ? AND scope_class != 'legacy_unscoped'`
+		args = append(args, normalizeSyncTargetKey(targetKey))
+	}
+	if project != "" {
+		query += ` AND project = ? AND scope_class = 'scoped'`
+		args = append(args, project)
+	}
+	query += ` ORDER BY first_seen_at LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return result, fmt.Errorf("ReplayDeferred: list deferred: %w", err)
 	}
@@ -6939,6 +7000,8 @@ func (s *Store) ReplayDeferred() (result ReplayDeferredResult, err error) {
 			Op:        SyncOpUpsert,
 			Payload:   row.payload,
 			Source:    SyncSourceRemote,
+			TargetKey: targetKey,
+			Project:   project,
 		}
 
 		applyErr := s.withTx(func(tx *sql.Tx) error {
@@ -6979,16 +7042,33 @@ func (s *Store) ReplayDeferred() (result ReplayDeferredResult, err error) {
 	return result, nil
 }
 
-// CountDeferredAndDead returns the count of rows in sync_apply_deferred grouped
-// by apply_status. Only 'deferred' and 'dead' statuses are counted; 'applied'
-// rows (if any) are not included.
+// CountDeferredAndDead returns global administrative totals, including legacy
+// unscoped rows that normal scoped imports intentionally leave untouched.
 func (s *Store) CountDeferredAndDead() (deferred, dead int, err error) {
-	rows, err := s.db.Query(`
+	return s.CountDeferredAndDeadForScope("", "")
+}
+
+// CountDeferredAndDeadForScope returns queue totals for an optional target and
+// project. Scoped totals exclude legacy-unscoped rows; empty filters return the
+// global administrative totals.
+func (s *Store) CountDeferredAndDeadForScope(targetKey, project string) (deferred, dead int, err error) {
+	targetKey = strings.TrimSpace(targetKey)
+	project, _ = NormalizeProject(strings.TrimSpace(project))
+	query := `
 		SELECT apply_status, count(*)
 		FROM sync_apply_deferred
-		WHERE apply_status IN ('deferred', 'dead')
-		GROUP BY apply_status
-	`)
+		WHERE apply_status IN ('deferred', 'dead')`
+	args := []any{}
+	if targetKey != "" {
+		query += ` AND target_key = ? AND scope_class != 'legacy_unscoped'`
+		args = append(args, normalizeSyncTargetKey(targetKey))
+	}
+	if project != "" {
+		query += ` AND project = ? AND scope_class = 'scoped'`
+		args = append(args, project)
+	}
+	query += ` GROUP BY apply_status`
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return 0, 0, fmt.Errorf("CountDeferredAndDead: query: %w", err)
 	}
@@ -7020,7 +7100,7 @@ func (s *Store) CountDeferredAndDead() (deferred, dead int, err error) {
 // JSON, PayloadValid is false and PayloadRaw is preserved.
 func (s *Store) ListDeferred(opts ListDeferredOptions) ([]DeferredRow, error) {
 	query := `
-		SELECT sync_id, entity, payload, apply_status, retry_count,
+		SELECT sync_id, entity, payload, target_key, project, scope_class, apply_status, retry_count,
 		       last_error, last_attempted_at, first_seen_at
 		FROM sync_apply_deferred
 		WHERE 1=1`
@@ -7067,7 +7147,7 @@ func (s *Store) ListDeferred(opts ListDeferredOptions) ([]DeferredRow, error) {
 // Returns an error wrapping "not found" when no row exists (matches FindCandidates style).
 func (s *Store) GetDeferred(syncID string) (DeferredRow, error) {
 	row := s.db.QueryRow(`
-		SELECT sync_id, entity, payload, apply_status, retry_count,
+		SELECT sync_id, entity, payload, target_key, project, scope_class, apply_status, retry_count,
 		       last_error, last_attempted_at, first_seen_at
 		FROM sync_apply_deferred
 		WHERE sync_id = ?
@@ -7093,7 +7173,7 @@ func scanDeferredRow(row scannable) (DeferredRow, error) {
 	var r DeferredRow
 	var rawPayload string
 	if err := row.Scan(
-		&r.SyncID, &r.Entity, &rawPayload, &r.ApplyStatus, &r.RetryCount,
+		&r.SyncID, &r.Entity, &rawPayload, &r.TargetKey, &r.Project, &r.ScopeClass, &r.ApplyStatus, &r.RetryCount,
 		&r.LastError, &r.LastAttemptedAt, &r.FirstSeenAt,
 	); err != nil {
 		return r, err

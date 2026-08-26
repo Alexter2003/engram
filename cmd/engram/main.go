@@ -232,6 +232,7 @@ func (a *mutationTransportAdapter) PullMutations(sinceSeq int64, limit int) (*au
 	for i, m := range resp.Mutations {
 		mutations[i] = autosync.PulledMutation{
 			Seq:        m.Seq,
+			Project:    m.Project,
 			Entity:     m.Entity,
 			EntityKey:  m.EntityKey,
 			Op:         m.Op,
@@ -1521,7 +1522,7 @@ func cmdSync(cfg store.Config) {
 		markCloudHealthy()
 	}
 
-	sy = engramsync.NewLocal(s, syncDir)
+	sy = engramsync.NewLocalWithProject(s, syncDir, project)
 	if cloudEnabled {
 		cc, err := preflightCloudSync(s, cfg, project, !doStatus)
 		if err != nil {
