@@ -1684,8 +1684,8 @@ func (s *fakeLocalStoreWithDeferred) ReplayDeferredForScope(targetKey, project s
 		if row.TargetKey != targetKey || row.Project != project {
 			continue
 		}
-		if row.ApplyStatus == "dead" {
-			continue // Dead rows must not be retried.
+		if row.ApplyStatus != "deferred" {
+			continue
 		}
 		res.Retried++
 		if s.replayErr != nil {
@@ -1737,16 +1737,30 @@ func TestPullDoesNotReplayOtherTargetDeferredScopes(t *testing.T) {
 	if err := New(ls, tr, DefaultConfig()).pull(context.Background()); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
+	func() {
+		ls.mu.Lock()
+		defer ls.mu.Unlock()
+		if got := ls.replayProjects; len(got) != 1 || got[0] != "project-b" {
+			t.Fatalf("replay projects = %v, want [project-b]", got)
+		}
+		if row := ls.deferredRows[0]; row.RetryCount != 4 || row.ApplyStatus != "deferred" {
+			t.Fatalf("project-a deferred row changed by project-b pull: %+v", row)
+		}
+		if row := ls.deferredRows[1]; row.ApplyStatus != "applied" {
+			t.Fatalf("project-b deferred row was not applied: %+v", row)
+		}
+		if ls.deferredApplied != 1 {
+			t.Fatalf("applied deferred rows = %d, want 1", ls.deferredApplied)
+		}
+	}()
+
+	if err := New(ls, tr, DefaultConfig()).pull(context.Background()); err != nil {
+		t.Fatalf("second pull: %v", err)
+	}
 	ls.mu.Lock()
 	defer ls.mu.Unlock()
-	if got := ls.replayProjects; len(got) != 1 || got[0] != "project-b" {
-		t.Fatalf("replay projects = %v, want [project-b]", got)
-	}
-	if row := ls.deferredRows[0]; row.RetryCount != 4 || row.ApplyStatus != "deferred" {
-		t.Fatalf("project-a deferred row changed by project-b pull: %+v", row)
-	}
-	if row := ls.deferredRows[1]; row.ApplyStatus != "applied" {
-		t.Fatalf("project-b deferred row was not applied: %+v", row)
+	if ls.deferredApplied != 1 {
+		t.Fatalf("second pull reapplied deferred rows: got %d, want 1", ls.deferredApplied)
 	}
 }
 
