@@ -317,6 +317,21 @@ test("session registration requires acknowledgement and failed acknowledgement r
   assert.equal(calls, 2);
 });
 
+test("session compaction strictly registers before forwarding its summary", () => {
+  const compactStart = source.indexOf('pi.on("session_compact"');
+  const compactEnd = source.indexOf('\n  pi.on("before_agent_start"', compactStart);
+  assert.notEqual(compactStart, -1, "session_compact handler not found");
+  assert.notEqual(compactEnd, -1, "session_compact handler end not found");
+  const compactHandler = source.slice(compactStart, compactEnd);
+
+  const registration = compactHandler.indexOf("if (sessionId) await ensureSession(sessionId);");
+  const summaryPost = compactHandler.indexOf('bestEffortEngramFetch("/observations"');
+  assert.notEqual(registration, -1, "session_compact must await strict session registration");
+  assert.notEqual(summaryPost, -1, "session_compact summary post not found");
+  assert.ok(registration < summaryPost, "strict registration must precede summary forwarding");
+  assert.doesNotMatch(compactHandler, /ensureSessionBestEffort/, "session_compact must not hide registration failure");
+});
+
 test("four session-attributed writes ignore model session_id and require the Pi runtime ID", () => {
   for (const tool of ["mem_save", "mem_save_prompt", "mem_session_summary", "mem_capture_passive"]) {
     const schema = source.match(new RegExp(`${tool}: Type\\.Object\\(\\{([\\s\\S]*?)\\n  \\}\\),`));

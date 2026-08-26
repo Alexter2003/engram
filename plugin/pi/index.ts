@@ -914,7 +914,7 @@ export default function registerEngram(pi: ExtensionAPI) {
     await refreshProjectDetection(ctx.cwd);
     if (projectDetectionPending || projectResolutionError) return;
     const sessionId = getSessionId(ctx);
-    if (sessionId) await ensureSessionBestEffort(sessionId);
+    if (sessionId) await ensureSession(sessionId);
 
     const summary = extractCompactedSummary(event);
     if (sessionId && summary) {
