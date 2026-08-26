@@ -1005,6 +1005,141 @@ func TestCmdProjectsConsolidateAllDryRun(t *testing.T) {
 	}
 }
 
+func TestGroupSimilarProjectsIgnoresSharedDirectoriesAndTransitiveMatches(t *testing.T) {
+	for _, projects := range [][]store.ProjectStats{
+		{{Name: "kubernetes", Directories: []string{"/shared"}}, {Name: "photoshop", Directories: []string{"/shared"}}},
+		{{Name: "kubernetes", Directories: []string{"/shared"}}, {Name: "photoshop", Directories: []string{"/shared"}}, {Name: "wireguard", Directories: []string{"/shared"}}},
+		{{Name: "kubernetes", Directories: []string{"/one"}}, {Name: "photoshop", Directories: []string{"/one", "/two"}}, {Name: "wireguard", Directories: []string{"/two"}}},
+	} {
+		if groups := groupSimilarProjects(projects); len(groups) != 0 {
+			t.Fatalf("directory-only projects grouped: %+v", groups)
+		}
+	}
+
+	projects := []store.ProjectStats{
+		{Name: "alpha", ObservationCount: 3, Directories: []string{"/shared"}},
+		{Name: "alpha-old", ObservationCount: 2, Directories: []string{"/shared"}},
+		{Name: "beta", ObservationCount: 1, Directories: []string{"/shared"}},
+		{Name: "beta-old", ObservationCount: 1, Directories: []string{"/shared"}},
+		{Name: "gamma", ObservationCount: 1, Directories: []string{"/shared"}},
+	}
+
+	groups := groupSimilarProjects(projects)
+	if len(groups) != 2 {
+		t.Fatalf("groups = %+v, want two direct-name groups", groups)
+	}
+	if got := groups[0].Names; strings.Join(got, ",") != "alpha,alpha-old" {
+		t.Fatalf("first group = %v, want [alpha alpha-old]", got)
+	}
+	if got := groups[1].Names; strings.Join(got, ",") != "beta,beta-old" {
+		t.Fatalf("second group = %v, want [beta beta-old]", got)
+	}
+
+	chain := []store.ProjectStats{
+		{Name: "abcdefghij", ObservationCount: 3},
+		{Name: "abcXXXghij", ObservationCount: 2},
+		{Name: "abcXXXYYYj", ObservationCount: 1},
+	}
+	groups = groupSimilarProjects(chain)
+	if len(groups) != 1 || strings.Join(groups[0].Names, ",") != "abcXXXYYYj,abcXXXghij" {
+		t.Fatalf("transitive-only member must not be grouped: %+v", groups)
+	}
+}
+
+func TestCmdProjectsConsolidateSingleProjectIgnoresSharedDirectory(t *testing.T) {
+	cfg := testConfig(t)
+	mustSeedObservation(t, cfg, "s-canonical", "canonical", "note", "canonical", "content", "project")
+	mustSeedObservation(t, cfg, "s-unrelated", "unrelated", "note", "unrelated", "content", "project")
+
+	old := detectProject
+	detectProject = func(string) string { return "canonical" }
+	t.Cleanup(func() { detectProject = old })
+
+	withArgs(t, "engram", "projects", "consolidate", "--dry-run")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
+	if stderr != "" {
+		t.Fatalf("stderr = %q", stderr)
+	}
+	if !strings.Contains(stdout, "No similar") || strings.Contains(stdout, "unrelated") {
+		t.Fatalf("shared directory must not create a candidate: %q", stdout)
+	}
+}
+
+func TestCmdProjectsPrunePathsOnlyDryRun(t *testing.T) {
+	cfg := testConfig(t)
+	pathProject := `c:\workspace\orphan`
+	mustSeedSession(t, cfg, "s-path", pathProject)
+	mustSeedSession(t, cfg, "s-ordinary", "ordinary-empty")
+	mustSeedObservation(t, cfg, "s-active", "active-project", "note", "active", "content", "project")
+
+	withArgs(t, "engram", "projects", "prune", "--paths-only", "--dry-run")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsPrune(cfg) })
+	if stderr != "" {
+		t.Fatalf("stderr = %q", stderr)
+	}
+	if !strings.Contains(stdout, pathProject) || strings.Contains(stdout, "ordinary-empty") || strings.Contains(stdout, "active-project") {
+		t.Fatalf("paths-only candidates = %q", stdout)
+	}
+
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	defer s.Close()
+	stats, err := s.ListProjectsWithStats()
+	if err != nil {
+		t.Fatalf("ListProjectsWithStats: %v", err)
+	}
+	if len(stats) != 3 {
+		t.Fatalf("dry-run mutated projects: %+v", stats)
+	}
+}
+
+func TestCmdProjectsPruneWithoutPathsOnlyKeepsOrdinaryBehavior(t *testing.T) {
+	cfg := testConfig(t)
+	mustSeedSession(t, cfg, "s-path", `c:\workspace\orphan`)
+	mustSeedSession(t, cfg, "s-ordinary", "ordinary-empty")
+
+	withArgs(t, "engram", "projects", "prune", "--dry-run")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsPrune(cfg) })
+	if stderr != "" {
+		t.Fatalf("stderr = %q", stderr)
+	}
+	if !strings.Contains(stdout, `c:\workspace\orphan`) || !strings.Contains(stdout, "ordinary-empty") {
+		t.Fatalf("ordinary prune candidates = %q", stdout)
+	}
+}
+
+func TestCmdProjectsPruneReportsOnlySuccessfulProjects(t *testing.T) {
+	cfg := testConfig(t)
+	mustSeedSession(t, cfg, "s-success", "success-empty")
+	mustSeedSession(t, cfg, "s-failure", "failure-empty")
+
+	oldPrune := storePruneProject
+	storePruneProject = func(s *store.Store, project string) (*store.PruneResult, error) {
+		if project == "failure-empty" {
+			return nil, errors.New("forced failure")
+		}
+		return oldPrune(s, project)
+	}
+	t.Cleanup(func() { storePruneProject = oldPrune })
+	oldScan := scanInputLine
+	scanInputLine = func(a ...any) (int, error) {
+		*a[0].(*string) = "all"
+		return 1, nil
+	}
+	t.Cleanup(func() { scanInputLine = oldScan })
+
+	withArgs(t, "engram", "projects", "prune")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsPrune(cfg) })
+	if !strings.Contains(stderr, `Error pruning "failure-empty": forced failure`) {
+		t.Fatalf("stderr = %q", stderr)
+	}
+	if !strings.Contains(stdout, "Pruned 1 project(s): 1 sessions, 0 prompts removed.") {
+		t.Fatalf("stdout = %q", stdout)
+	}
+}
+
 func TestCmdProjectsAllNoGroups(t *testing.T) {
 	cfg := testConfig(t)
 

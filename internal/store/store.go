@@ -5060,9 +5060,9 @@ type PruneResult struct {
 	PromptsDeleted  int64  `json:"prompts_deleted"`
 }
 
-// PruneProject removes all sessions and prompts for a project that has zero
-// (non-deleted) observations. Returns an error if the project still has
-// observations — the caller must verify first.
+// PruneProject removes prompts and sessions without observations for a project
+// that has zero active observations. Soft-deleted observations and their
+// sessions are retained.
 func (s *Store) PruneProject(project string) (*PruneResult, error) {
 	if project == "" {
 		return nil, fmt.Errorf("project name must not be empty")
@@ -5086,7 +5086,9 @@ func (s *Store) PruneProject(project string) (*PruneResult, error) {
 		}
 		result.PromptsDeleted, _ = res.RowsAffected()
 
-		res, err = s.execHook(tx, `DELETE FROM sessions WHERE project = ?`, project)
+		res, err = s.execHook(tx, `DELETE FROM sessions
+			WHERE project = ?
+			  AND NOT EXISTS (SELECT 1 FROM observations WHERE observations.session_id = sessions.id)`, project)
 		if err != nil {
 			return fmt.Errorf("prune sessions: %w", err)
 		}
