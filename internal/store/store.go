@@ -2504,6 +2504,24 @@ func (s *Store) recentUnpinnedObservations(project, scope string, limit int) ([]
 	return s.queryObservations(query, args...)
 }
 
+func (s *Store) compactionObservations(sessionID, project string, pinned bool, limit int) ([]Observation, error) {
+	pinnedValue := 0
+	if pinned {
+		pinnedValue = 1
+	}
+	query := `
+		SELECT ` + observationSelectColumns + `
+		FROM observations o
+		WHERE o.deleted_at IS NULL AND o.session_id = ? AND LOWER(o.project) = ? AND o.pinned = ?
+		ORDER BY datetime(o.created_at) DESC, o.id DESC`
+	args := []any{sessionID, project, pinnedValue}
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
+	return s.queryObservations(query, args...)
+}
+
 // ObservationsNeedingReview returns non-deleted observations whose review_after has passed.
 // An empty project searches all projects, matching existing browse/search conventions.
 func (s *Store) ObservationsNeedingReview(project string, limit int) ([]Observation, error) {
@@ -2682,6 +2700,33 @@ func (s *Store) RecentPrompts(project string, limit int) ([]Prompt, error) {
 	args = append(args, limit)
 
 	rows, err := s.queryItHook(s.db, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []Prompt
+	for rows.Next() {
+		var p Prompt
+		if err := rows.Scan(&p.ID, &p.SyncID, &p.SessionID, &p.Content, &p.Project, &p.CreatedAt); err != nil {
+			return nil, err
+		}
+		results = append(results, p)
+	}
+	return results, rows.Err()
+}
+
+func (s *Store) compactionPrompts(sessionID, project string, limit int) ([]Prompt, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+
+	rows, err := s.queryItHook(s.db, `
+		SELECT id, ifnull(sync_id, '') as sync_id, session_id, content, ifnull(project, '') as project, created_at
+		FROM user_prompts
+		WHERE session_id = ? AND LOWER(ifnull(project, '')) = ?
+		ORDER BY created_at DESC
+		LIMIT ?`, sessionID, project, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -3380,6 +3425,67 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 		for _, obs := range observations {
 			fmt.Fprintf(&b, "- [%s] **%s**: %s\n",
 				obs.Type, obs.Title, truncate(obs.Content, 300))
+		}
+		b.WriteString("\n")
+	}
+
+	return b.String(), nil
+}
+
+// FormatCompactionContext returns runtime context that is strictly limited to
+// one persisted session. The session's project is derived from the store and
+// is never supplied by the caller.
+func (s *Store) FormatCompactionContext(sessionID string) (string, error) {
+	session, err := s.GetSession(sessionID)
+	if err != nil {
+		return "", err
+	}
+
+	project, _ := NormalizeProject(session.Project)
+	var observationCount int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM observations WHERE session_id = ? AND LOWER(project) = ? AND deleted_at IS NULL`, session.ID, project).Scan(&observationCount); err != nil {
+		return "", err
+	}
+	pinned, err := s.compactionObservations(session.ID, project, true, 0)
+	if err != nil {
+		return "", err
+	}
+	observations, err := s.compactionObservations(session.ID, project, false, s.cfg.MaxContextResults)
+	if err != nil {
+		return "", err
+	}
+	prompts, err := s.compactionPrompts(session.ID, project, 10)
+	if err != nil {
+		return "", err
+	}
+
+	var b strings.Builder
+	b.WriteString("## Memory from This Session\n\n")
+	b.WriteString("### Session\n")
+	summary := ""
+	if session.Summary != nil {
+		summary = fmt.Sprintf(": %s", truncate(*session.Summary, 200))
+	}
+	fmt.Fprintf(&b, "- **%s** (%s)%s [%d observations]\n\n", session.ID, timeutil.FormatLocal(session.StartedAt), summary, observationCount)
+
+	if len(prompts) > 0 {
+		b.WriteString("### Recent User Prompts\n")
+		for _, p := range prompts {
+			fmt.Fprintf(&b, "- %s: %s\n", timeutil.FormatLocal(p.CreatedAt), truncate(p.Content, 200))
+		}
+		b.WriteString("\n")
+	}
+	if len(pinned) > 0 {
+		b.WriteString("### Pinned\n")
+		for _, obs := range pinned {
+			fmt.Fprintf(&b, "- [%s] **%s**: %s\n", obs.Type, obs.Title, truncate(obs.Content, 300))
+		}
+		b.WriteString("\n")
+	}
+	if len(observations) > 0 {
+		b.WriteString("### Recent Observations\n")
+		for _, obs := range observations {
+			fmt.Fprintf(&b, "- [%s] **%s**: %s\n", obs.Type, obs.Title, truncate(obs.Content, 300))
 		}
 		b.WriteString("\n")
 	}

@@ -171,7 +171,8 @@ Engram is local-first: local SQLite is authoritative; cloud features are optiona
 
 ### Context
 
-- `GET /context` — Formatted context. Query: `?project=X&scope=project|personal|global`
+- `GET /context` — Manual formatted context scoped by project and optional scope. Query: `?project=X&scope=project|personal|global`
+- `GET /context/compaction` — Runtime compaction context scoped strictly to one persisted session. Query: `?session_id=X`. The server derives the session project; this endpoint does not accept project or scope selection.
 
 ### Passive Capture
 
