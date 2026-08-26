@@ -5015,7 +5015,7 @@ func (s *Store) MergeProjects(sources []string, canonical string) (*MergeResult,
 			sourceUpdated = sourceUpdated || n > 0
 
 			if sourceUpdated {
-				result.SourcesMerged = append(result.SourcesMerged, srcNormalized)
+				result.SourcesMerged = append(result.SourcesMerged, sourceVariants[0])
 			}
 		}
 		// Enqueue sync mutations so cloud sync picks up the merged records.

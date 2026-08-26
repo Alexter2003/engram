@@ -1087,11 +1087,11 @@ Do not skip step 1. Without it, everything done before compaction is lost from m
 
 ## Project Name Normalization
 
-Engram automatically prevents project name drift — the same project saved under different names (`"engram"` vs `"Engram"` vs `"engram-memory"`) by different clients or users.
+Engram automatically prevents project name drift — the same project saved under different names (`"engram"` vs `"Engram"` vs `"  ENGRAM  "`) by different clients or users.
 
 ### Automatic normalization
 
-All project names are normalized on write and read: **lowercase**, **trimmed**, **collapsed hyphens/underscores**. If a name is changed during normalization, a warning is included in the response.
+All project names are normalized on write and read: **lowercase**, **trimmed**, **collapsed hyphens/underscores**. Hyphens and underscores are not interchangeable, so `"engram-memory"` and `"engram_memory"` are not equivalent. If a name is changed during normalization, a warning is included in the response.
 
 ### Auto-detection
 

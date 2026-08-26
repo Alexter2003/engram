@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +20,11 @@ import (
 )
 
 func newMCPTestStore(t *testing.T) *store.Store {
+	s, _ := newMCPTestStoreWithDataDir(t)
+	return s
+}
+
+func newMCPTestStoreWithDataDir(t *testing.T) (*store.Store, string) {
 	t.Helper()
 	cfg, err := store.DefaultConfig()
 	if err != nil {
@@ -33,7 +39,7 @@ func newMCPTestStore(t *testing.T) *store.Store {
 	t.Cleanup(func() {
 		_ = s.Close()
 	})
-	return s
+	return s, cfg.DataDir
 }
 
 func callResultText(t *testing.T, res *mcppkg.CallToolResult) string {
@@ -3055,26 +3061,23 @@ func TestHandleSaveNoSimilarWarningWhenProjectExists(t *testing.T) {
 }
 
 func TestHandleMergeProjects(t *testing.T) {
-	s := newMCPTestStore(t)
-
-	// Set up an observation under the canonical project.
-	if err := s.CreateSession("s-Engram", "Engram", ""); err != nil {
-		t.Fatalf("create session Engram: %v", err)
+	s, dataDir := newMCPTestStoreWithDataDir(t)
+	rawDB, err := sql.Open("sqlite", filepath.Join(dataDir, "engram.db"))
+	if err != nil {
+		t.Fatalf("open test database: %v", err)
 	}
-	if _, err := s.AddObservation(store.AddObservationParams{
-		SessionID: "s-Engram",
-		Type:      "decision",
-		Title:     "From Engram",
-		Content:   "Content from Engram",
-		Project:   "engram", // store normalizes to lowercase
-	}); err != nil {
-		t.Fatalf("add observation Engram: %v", err)
+	t.Cleanup(func() { _ = rawDB.Close() })
+	if _, err := rawDB.Exec(`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)`, "s-legacy", "ENGRAM", ""); err != nil {
+		t.Fatalf("insert legacy session: %v", err)
+	}
+	if _, err := rawDB.Exec(`INSERT INTO observations (sync_id, session_id, type, title, content, project, scope, normalized_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, "legacy-obs", "s-legacy", "decision", "From legacy Engram", "Content from legacy Engram", "ENGRAM", "project", "legacy-hash"); err != nil {
+		t.Fatalf("insert legacy observation: %v", err)
 	}
 
 	h := handleMergeProjects(s)
 
 	req := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
-		"from": "ENGRAM", // uppercase normalization-equivalent source
+		"from": "ENGRAM",
 		"to":   "engram",
 	}}}
 
@@ -3090,17 +3093,26 @@ func TestHandleMergeProjects(t *testing.T) {
 	if !strings.Contains(text, "engram") {
 		t.Fatalf("expected merge result mentioning canonical project, got %q", text)
 	}
-	if !strings.Contains(text, "Observations moved") {
-		t.Fatalf("expected observations count in result, got %q", text)
+	if !strings.Contains(text, "Observations moved: 1") {
+		t.Fatalf("expected positive observations count in result, got %q", text)
 	}
 
-	// Verify that the canonical observation remains available.
 	obs, err := s.RecentObservations("engram", "project", 10)
 	if err != nil {
 		t.Fatalf("recent observations: %v", err)
 	}
 	if len(obs) != 1 {
-		t.Fatalf("expected 1 observation after merge, got %d", len(obs))
+		t.Fatalf("canonical observations = %d, want 1", len(obs))
+	}
+	var legacyRows, canonicalRows int
+	if err := rawDB.QueryRow(`SELECT COUNT(*) FROM observations WHERE project = ?`, "ENGRAM").Scan(&legacyRows); err != nil {
+		t.Fatalf("count legacy observations: %v", err)
+	}
+	if err := rawDB.QueryRow(`SELECT COUNT(*) FROM observations WHERE project = ?`, "engram").Scan(&canonicalRows); err != nil {
+		t.Fatalf("count canonical observations: %v", err)
+	}
+	if legacyRows != 0 || canonicalRows != 1 {
+		t.Fatalf("observation projects after merge: legacy=%d canonical=%d, want 0 and 1", legacyRows, canonicalRows)
 	}
 }
 

@@ -1057,6 +1057,9 @@ func TestCmdProjectsConsolidateAllDryRun(t *testing.T) {
 	if !strings.Contains(stdout, "dry-run") || !strings.Contains(stdout, "Group") {
 		t.Fatalf("expected dry-run group output, got: %q", stdout)
 	}
+	if !strings.Contains(stdout, `Would merge into "engram"`) {
+		t.Fatalf("expected normalized canonical in dry-run output, got: %q", stdout)
+	}
 }
 
 func TestCmdProjectsAllRejectsWeakAndTransitiveGroups(t *testing.T) {
@@ -1077,7 +1080,7 @@ func TestCmdProjectsAllRejectsWeakAndTransitiveGroups(t *testing.T) {
 	}
 }
 
-func TestGroupSimilarProjectsUsesNormalizationEquivalenceAndStableTieBreak(t *testing.T) {
+func TestGroupSimilarProjectsUsesNormalizationEquivalenceAndNormalizedCanonical(t *testing.T) {
 	groups := groupSimilarProjects([]store.ProjectStats{
 		{Name: "engram", ObservationCount: 1, Directories: []string{"/shared"}},
 		{Name: "ENGRAM", ObservationCount: 1, Directories: []string{"/shared"}},
@@ -1090,8 +1093,8 @@ func TestGroupSimilarProjectsUsesNormalizationEquivalenceAndStableTieBreak(t *te
 	if got, want := groups[0].Names, []string{"ENGRAM", "engram"}; !slices.Equal(got, want) {
 		t.Fatalf("group names = %v, want %v", got, want)
 	}
-	if groups[0].Canonical != "ENGRAM" {
-		t.Fatalf("canonical = %q, want stable alphabetical tie winner %q", groups[0].Canonical, "ENGRAM")
+	if groups[0].Canonical != "engram" {
+		t.Fatalf("canonical = %q, want normalized group key %q", groups[0].Canonical, "engram")
 	}
 }
 

@@ -1894,7 +1894,7 @@ func cmdProjectsList(cfg store.Config) {
 // projectGroup represents a set of project names that should be merged.
 type projectGroup struct {
 	Names     []string
-	Canonical string // suggested canonical (most observations)
+	Canonical string // normalized operational canonical
 }
 
 // groupSimilarProjects groups only project names that normalize to the same value.
@@ -1910,18 +1910,9 @@ func groupSimilarProjects(projects []store.ProjectStats) []projectGroup {
 
 	// Build groups — skip singletons (no normalization-equivalent names).
 	var groups []projectGroup
-	for _, members := range byNormalizedName {
+	for canonical, members := range byNormalizedName {
 		if len(members) < 2 {
 			continue
-		}
-		// ListProjectNames uses alphabetical ordering. Use the same stable order
-		// when observation counts do not distinguish a canonical project.
-		best := members[0]
-		for _, member := range members[1:] {
-			if member.ObservationCount > best.ObservationCount ||
-				(member.ObservationCount == best.ObservationCount && member.Name < best.Name) {
-				best = member
-			}
 		}
 		grpNames := make([]string, len(members))
 		for i, member := range members {
@@ -1930,7 +1921,7 @@ func groupSimilarProjects(projects []store.ProjectStats) []projectGroup {
 		sort.Strings(grpNames)
 		groups = append(groups, projectGroup{
 			Names:     grpNames,
-			Canonical: best.Name,
+			Canonical: canonical,
 		})
 	}
 	// Sort groups by canonical name for deterministic output

@@ -7224,7 +7224,7 @@ func TestMergeProjectsCanonicalInSources(t *testing.T) {
 	}
 }
 
-func TestMergeProjectsNormalizesAliasSourcesWithoutLosingLegacyRows(t *testing.T) {
+func TestMergeProjectsReportsTrimmedLegacySourceWithoutLosingRows(t *testing.T) {
 	s := newTestStore(t)
 
 	if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)`, "legacy-session", "Engram Memory", "/work/engram"); err != nil {
@@ -7237,15 +7237,15 @@ func TestMergeProjectsNormalizesAliasSourcesWithoutLosingLegacyRows(t *testing.T
 		t.Fatalf("seed legacy prompt: %v", err)
 	}
 
-	result, err := s.MergeProjects([]string{"Engram Memory"}, "engram memory")
+	result, err := s.MergeProjects([]string{" Engram Memory "}, "engram memory")
 	if err != nil {
 		t.Fatalf("MergeProjects: %v", err)
 	}
 	if result.ObservationsUpdated != 1 || result.SessionsUpdated != 1 || result.PromptsUpdated != 1 {
 		t.Fatalf("unexpected merge result: %+v", result)
 	}
-	if len(result.SourcesMerged) != 1 || result.SourcesMerged[0] != "engram memory" {
-		t.Fatalf("SourcesMerged = %v, want [engram memory]", result.SourcesMerged)
+	if len(result.SourcesMerged) != 1 || result.SourcesMerged[0] != "Engram Memory" {
+		t.Fatalf("SourcesMerged = %v, want [Engram Memory]", result.SourcesMerged)
 	}
 
 	for _, table := range []string{"sessions", "observations", "user_prompts"} {
@@ -7383,18 +7383,30 @@ func TestMergeProjectsRejectsMixedSourcesWithoutMutation(t *testing.T) {
 }
 
 func TestProjectMergeSourceVariantsStayNormalizationEquivalent(t *testing.T) {
-	for _, rawSource := range []string{"Engram", " ENGRAM ", "engram", "foo-bar"} {
-		normalizedSource, _ := NormalizeProject(rawSource)
-		variants := projectMergeSourceVariants(rawSource, normalizedSource, "engram")
-		for _, variant := range variants {
-			normalizedVariant, _ := NormalizeProject(variant)
-			if normalizedVariant != "engram" {
-				t.Fatalf("variant %q normalizes to %q, want engram", variant, normalizedVariant)
-			}
-		}
+	tests := []struct {
+		name             string
+		rawSource        string
+		normalizedSource string
+		canonical        string
+		want             []string
+	}{
+		{name: "legacy case spelling", rawSource: "Engram", normalizedSource: "engram", canonical: "engram", want: []string{"Engram"}},
+		{name: "whitespace input uses trimmed SQL target", rawSource: " ENGRAM ", normalizedSource: "engram", canonical: "engram", want: []string{"ENGRAM"}},
+		{name: "canonical is excluded", rawSource: "engram", normalizedSource: "engram", canonical: "engram", want: nil},
+		{name: "non-equivalent source is excluded", rawSource: "foo-bar", normalizedSource: "foo-bar", canonical: "foo_bar", want: nil},
 	}
-	if variants := projectMergeSourceVariants("foo-bar", "foo-bar", "foo_bar"); len(variants) != 0 {
-		t.Fatalf("separator variants = %v, want none", variants)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := projectMergeSourceVariants(tt.rawSource, tt.normalizedSource, tt.canonical)
+			if len(got) != len(tt.want) {
+				t.Fatalf("variant count = %d, want %d; variants = %v", len(got), len(tt.want), got)
+			}
+			for i, want := range tt.want {
+				if got[i] != want {
+					t.Fatalf("variant[%d] = %q, want %q", i, got[i], want)
+				}
+			}
+		})
 	}
 }
 
