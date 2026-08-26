@@ -144,6 +144,15 @@ func (s *fakeLocalStore) ReplayDeferred() (store.ReplayDeferredResult, error) {
 
 func (s *fakeLocalStore) CountDeferredAndDead() (int, int, error) { return 0, 0, nil }
 
+type fakeLocalStoreWithRepairError struct {
+	*fakeLocalStore
+	repairErr error
+}
+
+func (s *fakeLocalStoreWithRepairError) EnsureEnrolledProjectSyncMutations(context.Context) error {
+	return s.repairErr
+}
+
 // ─── Fake Transport ───────────────────────────────────────────────────────────
 
 type fakeCloudTransport struct {
@@ -618,6 +627,23 @@ func TestManagerPushRepairsEnrolledJournalBeforeListingMutations(t *testing.T) {
 	}
 	if len(transport.pushed) != 1 || len(transport.pushed[0]) != 1 || transport.pushed[0][0].Entity != store.SyncEntitySession {
 		t.Fatalf("pushed mutations = %+v, want repaired session mutation", transport.pushed)
+	}
+}
+
+func TestManagerPushReturnsRepairErrorBeforeTransport(t *testing.T) {
+	local := &fakeLocalStoreWithRepairError{
+		fakeLocalStore: newFakeLocalStore(),
+		repairErr:      errors.New("repair failed"),
+	}
+	local.mutations = []store.SyncMutation{{Seq: 1, Project: "project"}}
+	transport := newFakeTransport()
+
+	err := New(local, transport, DefaultConfig()).push(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "repair enrolled sync journal") {
+		t.Fatalf("push error = %v, want repair enrolled sync journal", err)
+	}
+	if calls := atomic.LoadInt32(&transport.pushCalls); calls != 0 {
+		t.Fatalf("transport push calls = %d, want 0", calls)
 	}
 }
 

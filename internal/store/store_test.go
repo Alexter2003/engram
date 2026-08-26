@@ -7729,6 +7729,25 @@ func TestEnsureEnrolledProjectSyncMutationsRetriesAfterFailure(t *testing.T) {
 	}
 }
 
+func TestEnsureEnrolledProjectSyncMutationsCanceledLeaderSkipsRepair(t *testing.T) {
+	s := newTestStore(t)
+
+	calls := 0
+	s.repairOperation = func() error {
+		calls++
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := s.EnsureEnrolledProjectSyncMutations(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled leader error = %v, want context.Canceled", err)
+	}
+	if calls != 0 {
+		t.Fatalf("repair calls = %d, want 0", calls)
+	}
+}
+
 func TestEnsureEnrolledProjectSyncMutationsSharesConcurrentFirstRepair(t *testing.T) {
 	s := newTestStore(t)
 
@@ -7766,6 +7785,25 @@ func TestEnsureEnrolledProjectSyncMutationsSharesConcurrentFirstRepair(t *testin
 	}
 	if calls != 1 {
 		t.Fatalf("repair calls = %d, want exactly one", calls)
+	}
+}
+
+func TestEnsureEnrolledProjectSyncMutationsWaiterReceivesSuccessfulInFlightResult(t *testing.T) {
+	s := newTestStore(t)
+	inFlight := &enrolledProjectRepair{done: make(chan struct{})}
+
+	s.repairMu.Lock()
+	s.repairInFlight = inFlight
+	s.repairMu.Unlock()
+
+	result := make(chan error, 1)
+	go func() { result <- s.EnsureEnrolledProjectSyncMutations(context.Background()) }()
+
+	s.repairMu.Lock()
+	close(inFlight.done)
+	s.repairMu.Unlock()
+	if err := <-result; err != nil {
+		t.Fatalf("successful waiter error = %v, want nil", err)
 	}
 }
 

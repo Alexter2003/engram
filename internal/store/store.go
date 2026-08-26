@@ -5139,6 +5139,9 @@ func (s *Store) EnsureEnrolledProjectSyncMutations(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	s.repairMu.Lock()
 	if s.repairDone {
