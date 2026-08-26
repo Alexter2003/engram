@@ -639,7 +639,7 @@ func TestFilterRelationMutationsForEndpointAvailability(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			chunk := &ChunkData{Mutations: []store.SyncMutation{mutation}}
-			if err := filterRelationMutationsForEndpointAvailability(chunk, &store.ExportData{Observations: tc.observations}, tc.exported); err != nil {
+			if err := filterRelationMutationsForEndpointAvailability(chunk, &store.ExportData{Observations: tc.observations}, tc.exported, true); err != nil {
 				t.Fatalf("filter relation endpoints: %v", err)
 			}
 			if got := len(chunk.Mutations); (got == 1) != tc.wantRetained {
@@ -750,6 +750,87 @@ func TestLocalChunkExportSkipsRelationWithPersonalEndpoint(t *testing.T) {
 			t.Fatalf("personal endpoint must not be added for relation closure: %+v", observation)
 		}
 	}
+}
+
+func TestLocalChunkExportIncludesRelationWithPersonalEndpointInFullExport(t *testing.T) {
+	s := newTestStore(t)
+	const sessionID = "sess-full-personal-relation-endpoint"
+	if err := s.CreateSession(sessionID, "proj-a", "/tmp/proj-a"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	sourceID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: sessionID,
+		Type:      "decision",
+		Title:     "project endpoint",
+		Content:   "project endpoint content",
+		Project:   "proj-a",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add project endpoint: %v", err)
+	}
+	personalID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: sessionID,
+		Type:      "decision",
+		Title:     "personal endpoint",
+		Content:   "personal endpoint content",
+		Project:   "proj-a",
+		Scope:     "personal",
+	})
+	if err != nil {
+		t.Fatalf("add personal endpoint: %v", err)
+	}
+	source, err := s.GetObservation(sourceID)
+	if err != nil {
+		t.Fatalf("get project endpoint: %v", err)
+	}
+	personal, err := s.GetObservation(personalID)
+	if err != nil {
+		t.Fatalf("get personal endpoint: %v", err)
+	}
+
+	const relationID = "rel-full-personal-endpoint"
+	if _, err := s.SaveRelation(store.SaveRelationParams{SyncID: relationID, SourceID: source.SyncID, TargetID: personal.SyncID}); err != nil {
+		t.Fatalf("save relation: %v", err)
+	}
+	confidence := 0.9
+	if _, err := s.JudgeRelation(store.JudgeRelationParams{
+		JudgmentID:    relationID,
+		Relation:      store.RelationCompatible,
+		Confidence:    &confidence,
+		MarkedByActor: "test",
+		MarkedByKind:  "system",
+	}); err != nil {
+		t.Fatalf("judge relation: %v", err)
+	}
+
+	syncDir := filepath.Join(t.TempDir(), ".engram")
+	result, err := New(s, syncDir).Export("alice", "")
+	if err != nil {
+		t.Fatalf("full export: %v", err)
+	}
+	chunkJSON, err := readGzip(filepath.Join(syncDir, "chunks", result.ChunkID+".jsonl.gz"))
+	if err != nil {
+		t.Fatalf("read chunk: %v", err)
+	}
+	var chunk ChunkData
+	if err := json.Unmarshal(chunkJSON, &chunk); err != nil {
+		t.Fatalf("unmarshal chunk: %v", err)
+	}
+
+	observations := map[string]bool{}
+	for _, observation := range chunk.Observations {
+		observations[observation.SyncID] = true
+	}
+	if !observations[source.SyncID] || !observations[personal.SyncID] {
+		t.Fatalf("expected both relation endpoints in full export, got %+v", chunk.Observations)
+	}
+	for _, mutation := range chunk.Mutations {
+		if mutation.Entity == store.SyncEntityRelation && mutation.EntityKey == relationID {
+			return
+		}
+	}
+	t.Fatalf("relation with personal endpoint was not exported: %+v", chunk.Mutations)
 }
 
 func TestLocalChunkExportRejectsMalformedRelationEndpointPayload(t *testing.T) {

@@ -416,7 +416,7 @@ func (sy *Syncer) Export(createdBy string, project string) (*SyncResult, error) 
 			return nil, fmt.Errorf("scan exported relations: %w", err)
 		}
 		chunk.Mutations = filterRelationMutationsForExport(relationMutations, exportedRelations, lastChunkTime)
-		if err := filterRelationMutationsForEndpointAvailability(chunk, data, exportedObservations); err != nil {
+		if err := filterRelationMutationsForEndpointAvailability(chunk, data, exportedObservations, strings.TrimSpace(project) != ""); err != nil {
 			return nil, fmt.Errorf("filter relation endpoints: %w", err)
 		}
 	}
@@ -1170,8 +1170,8 @@ func filterExportDataToProjectScope(data *store.ExportData) *store.ExportData {
 // when both endpoints are available in the current or a prior manifest chunk.
 // It never re-exports stale observations as relation closure because a receiver
 // could overwrite newer local content. Relations involving endpoints outside
-// the current project export are skipped with a visible warning.
-func filterRelationMutationsForEndpointAvailability(chunk *ChunkData, data *store.ExportData, exportedObservations map[string]struct{}) error {
+// a named project export are skipped with a visible warning.
+func filterRelationMutationsForEndpointAvailability(chunk *ChunkData, data *store.ExportData, exportedObservations map[string]struct{}, requireProjectScope bool) error {
 	observationsBySyncID := make(map[string]store.Observation, len(data.Observations))
 	for _, observation := range data.Observations {
 		observationsBySyncID[observation.SyncID] = observation
@@ -1209,7 +1209,7 @@ func filterRelationMutationsForEndpointAvailability(chunk *ChunkData, data *stor
 				skip = true
 				break
 			}
-			if observation.Scope != "project" {
+			if requireProjectScope && observation.Scope != "project" {
 				log.Printf("[sync] warning: skipping relation %s because endpoint %s has %q scope", mutation.EntityKey, endpointID, observation.Scope)
 				skip = true
 				break
