@@ -4570,6 +4570,7 @@ func TestStoreUncoveredBranchesPushToHundred(t *testing.T) {
 	t.Run("query iterator scan and rows.Err branches", func(t *testing.T) {
 		s := newTestStore(t)
 		origQueryIt := s.hooks.queryIt
+		origQueryItContext := s.hooks.queryItContext
 
 		setScanErr := func(match string) {
 			s.hooks.queryIt = func(db queryer, query string, args ...any) (rowScanner, error) {
@@ -4577,6 +4578,12 @@ func TestStoreUncoveredBranchesPushToHundred(t *testing.T) {
 					return &fakeRows{next: []bool{true, false}, scanErr: errors.New("forced scan error")}, nil
 				}
 				return origQueryIt(db, query, args...)
+			}
+			s.hooks.queryItContext = func(ctx context.Context, db *sql.DB, query string, args ...any) (rowScanner, error) {
+				if strings.Contains(query, match) {
+					return &fakeRows{next: []bool{true, false}, scanErr: errors.New("forced scan error")}, nil
+				}
+				return origQueryItContext(ctx, db, query, args...)
 			}
 		}
 
@@ -4586,6 +4593,12 @@ func TestStoreUncoveredBranchesPushToHundred(t *testing.T) {
 					return &fakeRows{next: []bool{false}, err: errors.New("forced rows err")}, nil
 				}
 				return origQueryIt(db, query, args...)
+			}
+			s.hooks.queryItContext = func(ctx context.Context, db *sql.DB, query string, args ...any) (rowScanner, error) {
+				if strings.Contains(query, match) {
+					return &fakeRows{next: []bool{false}, err: errors.New("forced rows err")}, nil
+				}
+				return origQueryItContext(ctx, db, query, args...)
 			}
 		}
 
@@ -9073,6 +9086,34 @@ func TestSearch_WeightedBM25Ranking(t *testing.T) {
 	if results[1].ID != idB {
 		t.Errorf("expected observation B (content match) to rank second; got second: %d (title: %q, rank: %v)",
 			results[1].ID, results[1].Title, results[1].Rank)
+	}
+}
+
+func TestSearchContext_AlreadyCanceled(t *testing.T) {
+	s := newTestStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	results, err := s.SearchContext(ctx, "unreachable", SearchOptions{Project: "engram", Limit: 10})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context cancellation, got results=%v err=%v", results, err)
+	}
+	if results != nil {
+		t.Fatalf("expected no results from canceled search, got %v", results)
+	}
+}
+
+func TestFTSQueriesUseFTSFirstCrossJoin(t *testing.T) {
+	searchQuery, _ := buildSearchFTSQuery(`"memory"`, SearchOptions{}, 10)
+	for name, query := range map[string]string{
+		"search":          searchQuery,
+		"find candidates": findCandidatesFTSQuery,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if !strings.Contains(query, "CROSS JOIN observations o ON o.id = fts.rowid") {
+				t.Fatalf("expected FTS-first CROSS JOIN, got query:\n%s", query)
+			}
+		})
 	}
 }
 

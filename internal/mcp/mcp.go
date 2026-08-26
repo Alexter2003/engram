@@ -1018,7 +1018,7 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
 		sessionID := defaultSessionID(project)
 		activity.RecordToolCall(sessionID)
 
-		results, err := s.Search(query, store.SearchOptions{
+		results, err := s.SearchContext(ctx, query, store.SearchOptions{
 			Type:      typ,
 			Project:   searchProject,
 			Scope:     scope,
@@ -1043,8 +1043,10 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
 		}
 		relationsMap := map[string]store.ObservationRelations{}
 		if len(syncIDs) > 0 {
-			if rm, relErr := s.GetRelationsForObservations(syncIDs); relErr == nil {
+			if rm, relErr := s.GetRelationsForObservationsContext(ctx, syncIDs); relErr == nil {
 				relationsMap = rm
+			} else if errors.Is(relErr, context.Canceled) || errors.Is(relErr, context.DeadlineExceeded) {
+				return mcp.NewToolResultError(fmt.Sprintf("Search error: %s. Try simpler keywords.", relErr)), nil
 			}
 			// Errors from relation loading are swallowed — search must not fail.
 		}

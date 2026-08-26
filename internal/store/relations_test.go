@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"log"
 	"strings"
@@ -19,6 +20,21 @@ func setupRelationsStore(t *testing.T) *Store {
 		t.Fatalf("CreateSession: %v", err)
 	}
 	return s
+}
+
+func TestGetRelationsForObservationsContext_AlreadyCanceled(t *testing.T) {
+	s := setupRelationsStore(t)
+	_, syncID := addTestObs(t, s, "Contextual relation", "decision", "testproject", "project")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	relations, err := s.GetRelationsForObservationsContext(ctx, []string{syncID})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context cancellation, got relations=%v err=%v", relations, err)
+	}
+	if relations != nil {
+		t.Fatalf("expected no relations from canceled enrichment, got %v", relations)
+	}
 }
 
 // addTestObs inserts a single observation and returns its (id, syncID).
