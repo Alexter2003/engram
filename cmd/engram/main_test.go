@@ -1095,6 +1095,71 @@ func TestCmdProjectsPrunePathsOnlyDryRun(t *testing.T) {
 	}
 }
 
+func TestCmdProjectsPrunePathsOnly(t *testing.T) {
+	cfg := testConfig(t)
+	forwardSlashProject := "/tmp/orphan"
+	backslashProject := `c:\workspace\orphan`
+	mustSeedPrompt(t, cfg, "s-forward-slash", forwardSlashProject)
+	mustSeedPrompt(t, cfg, "s-backslash", backslashProject)
+	mustSeedSession(t, cfg, "s-ordinary", "ordinary-empty")
+	mustSeedObservation(t, cfg, "s-active", "active-project", "note", "active", "content", "project")
+
+	oldScan := scanInputLine
+	scanInputLine = func(a ...any) (int, error) {
+		*a[0].(*string) = "all"
+		return 1, nil
+	}
+	t.Cleanup(func() { scanInputLine = oldScan })
+
+	withArgs(t, "engram", "projects", "prune", "--paths-only")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsPrune(cfg) })
+	if stderr != "" {
+		t.Fatalf("stderr = %q", stderr)
+	}
+	for _, project := range []string{forwardSlashProject, backslashProject} {
+		if !strings.Contains(stdout, project) {
+			t.Fatalf("paths-only output missing %q: %q", project, stdout)
+		}
+	}
+	if strings.Contains(stdout, "ordinary-empty") || strings.Contains(stdout, "active-project") {
+		t.Fatalf("paths-only output included a retained project: %q", stdout)
+	}
+	if !strings.Contains(stdout, "Pruned 2 project(s): 2 sessions, 2 prompts removed.") {
+		t.Fatalf("prune result = %q", stdout)
+	}
+
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	defer s.Close()
+	for _, sessionID := range []string{"s-forward-slash", "s-backslash"} {
+		if _, err := s.GetSession(sessionID); err == nil {
+			t.Fatalf("pruned session %q still exists", sessionID)
+		}
+	}
+	stats, err := s.ListProjectsWithStats()
+	if err != nil {
+		t.Fatalf("ListProjectsWithStats: %v", err)
+	}
+	remaining := make(map[string]store.ProjectStats, len(stats))
+	for _, ps := range stats {
+		remaining[ps.Name] = ps
+	}
+	if _, ok := remaining[forwardSlashProject]; ok {
+		t.Fatalf("pruned project %q still has data: %+v", forwardSlashProject, remaining[forwardSlashProject])
+	}
+	if _, ok := remaining[backslashProject]; ok {
+		t.Fatalf("pruned project %q still has data: %+v", backslashProject, remaining[backslashProject])
+	}
+	if ordinary, ok := remaining["ordinary-empty"]; !ok || ordinary.SessionCount != 1 {
+		t.Fatalf("ordinary empty project = %+v, want one retained session", ordinary)
+	}
+	if active, ok := remaining["active-project"]; !ok || active.ObservationCount != 1 || active.SessionCount != 1 {
+		t.Fatalf("active project = %+v, want one retained observation and session", active)
+	}
+}
+
 func TestCmdProjectsPruneWithoutPathsOnlyKeepsOrdinaryBehavior(t *testing.T) {
 	cfg := testConfig(t)
 	mustSeedSession(t, cfg, "s-path", `c:\workspace\orphan`)
