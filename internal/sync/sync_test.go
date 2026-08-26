@@ -949,6 +949,10 @@ func TestUpgradeBootstrapCheckpointResume(t *testing.T) {
 		Project:     "proj-a",
 		Stage:       store.UpgradeStageBootstrapEnrolled,
 		RepairClass: store.UpgradeRepairClassRepairable,
+		Snapshot: store.CloudUpgradeSnapshot{
+			Captured:        true,
+			ProjectEnrolled: false,
+		},
 	}); err != nil {
 		t.Fatalf("seed checkpoint stage: %v", err)
 	}
@@ -976,6 +980,53 @@ func TestUpgradeBootstrapCheckpointResume(t *testing.T) {
 	if transport.writeChunkCalls != writeCallsBefore {
 		t.Fatalf("expected no additional push writes on rerun, before=%d after=%d", writeCallsBefore, transport.writeChunkCalls)
 	}
+
+	state, err := s.GetCloudUpgradeState("proj-a")
+	if err != nil {
+		t.Fatalf("load checkpoint state: %v", err)
+	}
+	if state == nil || !state.Snapshot.Captured || state.Snapshot.ProjectEnrolled {
+		t.Fatalf("expected checkpoints to preserve the pre-bootstrap snapshot, got %+v", state)
+	}
+	var snapshotJSON string
+	if err := s.DB().QueryRow(`SELECT snapshot_json FROM cloud_upgrade_state WHERE project = ?`, "proj-a").Scan(&snapshotJSON); err != nil {
+		t.Fatalf("read persisted checkpoint snapshot: %v", err)
+	}
+	if strings.Contains(snapshotJSON, `"token"`) || strings.Contains(snapshotJSON, "cloud_config") {
+		t.Fatalf("checkpoint persisted credential material: %s", snapshotJSON)
+	}
+}
+
+func TestBootstrapProjectRejectsUncapturedPostSideEffectCheckpoints(t *testing.T) {
+	for _, stage := range []string{
+		store.UpgradeStageBootstrapEnrolled,
+		store.UpgradeStageBootstrapPushed,
+		store.UpgradeStageBootstrapVerified,
+	} {
+		t.Run(stage, func(t *testing.T) {
+			s := newTestStore(t)
+			if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{
+				Project:     "proj-a",
+				Stage:       stage,
+				RepairClass: store.UpgradeRepairClassRepairable,
+			}); err != nil {
+				t.Fatalf("seed uncaptured checkpoint: %v", err)
+			}
+
+			transport := newFakeCloudTransport()
+			_, err := BootstrapProject(s, transport, UpgradeBootstrapOptions{Project: "proj-a"})
+			if err == nil || !strings.Contains(err.Error(), "requires a captured pre-bootstrap snapshot") {
+				t.Fatalf("expected uncaptured checkpoint failure, got %v", err)
+			}
+			if transport.writeChunkCalls != 0 {
+				t.Fatalf("uncaptured checkpoint must not push, writes=%d", transport.writeChunkCalls)
+			}
+			enrolled, err := s.IsProjectEnrolled("proj-a")
+			if err != nil || enrolled {
+				t.Fatalf("uncaptured checkpoint must not change enrollment: enrolled=%t err=%v", enrolled, err)
+			}
+		})
+	}
 }
 
 func TestRollbackProjectInvokesAutosyncHooksAndHonorsBoundary(t *testing.T) {
@@ -985,8 +1036,8 @@ func TestRollbackProjectInvokesAutosyncHooksAndHonorsBoundary(t *testing.T) {
 		Stage:       store.UpgradeStageBootstrapPushed,
 		RepairClass: store.UpgradeRepairClassRepairable,
 		Snapshot: store.CloudUpgradeSnapshot{
-			CloudConfigPresent: true,
-			ProjectEnrolled:    false,
+			Captured:        true,
+			ProjectEnrolled: false,
 		},
 	}); err != nil {
 		t.Fatalf("seed rollback state: %v", err)
@@ -1056,6 +1107,20 @@ func TestBootstrapProjectValidationAndCreatedByDefault(t *testing.T) {
 		if transport.lastCreatedBy != "upgrade-bootstrap" {
 			t.Fatalf("expected default createdBy upgrade-bootstrap, got %q", transport.lastCreatedBy)
 		}
+		state, err := s.GetCloudUpgradeState("proj-a")
+		if err != nil {
+			t.Fatalf("load direct bootstrap state: %v", err)
+		}
+		if state == nil || !state.Snapshot.Captured || state.Snapshot.ProjectEnrolled {
+			t.Fatalf("expected direct bootstrap to preserve the pre-enrollment snapshot, got %+v", state)
+		}
+		var snapshotJSON string
+		if err := s.DB().QueryRow(`SELECT snapshot_json FROM cloud_upgrade_state WHERE project = ?`, "proj-a").Scan(&snapshotJSON); err != nil {
+			t.Fatalf("read persisted direct bootstrap snapshot: %v", err)
+		}
+		if strings.Contains(snapshotJSON, `"token"`) || strings.Contains(snapshotJSON, "cloud_config") {
+			t.Fatalf("direct bootstrap persisted credential material: %s", snapshotJSON)
+		}
 	})
 }
 
@@ -1067,6 +1132,7 @@ func TestRollbackProjectHandlesHookFailures(t *testing.T) {
 			Stage:       store.UpgradeStageBootstrapPushed,
 			RepairClass: store.UpgradeRepairClassRepairable,
 			Snapshot: store.CloudUpgradeSnapshot{
+				Captured:        true,
 				ProjectEnrolled: false,
 			},
 		}); err != nil {
@@ -1090,6 +1156,7 @@ func TestRollbackProjectHandlesHookFailures(t *testing.T) {
 			Stage:       store.UpgradeStageBootstrapPushed,
 			RepairClass: store.UpgradeRepairClassRepairable,
 			Snapshot: store.CloudUpgradeSnapshot{
+				Captured:        true,
 				ProjectEnrolled: false,
 			},
 		}); err != nil {
@@ -1117,6 +1184,7 @@ func TestRollbackProjectHandlesHookFailures(t *testing.T) {
 			Stage:       store.UpgradeStageBootstrapPushed,
 			RepairClass: store.UpgradeRepairClassRepairable,
 			Snapshot: store.CloudUpgradeSnapshot{
+				Captured:        true,
 				ProjectEnrolled: false,
 			},
 		}); err != nil {

@@ -2098,9 +2098,8 @@ func TestUpgradeStateSnapshotLifecycle(t *testing.T) {
 	}
 
 	snapshot := CloudUpgradeSnapshot{
-		CloudConfigPresent: true,
-		CloudConfigJSON:    `{"server_url":"https://cloud.example.test"}`,
-		ProjectEnrolled:    false,
+		Captured:        true,
+		ProjectEnrolled: false,
 	}
 	state := CloudUpgradeState{
 		Project:          project,
@@ -2124,7 +2123,7 @@ func TestUpgradeStateSnapshotLifecycle(t *testing.T) {
 	if stored.Stage != UpgradeStageBootstrapEnrolled {
 		t.Fatalf("expected stage %q, got %q", UpgradeStageBootstrapEnrolled, stored.Stage)
 	}
-	if !stored.Snapshot.CloudConfigPresent || stored.Snapshot.CloudConfigJSON == "" {
+	if !stored.Snapshot.Captured || stored.Snapshot.ProjectEnrolled {
 		t.Fatalf("expected snapshot to roundtrip, got %+v", stored.Snapshot)
 	}
 
@@ -2159,6 +2158,84 @@ func TestUpgradeStateSnapshotLifecycle(t *testing.T) {
 	}
 	if afterClear != nil {
 		t.Fatalf("expected nil upgrade state after clear, got %+v", afterClear)
+	}
+}
+
+func TestCloudUpgradeSnapshotMigrationRedactsAndPreservesOnlyTrustedCaptures(t *testing.T) {
+	cfg := mustDefaultConfig(t)
+	cfg.DataDir = t.TempDir()
+
+	s, err := New(cfg)
+	if err != nil {
+		t.Fatalf("create store: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close store before legacy seed: %v", err)
+	}
+
+	const token = "test-legacy-token-must-not-remain-in-sqlite"
+	testCases := []struct {
+		project  string
+		stage    string
+		snapshot string
+		want     CloudUpgradeSnapshot
+	}{
+		{"legacy-captured", UpgradeStageDoctorReady, fmt.Sprintf(`{"cloud_config_present":true,"cloud_config_json":"%s","project_enrolled":true}`, token), CloudUpgradeSnapshot{Captured: true, ProjectEnrolled: true}},
+		{"legacy-doctor", UpgradeStageDoctorBlocked, `{"cloud_config_present":false,"project_enrolled":false}`, CloudUpgradeSnapshot{}},
+		{"legacy-repair", UpgradeStageRepairApplied, `{"cloud_config_present":false,"project_enrolled":false}`, CloudUpgradeSnapshot{}},
+		{"legacy-post-side-effect", UpgradeStageBootstrapPushed, `{"cloud_config_present":true,"project_enrolled":false}`, CloudUpgradeSnapshot{}},
+		{"current-doctor", UpgradeStageDoctorReady, `{"captured":false,"project_enrolled":false}`, CloudUpgradeSnapshot{}},
+		{"current-repair", UpgradeStageRepairApplied, `{"captured":false,"project_enrolled":false}`, CloudUpgradeSnapshot{}},
+		{"malformed-enrolled", UpgradeStageBootstrapEnrolled, `{"captured":`, CloudUpgradeSnapshot{}},
+		{"malformed-pushed", UpgradeStageBootstrapPushed, `{"captured":`, CloudUpgradeSnapshot{}},
+	}
+	raw, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
+	if err != nil {
+		t.Fatalf("open raw store: %v", err)
+	}
+	for _, tc := range testCases {
+		if _, err := raw.Exec(`INSERT INTO cloud_upgrade_state (project, stage, snapshot_json) VALUES (?, ?, ?)`, tc.project, tc.stage, tc.snapshot); err != nil {
+			_ = raw.Close()
+			t.Fatalf("seed %s snapshot: %v", tc.project, err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw store: %v", err)
+	}
+
+	s, err = New(cfg)
+	if err != nil {
+		t.Fatalf("reopen migrated store: %v", err)
+	}
+
+	for _, tc := range testCases {
+		state, err := s.GetCloudUpgradeState(tc.project)
+		if err != nil || state == nil || state.Snapshot != tc.want {
+			t.Fatalf("migrate %s snapshot: state=%+v err=%v", tc.project, state, err)
+		}
+		if tc.want.Captured {
+			continue
+		}
+		allowed, err := s.CanRollbackCloudUpgrade(tc.project)
+		if err != nil || allowed {
+			t.Fatalf("uncaptured %s snapshot must not allow rollback: allowed=%t err=%v", tc.project, allowed, err)
+		}
+	}
+	var snapshotJSON string
+	if err := s.DB().QueryRow(`SELECT snapshot_json FROM cloud_upgrade_state WHERE project = ?`, "legacy-captured").Scan(&snapshotJSON); err != nil || strings.Contains(snapshotJSON, token) || strings.Contains(snapshotJSON, `"token"`) || strings.Contains(snapshotJSON, "cloud_config") {
+		t.Fatalf("legacy credential material remained in snapshot: %s (%v)", snapshotJSON, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close migrated store: %v", err)
+	}
+	s, err = New(cfg)
+	if err != nil {
+		t.Fatalf("reopen idempotently redacted store: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	state, err := s.GetCloudUpgradeState("legacy-captured")
+	if err != nil || state == nil || !state.Snapshot.Captured || !state.Snapshot.ProjectEnrolled {
+		t.Fatalf("idempotent migration lost captured snapshot: state=%+v err=%v", state, err)
 	}
 }
 
@@ -2667,9 +2744,8 @@ func TestRollbackCloudUpgradeSafetyBoundary(t *testing.T) {
 			Stage:       UpgradeStageBootstrapPushed,
 			RepairClass: UpgradeRepairClassRepairable,
 			Snapshot: CloudUpgradeSnapshot{
-				CloudConfigPresent: true,
-				CloudConfigJSON:    `{"server_url":"https://cloud.example.test"}`,
-				ProjectEnrolled:    false,
+				Captured:        true,
+				ProjectEnrolled: false,
 			},
 		}); err != nil {
 			t.Fatalf("seed upgrade state: %v", err)
@@ -2698,8 +2774,8 @@ func TestRollbackCloudUpgradeSafetyBoundary(t *testing.T) {
 			Stage:       UpgradeStageBootstrapVerified,
 			RepairClass: UpgradeRepairClassReady,
 			Snapshot: CloudUpgradeSnapshot{
-				CloudConfigPresent: true,
-				ProjectEnrolled:    true,
+				Captured:        true,
+				ProjectEnrolled: true,
 			},
 		}); err != nil {
 			t.Fatalf("seed verified state: %v", err)
@@ -2708,6 +2784,31 @@ func TestRollbackCloudUpgradeSafetyBoundary(t *testing.T) {
 		_, err := s.RollbackCloudUpgrade("rb-verified")
 		if err == nil || !strings.Contains(err.Error(), "rollback is unavailable post-bootstrap") {
 			t.Fatalf("expected loud post-boundary failure, got %v", err)
+		}
+	})
+
+	t.Run("rollback rejects uncaptured checkpoints without changing enrollment", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.EnrollProject("rb-uncaptured"); err != nil {
+			t.Fatalf("seed enrolled project: %v", err)
+		}
+		if err := s.SaveCloudUpgradeState(CloudUpgradeState{
+			Project:     "rb-uncaptured",
+			Stage:       UpgradeStageBootstrapPushed,
+			RepairClass: UpgradeRepairClassRepairable,
+		}); err != nil {
+			t.Fatalf("seed uncaptured checkpoint: %v", err)
+		}
+
+		if _, err := s.RollbackCloudUpgrade("rb-uncaptured"); err == nil || !strings.Contains(err.Error(), "rollback requires a captured pre-bootstrap snapshot") {
+			t.Fatalf("expected snapshot-specific rollback failure, got %v", err)
+		}
+		enrolled, err := s.IsProjectEnrolled("rb-uncaptured")
+		if err != nil {
+			t.Fatalf("verify enrollment after rejected rollback: %v", err)
+		}
+		if !enrolled {
+			t.Fatal("rejected rollback must not unenroll the project")
 		}
 	})
 }

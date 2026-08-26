@@ -311,9 +311,8 @@ const (
 )
 
 type CloudUpgradeSnapshot struct {
-	CloudConfigPresent bool   `json:"cloud_config_present"`
-	CloudConfigJSON    string `json:"cloud_config_json,omitempty"`
-	ProjectEnrolled    bool   `json:"project_enrolled"`
+	Captured        bool `json:"captured"`
+	ProjectEnrolled bool `json:"project_enrolled"`
 }
 
 type CloudUpgradeState struct {
@@ -819,6 +818,9 @@ func (s *Store) migrate() error {
 	if _, err := s.execHook(s.db, schema); err != nil {
 		return err
 	}
+	if err := s.redactCloudUpgradeSnapshots(); err != nil {
+		return err
+	}
 
 	observationColumns := []struct {
 		name       string
@@ -1098,6 +1100,35 @@ func (s *Store) migrate() error {
 	return nil
 }
 
+func (s *Store) redactCloudUpgradeSnapshots() error {
+	_, err := s.execHook(s.db, `
+		UPDATE cloud_upgrade_state
+		SET snapshot_json = CASE json_valid(snapshot_json)
+			WHEN 1 THEN CASE
+				WHEN json_type(snapshot_json, '$.cloud_config_present') IS NOT NULL
+					OR json_type(snapshot_json, '$.cloud_config_json') IS NOT NULL
+					THEN CASE
+						WHEN stage IN ('planned', 'doctor_ready', 'doctor_blocked', 'repair_applied')
+							AND (
+								json_extract(snapshot_json, '$.cloud_config_present') = 1
+								OR ifnull(json_extract(snapshot_json, '$.cloud_config_json'), '') != ''
+								OR json_extract(snapshot_json, '$.project_enrolled') = 1
+							)
+							THEN '{"captured":true,"project_enrolled":' ||
+								CASE json_extract(snapshot_json, '$.project_enrolled') WHEN 1 THEN 'true' ELSE 'false' END || '}'
+						ELSE '{"captured":false,"project_enrolled":false}'
+					END
+				ELSE '{"captured":' ||
+					CASE json_extract(snapshot_json, '$.captured') WHEN 1 THEN 'true' ELSE 'false' END ||
+					',"project_enrolled":' ||
+					CASE json_extract(snapshot_json, '$.project_enrolled') WHEN 1 THEN 'true' ELSE 'false' END || '}'
+			END
+			ELSE '{"captured":false,"project_enrolled":false}'
+		END
+	`)
+	return err
+}
+
 func (s *Store) SaveCloudUpgradeState(state CloudUpgradeState) error {
 	project, _ := NormalizeProject(state.Project)
 	project = strings.TrimSpace(project)
@@ -1120,7 +1151,12 @@ func (s *Store) SaveCloudUpgradeState(state CloudUpgradeState) error {
 		ON CONFLICT(project) DO UPDATE SET
 			stage = excluded.stage,
 			repair_class = excluded.repair_class,
-			snapshot_json = excluded.snapshot_json,
+			snapshot_json = CASE
+				WHEN json_extract(excluded.snapshot_json, '$.captured') = 0
+					AND json_extract(cloud_upgrade_state.snapshot_json, '$.captured') = 1
+					THEN cloud_upgrade_state.snapshot_json
+				ELSE excluded.snapshot_json
+			END,
 			last_error_code = excluded.last_error_code,
 			last_error_message = excluded.last_error_message,
 			findings_json = excluded.findings_json,
@@ -1179,7 +1215,7 @@ func (s *Store) CanRollbackCloudUpgrade(project string) (bool, error) {
 	if state == nil {
 		return false, nil
 	}
-	return state.Stage != UpgradeStageBootstrapVerified, nil
+	return state.Snapshot.Captured && state.Stage != UpgradeStageBootstrapVerified, nil
 }
 
 func (s *Store) RollbackCloudUpgrade(project string) (CloudUpgradeState, error) {
@@ -1195,6 +1231,9 @@ func (s *Store) RollbackCloudUpgrade(project string) (CloudUpgradeState, error) 
 	}
 	if state == nil {
 		return CloudUpgradeState{}, fmt.Errorf("rollback requires existing upgrade checkpoint state")
+	}
+	if !state.Snapshot.Captured {
+		return CloudUpgradeState{}, fmt.Errorf("rollback requires a captured pre-bootstrap snapshot")
 	}
 	if state.Stage == UpgradeStageBootstrapVerified {
 		return CloudUpgradeState{}, fmt.Errorf("rollback is unavailable post-bootstrap; use explicit disconnect/unenroll flows")
