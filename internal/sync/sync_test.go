@@ -506,6 +506,270 @@ func TestLocalChunkExportIncludesRelationsForObservationsInheritingSessionProjec
 	}
 }
 
+func TestLocalChunkExportIncludesRelationWithPriorChunkEndpoints(t *testing.T) {
+	s := newTestStore(t)
+	const (
+		project   = "proj-a"
+		sessionID = "sess-relation-closure"
+	)
+	if err := s.CreateSession(sessionID, project, "/tmp/proj-a"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	sourceID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: sessionID,
+		Type:      "decision",
+		Title:     "project endpoint",
+		Content:   "project endpoint content",
+		Project:   project,
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add project endpoint: %v", err)
+	}
+	targetID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: sessionID,
+		Type:      "decision",
+		Title:     "second project endpoint",
+		Content:   "second project endpoint content",
+		Project:   project,
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add second project endpoint: %v", err)
+	}
+	source, err := s.GetObservation(sourceID)
+	if err != nil {
+		t.Fatalf("get project endpoint: %v", err)
+	}
+	target, err := s.GetObservation(targetID)
+	if err != nil {
+		t.Fatalf("get second project endpoint: %v", err)
+	}
+
+	const oldTime = "2025-01-01 00:00:00"
+	if _, err := s.DB().Exec(`UPDATE sessions SET started_at = ? WHERE id = ?`, oldTime, sessionID); err != nil {
+		t.Fatalf("backdate session: %v", err)
+	}
+	if _, err := s.DB().Exec(`UPDATE observations SET created_at = ?, updated_at = ? WHERE sync_id IN (?, ?)`, oldTime, oldTime, source.SyncID, target.SyncID); err != nil {
+		t.Fatalf("backdate endpoints: %v", err)
+	}
+	if _, err := s.AddObservation(store.AddObservationParams{
+		SessionID: sessionID,
+		Type:      "decision",
+		Title:     "new project observation",
+		Content:   "new project observation content",
+		Project:   project,
+		Scope:     "project",
+	}); err != nil {
+		t.Fatalf("add new project observation: %v", err)
+	}
+
+	const relationID = "rel-watermark-closure"
+	if _, err := s.SaveRelation(store.SaveRelationParams{SyncID: relationID, SourceID: source.SyncID, TargetID: target.SyncID}); err != nil {
+		t.Fatalf("save relation: %v", err)
+	}
+	confidence := 0.9
+	if _, err := s.JudgeRelation(store.JudgeRelationParams{
+		JudgmentID:    relationID,
+		Relation:      store.RelationCompatible,
+		Confidence:    &confidence,
+		MarkedByActor: "test",
+		MarkedByKind:  "system",
+	}); err != nil {
+		t.Fatalf("judge relation: %v", err)
+	}
+
+	syncDir := filepath.Join(t.TempDir(), ".engram")
+	writeLocalChunkFile(t, syncDir, "previous-chunk", ChunkData{Observations: []store.Observation{
+		{SyncID: source.SyncID},
+		{SyncID: target.SyncID},
+	}})
+	writeManifestFile(t, syncDir, &Manifest{Version: 1, Chunks: []ChunkEntry{{
+		ID: "previous-chunk", CreatedAt: "2025-06-01T00:00:00Z",
+	}}})
+
+	result, err := New(s, syncDir).Export("alice", project)
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	chunkJSON, err := readGzip(filepath.Join(syncDir, "chunks", result.ChunkID+".jsonl.gz"))
+	if err != nil {
+		t.Fatalf("read chunk: %v", err)
+	}
+	var chunk ChunkData
+	if err := json.Unmarshal(chunkJSON, &chunk); err != nil {
+		t.Fatalf("unmarshal chunk: %v", err)
+	}
+	foundRelation := false
+	for _, mutation := range chunk.Mutations {
+		if mutation.Entity == store.SyncEntityRelation && mutation.EntityKey == relationID {
+			foundRelation = true
+		}
+	}
+	if !foundRelation {
+		t.Fatalf("relation with prior-chunk endpoints was not exported: %+v", chunk.Mutations)
+	}
+	for _, observation := range chunk.Observations {
+		if observation.SyncID == source.SyncID || observation.SyncID == target.SyncID {
+			t.Fatalf("prior-chunk endpoint must not be re-exported for relation closure: %+v", observation)
+		}
+	}
+}
+
+func TestFilterRelationMutationsForEndpointAvailability(t *testing.T) {
+	mutation := store.SyncMutation{
+		Entity:    store.SyncEntityRelation,
+		EntityKey: "rel-endpoint-availability",
+		Op:        store.SyncOpUpsert,
+		Payload:   `{"source_id":"source","target_id":"target"}`,
+	}
+	projectEndpoints := []store.Observation{{SyncID: "source", Scope: "project"}, {SyncID: "target", Scope: "project"}}
+	bothEndpoints := map[string]struct{}{"source": {}, "target": {}}
+
+	for _, tc := range []struct {
+		name         string
+		observations []store.Observation
+		exported     map[string]struct{}
+		wantRetained bool
+	}{
+		{name: "prior project endpoints", observations: projectEndpoints, exported: bothEndpoints, wantRetained: true},
+		{name: "personal endpoint", observations: []store.Observation{{SyncID: "source", Scope: "project"}, {SyncID: "target", Scope: "personal"}}, exported: bothEndpoints},
+		{name: "out of project endpoint", observations: []store.Observation{{SyncID: "source", Scope: "project"}}, exported: bothEndpoints},
+		{name: "never delivered endpoint", observations: projectEndpoints, exported: map[string]struct{}{"source": {}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			chunk := &ChunkData{Mutations: []store.SyncMutation{mutation}}
+			if err := filterRelationMutationsForEndpointAvailability(chunk, &store.ExportData{Observations: tc.observations}, tc.exported); err != nil {
+				t.Fatalf("filter relation endpoints: %v", err)
+			}
+			if got := len(chunk.Mutations); (got == 1) != tc.wantRetained {
+				t.Fatalf("retained %d relation mutations, want retained=%t", got, tc.wantRetained)
+			}
+		})
+	}
+}
+
+func TestLocalChunkExportSkipsRelationWithPersonalEndpoint(t *testing.T) {
+	s := newTestStore(t)
+	const (
+		project   = "proj-a"
+		sessionID = "sess-personal-relation-endpoint"
+	)
+	if err := s.CreateSession(sessionID, project, "/tmp/proj-a"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	sourceID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: sessionID,
+		Type:      "decision",
+		Title:     "project endpoint",
+		Content:   "project endpoint content",
+		Project:   project,
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add project endpoint: %v", err)
+	}
+	personalID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: sessionID,
+		Type:      "decision",
+		Title:     "personal endpoint",
+		Content:   "personal endpoint content",
+		Project:   project,
+		Scope:     "personal",
+	})
+	if err != nil {
+		t.Fatalf("add personal endpoint: %v", err)
+	}
+	source, err := s.GetObservation(sourceID)
+	if err != nil {
+		t.Fatalf("get project endpoint: %v", err)
+	}
+	personal, err := s.GetObservation(personalID)
+	if err != nil {
+		t.Fatalf("get personal endpoint: %v", err)
+	}
+
+	const oldTime = "2025-01-01 00:00:00"
+	if _, err := s.DB().Exec(`UPDATE sessions SET started_at = ? WHERE id = ?`, oldTime, sessionID); err != nil {
+		t.Fatalf("backdate session: %v", err)
+	}
+	if _, err := s.DB().Exec(`UPDATE observations SET created_at = ?, updated_at = ? WHERE sync_id = ?`, oldTime, oldTime, source.SyncID); err != nil {
+		t.Fatalf("backdate project endpoint: %v", err)
+	}
+	if _, err := s.AddObservation(store.AddObservationParams{
+		SessionID: sessionID,
+		Type:      "decision",
+		Title:     "new project observation",
+		Content:   "new project observation content",
+		Project:   project,
+		Scope:     "project",
+	}); err != nil {
+		t.Fatalf("add new project observation: %v", err)
+	}
+
+	const relationID = "rel-personal-endpoint"
+	if _, err := s.SaveRelation(store.SaveRelationParams{SyncID: relationID, SourceID: personal.SyncID, TargetID: source.SyncID}); err != nil {
+		t.Fatalf("save relation: %v", err)
+	}
+	confidence := 0.9
+	if _, err := s.JudgeRelation(store.JudgeRelationParams{
+		JudgmentID:    relationID,
+		Relation:      store.RelationCompatible,
+		Confidence:    &confidence,
+		MarkedByActor: "test",
+		MarkedByKind:  "system",
+	}); err != nil {
+		t.Fatalf("judge relation: %v", err)
+	}
+
+	syncDir := filepath.Join(t.TempDir(), ".engram")
+	writeLocalChunkFile(t, syncDir, "previous-chunk", ChunkData{})
+	writeManifestFile(t, syncDir, &Manifest{Version: 1, Chunks: []ChunkEntry{{
+		ID: "previous-chunk", CreatedAt: "2025-06-01T00:00:00Z",
+	}}})
+
+	result, err := New(s, syncDir).Export("alice", project)
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	chunkJSON, err := readGzip(filepath.Join(syncDir, "chunks", result.ChunkID+".jsonl.gz"))
+	if err != nil {
+		t.Fatalf("read chunk: %v", err)
+	}
+	var chunk ChunkData
+	if err := json.Unmarshal(chunkJSON, &chunk); err != nil {
+		t.Fatalf("unmarshal chunk: %v", err)
+	}
+	for _, mutation := range chunk.Mutations {
+		if mutation.Entity == store.SyncEntityRelation && mutation.EntityKey == relationID {
+			t.Fatalf("personal endpoint relation must not be exported: %+v", mutation)
+		}
+	}
+	for _, observation := range chunk.Observations {
+		if observation.SyncID == personal.SyncID {
+			t.Fatalf("personal endpoint must not be added for relation closure: %+v", observation)
+		}
+	}
+}
+
+func TestLocalChunkExportRejectsMalformedRelationEndpointPayload(t *testing.T) {
+	originalExportRelations := storeExportRelations
+	t.Cleanup(func() { storeExportRelations = originalExportRelations })
+	storeExportRelations = func(_ *store.Store, _ string) ([]store.SyncMutation, error) {
+		return []store.SyncMutation{{
+			Entity:    store.SyncEntityRelation,
+			EntityKey: "rel-malformed",
+			Op:        store.SyncOpUpsert,
+			Payload:   "{",
+		}}, nil
+	}
+
+	_, err := New(newTestStore(t), filepath.Join(t.TempDir(), ".engram")).Export("alice", "proj-a")
+	if err == nil || !strings.Contains(err.Error(), "filter relation endpoints: decode relation rel-malformed") {
+		t.Fatalf("expected malformed relation payload error, got %v", err)
+	}
+}
+
 func TestLocalChunkImportRestoresRelationsAfterObservations(t *testing.T) {
 	src := newTestStore(t)
 	sourceSyncID, targetSyncID := seedRelationForProject(t, src, "proj-a", "sess-rel-import", "rel-import")
@@ -636,7 +900,7 @@ func TestIncrementalRelationExport(t *testing.T) {
 	pastChunkID := "pastchunk00"
 	writeLocalChunkFile(t, syncDir, pastChunkID, ChunkData{
 		// rel-inc-1 is genuinely present in this prior chunk, so
-		// exportedRelationKeys treats it as already exported and skips it.
+		// Exported relation keys treat it as already exported and skip it.
 		Mutations: []store.SyncMutation{{
 			Entity:    store.SyncEntityRelation,
 			EntityKey: "rel-inc-1",
