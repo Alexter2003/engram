@@ -6,6 +6,7 @@
 package store
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -19,6 +20,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Gentleman-Programming/engram/internal/timeutil"
@@ -492,6 +494,16 @@ type Store struct {
 	db    *sql.DB
 	cfg   Config
 	hooks storeHooks
+
+	repairMu        sync.Mutex
+	repairDone      bool
+	repairInFlight  *enrolledProjectRepair
+	repairOperation func() error // test seam; production uses repairEnrolledProjectSyncMutations.
+}
+
+type enrolledProjectRepair struct {
+	done chan struct{}
+	err  error
 }
 
 type execer interface {
@@ -644,15 +656,12 @@ func New(cfg Config) (*Store, error) {
 	if err := s.migrate(); err != nil {
 		return nil, fmt.Errorf("engram: migration: %w", err)
 	}
-	if err := s.repairEnrolledProjectSyncMutations(); err != nil {
-		return nil, fmt.Errorf("engram: repair enrolled sync journal: %w", err)
-	}
 
 	return s, nil
 }
 
-// newWithoutRepair is the same as New but skips repairEnrolledProjectSyncMutations.
-// It exists solely to support tests that need to seed data and call repair manually.
+// newWithoutRepair is retained as a test helper alias for New. Enrolled-project
+// repair is deferred until the first synchronization operation in both cases.
 func newWithoutRepair(cfg Config) (*Store, error) {
 	if !filepath.IsAbs(cfg.DataDir) {
 		return nil, fmt.Errorf("engram: data directory must be an absolute path, got %q — set ENGRAM_DATA_DIR or ensure your home directory is resolvable", cfg.DataDir)
@@ -5120,6 +5129,52 @@ func (s *Store) projectNeedsBackfill(project string) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// EnsureEnrolledProjectSyncMutations repairs legacy enrolled-project journal
+// entries before a sync operation reads them. A successful repair is memoized
+// for this Store's lifetime; failures are returned to callers and retried by a
+// later synchronization attempt.
+func (s *Store) EnsureEnrolledProjectSyncMutations(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	s.repairMu.Lock()
+	if s.repairDone {
+		s.repairMu.Unlock()
+		return nil
+	}
+	if inFlight := s.repairInFlight; inFlight != nil {
+		s.repairMu.Unlock()
+		select {
+		case <-inFlight.done:
+			return inFlight.err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	inFlight := &enrolledProjectRepair{done: make(chan struct{})}
+	s.repairInFlight = inFlight
+	s.repairMu.Unlock()
+
+	var err error
+	if s.repairOperation != nil {
+		err = s.repairOperation()
+	} else {
+		err = s.repairEnrolledProjectSyncMutations()
+	}
+
+	s.repairMu.Lock()
+	inFlight.err = err
+	if err == nil {
+		s.repairDone = true
+	}
+	s.repairInFlight = nil
+	close(inFlight.done)
+	s.repairMu.Unlock()
+	return err
 }
 
 func (s *Store) repairEnrolledProjectSyncMutations() error {

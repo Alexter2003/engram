@@ -589,6 +589,38 @@ func TestManagerPushPersistsProjectIsolationAcrossStoreRestart(t *testing.T) {
 	}
 }
 
+func TestManagerPushRepairsEnrolledJournalBeforeListingMutations(t *testing.T) {
+	cfg, err := store.DefaultConfig()
+	if err != nil {
+		t.Fatalf("store default config: %v", err)
+	}
+	cfg.DataDir = t.TempDir()
+	local, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer local.Close() //nolint:errcheck
+
+	if err := local.CreateSession("legacy-session", "legacy-project", "/tmp/legacy-project"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := local.EnrollProject("legacy-project"); err != nil {
+		t.Fatalf("enroll project: %v", err)
+	}
+	if _, err := local.DB().Exec(`DELETE FROM sync_mutations WHERE project = ?`, "legacy-project"); err != nil {
+		t.Fatalf("remove journal entries to simulate legacy store: %v", err)
+	}
+
+	transport := newFakeTransport()
+	transport.pushResult = &PushMutationsResult{AcceptedSeqs: []int64{1}}
+	if err := New(local, transport, DefaultConfig()).push(context.Background()); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if len(transport.pushed) != 1 || len(transport.pushed[0]) != 1 || transport.pushed[0][0].Entity != store.SyncEntitySession {
+		t.Fatalf("pushed mutations = %+v, want repaired session mutation", transport.pushed)
+	}
+}
+
 // ─── Phase + lifecycle tests (REQ-204) ───────────────────────────────────────
 
 func TestManagerPhaseTransitions(t *testing.T) {

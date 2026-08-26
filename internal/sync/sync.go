@@ -21,6 +21,7 @@ package sync
 
 import (
 	"compress/gzip"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -1376,6 +1377,10 @@ func (sy *Syncer) filterByPendingMutations(data *store.ExportData, project strin
 }
 
 func (sy *Syncer) listPendingMutationsForExport() ([]store.SyncMutation, error) {
+	if err := sy.store.EnsureEnrolledProjectSyncMutations(context.Background()); err != nil {
+		return nil, fmt.Errorf("repair enrolled sync journal: %w", err)
+	}
+
 	const pageSize = 5000
 	afterSeq := int64(0)
 	mutations := make([]store.SyncMutation, 0, pageSize)
