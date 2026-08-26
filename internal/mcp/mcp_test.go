@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -3365,6 +3366,26 @@ func TestSessionStartUsesDefaultSessionID(t *testing.T) {
 	realScore := activity.ActivityScore("real-unique-session-id")
 	if realScore != "" {
 		t.Fatalf("expected no activity under real session ID, got: %q", realScore)
+	}
+}
+
+func TestSessionStartRejectsEmptyID(t *testing.T) {
+	s := newMCPTestStore(t)
+	dir := t.TempDir()
+	initTestGitRepo(t, dir)
+	t.Chdir(dir)
+
+	res, err := handleSessionStart(s, MCPConfig{}, NewSessionActivity(10*time.Minute))(context.Background(), mcppkg.CallToolRequest{
+		Params: mcppkg.CallToolParams{Arguments: map[string]any{"id": " \t"}},
+	})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if !res.IsError || !strings.Contains(callResultText(t, res), "session id is required") {
+		t.Fatalf("result isError=%v text=%q, want clear required-id error", res.IsError, callResultText(t, res))
+	}
+	if _, err := s.GetSession(""); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("empty session was persisted: %v", err)
 	}
 }
 

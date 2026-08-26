@@ -200,7 +200,7 @@ func cmdDoctorRepair(cfg store.Config) {
 
 func isSupportedDoctorRepairCheck(check string) bool {
 	switch check {
-	case diagnostic.CheckSessionProjectDirectoryMismatch, diagnostic.CheckManualSessionNameProjectMismatch:
+	case diagnostic.CheckSessionProjectDirectoryMismatch, diagnostic.CheckManualSessionNameProjectMismatch, diagnostic.CheckInvalidSessionIdentity:
 		return true
 	default:
 		return false

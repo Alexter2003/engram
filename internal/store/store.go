@@ -626,6 +626,12 @@ func New(cfg Config) (*Store, error) {
 		return nil, fmt.Errorf("engram: open database: %w", err)
 	}
 	db.SetMaxOpenConns(1)
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			_ = db.Close()
+		}
+	}()
 
 	// SQLite performance pragmas
 	pragmas := []string{
@@ -648,6 +654,7 @@ func New(cfg Config) (*Store, error) {
 		return nil, fmt.Errorf("engram: repair enrolled sync journal: %w", err)
 	}
 
+	succeeded = true
 	return s, nil
 }
 
@@ -2010,6 +2017,9 @@ func (s *Store) migrateFTSTopicKey() error {
 // ─── Sessions ────────────────────────────────────────────────────────────────
 
 func (s *Store) CreateSession(id, project, directory string) error {
+	if err := validateSessionID(id); err != nil {
+		return err
+	}
 	// Normalize project name before storing
 	project, _ = NormalizeProject(project)
 
@@ -2017,15 +2027,19 @@ func (s *Store) CreateSession(id, project, directory string) error {
 		if err := s.createSessionTx(tx, id, project, directory); err != nil {
 			return err
 		}
-		var startedAt string
-		if err := tx.QueryRow(`SELECT started_at FROM sessions WHERE id = ?`, id).Scan(&startedAt); err != nil {
+		var persisted Session
+		if err := tx.QueryRow(`SELECT id, project, directory, started_at, ended_at, summary FROM sessions WHERE id = ?`, id).Scan(
+			&persisted.ID, &persisted.Project, &persisted.Directory, &persisted.StartedAt, &persisted.EndedAt, &persisted.Summary,
+		); err != nil {
 			return err
 		}
-		return s.enqueueSyncMutationTx(tx, SyncEntitySession, id, SyncOpUpsert, syncSessionPayload{
-			ID:        id,
-			Project:   project,
-			Directory: directory,
-			StartedAt: startedAt,
+		return s.enqueueSyncMutationTx(tx, SyncEntitySession, persisted.ID, SyncOpUpsert, syncSessionPayload{
+			ID:        persisted.ID,
+			Project:   persisted.Project,
+			Directory: persisted.Directory,
+			StartedAt: persisted.StartedAt,
+			EndedAt:   persisted.EndedAt,
+			Summary:   persisted.Summary,
 		})
 	})
 }
@@ -3565,6 +3579,11 @@ func (s *Store) exportWithProjectScope(project string) (*ExportData, error) {
 }
 
 func (s *Store) Import(data *ExportData) (*ImportResult, error) {
+	for _, sess := range data.Sessions {
+		if err := validateSessionID(sess.ID); err != nil {
+			return nil, fmt.Errorf("import session: %w", err)
+		}
+	}
 	tx, err := s.beginTxHook()
 	if err != nil {
 		return nil, fmt.Errorf("import: begin tx: %w", err)
@@ -4985,6 +5004,9 @@ func isRetryableSQLiteLockError(err error) bool {
 }
 
 func (s *Store) createSessionTx(tx *sql.Tx, id, project, directory string) error {
+	if err := validateSessionID(id); err != nil {
+		return err
+	}
 	_, err := s.execHook(tx,
 		`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET
@@ -5167,6 +5189,7 @@ func (s *Store) backfillSessionSyncMutationsTx(tx *sql.Tx, project string) error
 		SELECT id, project, directory, started_at, ended_at, summary
 		FROM sessions
 		WHERE project = ?
+		  AND trim(id) != ''
 		  AND NOT EXISTS (
 			SELECT 1
 			FROM sync_mutations sm
@@ -5627,8 +5650,12 @@ func (s *Store) applyPulledMutationTx(tx *sql.Tx, mutation SyncMutation) error {
 		if err := decodeSyncPayload([]byte(mutation.Payload), &payload); err != nil {
 			return err
 		}
-		if strings.TrimSpace(payload.ID) == "" {
-			payload.ID = strings.TrimSpace(mutation.EntityKey)
+		entityKey := mutation.EntityKey
+		if strings.TrimSpace(payload.ID) == "" && strings.TrimSpace(entityKey) != "" {
+			payload.ID = entityKey
+		}
+		if err := validateSessionMutationIdentity(payload.ID, entityKey); err != nil {
+			return err
 		}
 		if mutation.Op == SyncOpDelete || isSessionDeletePayload(payload) {
 			return s.applySessionDeleteTx(tx, payload)
@@ -5830,6 +5857,9 @@ func observationPayloadFromObservation(obs *Observation) syncObservationPayload 
 }
 
 func (s *Store) applySessionPayloadTx(tx *sql.Tx, payload syncSessionPayload) error {
+	if err := validateSessionID(payload.ID); err != nil {
+		return err
+	}
 	if isSessionDeletePayload(payload) {
 		return s.applySessionDeleteTx(tx, payload)
 	}
@@ -5858,15 +5888,35 @@ func isSessionDeletePayload(payload syncSessionPayload) bool {
 }
 
 func (s *Store) applySessionDeleteTx(tx *sql.Tx, payload syncSessionPayload) error {
-	sessionID := strings.TrimSpace(payload.ID)
-	if sessionID == "" {
-		return nil
+	sessionID := payload.ID
+	if err := validateSessionID(sessionID); err != nil {
+		return err
 	}
 	if _, err := s.execHook(tx, `DELETE FROM user_prompts WHERE session_id = ?`, sessionID); err != nil {
 		return err
 	}
 	_, err := s.execHook(tx, `DELETE FROM sessions WHERE id = ?`, sessionID)
 	return err
+}
+
+func validateSessionID(id string) error {
+	if strings.TrimSpace(id) == "" {
+		return fmt.Errorf("session id is required")
+	}
+	return nil
+}
+
+func validateSessionMutationIdentity(payloadID, entityKey string) error {
+	if err := validateSessionID(payloadID); err != nil {
+		return fmt.Errorf("session mutation payload id: %w", err)
+	}
+	if err := validateSessionID(entityKey); err != nil {
+		return fmt.Errorf("session mutation entity_key: %w", err)
+	}
+	if payloadID != entityKey {
+		return fmt.Errorf("session mutation entity_key %q does not match payload id %q", entityKey, payloadID)
+	}
+	return nil
 }
 
 func (s *Store) applyObservationUpsertTx(tx *sql.Tx, payload syncObservationPayload) error {

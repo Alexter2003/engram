@@ -13,12 +13,14 @@ const (
 	CheckSessionProjectDirectoryMismatch  = "session_project_directory_mismatch"
 	CheckManualSessionNameProjectMismatch = "manual_session_name_project_mismatch"
 	CheckSyncMutationRequiredFields       = "sync_mutation_required_fields"
+	CheckInvalidSessionIdentity           = "invalid_session_identity"
 	CheckSQLiteLockContention             = "sqlite_lock_contention"
 )
 
 type SessionProjectDirectoryMismatchCheck struct{}
 type ManualSessionNameProjectMismatchCheck struct{}
 type SyncMutationRequiredFieldsCheck struct{}
+type InvalidSessionIdentityCheck struct{}
 type SQLiteLockContentionCheck struct{}
 
 func (SessionProjectDirectoryMismatchCheck) Code() string {
@@ -28,6 +30,7 @@ func (ManualSessionNameProjectMismatchCheck) Code() string {
 	return CheckManualSessionNameProjectMismatch
 }
 func (SyncMutationRequiredFieldsCheck) Code() string { return CheckSyncMutationRequiredFields }
+func (InvalidSessionIdentityCheck) Code() string     { return CheckInvalidSessionIdentity }
 func (SQLiteLockContentionCheck) Code() string       { return CheckSQLiteLockContention }
 
 func (c SessionProjectDirectoryMismatchCheck) Run(ctx context.Context, scope Scope) (CheckResult, error) {
@@ -160,6 +163,28 @@ func (c SyncMutationRequiredFieldsCheck) Run(ctx context.Context, scope Scope) (
 		})
 	}
 	return resultFromFindings(c.Code(), map[string]any{"pending_mutations_evaluated": len(mutations)}, findings), nil
+}
+
+func (c InvalidSessionIdentityCheck) Run(ctx context.Context, scope Scope) (CheckResult, error) {
+	_ = ctx
+	evidence, err := scope.Store.ListInvalidSessionIdentityEvidence(scope.Project)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	findings := make([]Finding, 0, len(evidence))
+	for _, item := range evidence {
+		findings = append(findings, Finding{
+			CheckID:              c.Code(),
+			Severity:             SeverityBlocking,
+			ReasonCode:           "invalid_session_identity",
+			Message:              "Session source ID is empty; affected references and journal entries cannot be repaired without an explicit canonical session ID.",
+			Why:                  "An empty session ID is not accepted by cloud replication and re-emitting it would preserve corrupt identity data.",
+			Evidence:             mustJSON(item),
+			SafeNextStep:         "Provide an explicit canonical session ID through a supported repair workflow; automatic ID generation is intentionally unavailable.",
+			RequiresConfirmation: true,
+		})
+	}
+	return resultFromFindings(c.Code(), map[string]any{"invalid_source_sessions": len(evidence)}, findings), nil
 }
 
 func (c SQLiteLockContentionCheck) Run(ctx context.Context, scope Scope) (CheckResult, error) {

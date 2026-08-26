@@ -74,6 +74,8 @@ func BuildRepairPlan(ctx context.Context, scope Scope, report Report, check stri
 		if err := planManualSessionRepair(&plan, scope); err != nil {
 			return RepairPlan{}, err
 		}
+	case CheckInvalidSessionIdentity:
+		planInvalidSessionIdentityRepair(&plan, report)
 	default:
 		return RepairPlan{}, fmt.Errorf("unsupported repair check %q", check)
 	}
@@ -83,6 +85,20 @@ func BuildRepairPlan(ctx context.Context, scope Scope, report Report, check stri
 		plan.Status = "noop"
 	}
 	return plan, nil
+}
+
+func planInvalidSessionIdentityRepair(plan *RepairPlan, report Report) {
+	for _, check := range report.Checks {
+		for _, finding := range check.Findings {
+			if finding.ReasonCode != "invalid_session_identity" {
+				continue
+			}
+			plan.Skipped = append(plan.Skipped, RepairSkip{
+				ReasonCode: "cannot_repair_without_explicit_canonical_session_id",
+				Message:    "cannot repair without explicit canonical session ID; no supported repair input exists",
+			})
+		}
+	}
 }
 
 func planDirectoryMismatchRepair(plan *RepairPlan, report Report) {

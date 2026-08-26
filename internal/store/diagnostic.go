@@ -31,6 +31,16 @@ type SyncMutationPayloadValidation struct {
 	Message       string   `json:"message,omitempty"`
 }
 
+// InvalidSessionIdentityEvidence describes a corrupt source session and the
+// dependent local data that cannot be repaired without a canonical ID.
+type InvalidSessionIdentityEvidence struct {
+	Project             string `json:"project"`
+	SessionID           string `json:"session_id"`
+	ObservationCount    int64  `json:"observation_count"`
+	PromptCount         int64  `json:"prompt_count"`
+	InvalidJournalCount int64  `json:"invalid_journal_count"`
+}
+
 // SQLiteLockSnapshot captures conservative SQLite lock/contention indicators.
 // wal_checkpoint(PASSIVE) is an observational probe for this diagnostic surface;
 // callers must not interpret it as a repair action.
@@ -98,6 +108,70 @@ func (s *Store) ListPendingProjectMutations(project string) ([]SyncMutation, err
 	return s.listPendingProjectMutationsTxLike(s.db, project)
 }
 
+// ListInvalidSessionIdentityEvidence reports empty source session IDs together
+// with affected references and invalid session journal entries. It is read-only.
+func (s *Store) ListInvalidSessionIdentityEvidence(project string) ([]InvalidSessionIdentityEvidence, error) {
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	query := `SELECT id, project FROM sessions WHERE trim(id) = ''`
+	args := []any{}
+	if project != "" {
+		query += ` AND project = ?`
+		args = append(args, project)
+	}
+	rows, err := s.queryItHook(s.db, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	evidence := make([]InvalidSessionIdentityEvidence, 0)
+	for rows.Next() {
+		var item InvalidSessionIdentityEvidence
+		if err := rows.Scan(&item.SessionID, &item.Project); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		evidence = append(evidence, item)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	for i := range evidence {
+		item := &evidence[i]
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM observations WHERE session_id = ?`, item.SessionID).Scan(&item.ObservationCount); err != nil {
+			return nil, err
+		}
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM user_prompts WHERE session_id = ?`, item.SessionID).Scan(&item.PromptCount); err != nil {
+			return nil, err
+		}
+		mutationRows, err := s.queryItHook(s.db, `SELECT entity_key, payload FROM sync_mutations WHERE entity = ? AND project = ?`, SyncEntitySession, item.Project)
+		if err != nil {
+			return nil, err
+		}
+		for mutationRows.Next() {
+			var entityKey, payloadRaw string
+			if err := mutationRows.Scan(&entityKey, &payloadRaw); err != nil {
+				_ = mutationRows.Close()
+				return nil, err
+			}
+			var payload syncSessionPayload
+			if err := decodeSyncPayload([]byte(payloadRaw), &payload); err != nil || validateSessionMutationIdentity(payload.ID, entityKey) != nil {
+				item.InvalidJournalCount++
+			}
+		}
+		if err := mutationRows.Close(); err != nil {
+			return nil, err
+		}
+		if err := mutationRows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return evidence, nil
+}
+
 type rowQuerier interface {
 	Query(query string, args ...any) (*sql.Rows, error)
 }
@@ -136,7 +210,6 @@ func (s *Store) listPendingProjectMutationsTxLike(q rowQuerier, project string) 
 func ValidateSyncMutationPayload(entity, op, payload, entityKey string) SyncMutationPayloadValidation {
 	entity = strings.TrimSpace(entity)
 	op = strings.TrimSpace(op)
-	entityKey = strings.TrimSpace(entityKey)
 	result := SyncMutationPayloadValidation{Entity: entity, Op: op, EntityKey: entityKey}
 	trimmed := strings.TrimSpace(payload)
 	if trimmed == "" {
@@ -162,6 +235,14 @@ func ValidateSyncMutationPayload(entity, op, payload, entityKey string) SyncMuta
 		encoded, _ := json.Marshal(v)
 		return strings.TrimSpace(string(encoded))
 	}
+	rawStringField := func(name string) string {
+		v, ok := body[name]
+		if !ok || v == nil {
+			return ""
+		}
+		s, _ := v.(string)
+		return s
+	}
 	missing := make([]string, 0)
 	require := func(name string) {
 		if field(name) == "" {
@@ -171,8 +252,17 @@ func ValidateSyncMutationPayload(entity, op, payload, entityKey string) SyncMuta
 
 	switch entity {
 	case SyncEntitySession:
-		if field("id") == "" && entityKey == "" {
+		payloadID := rawStringField("id")
+		if strings.TrimSpace(payloadID) == "" {
 			missing = append(missing, "id")
+		}
+		if strings.TrimSpace(entityKey) == "" {
+			missing = append(missing, "entity_key")
+		}
+		if len(missing) == 0 && payloadID != entityKey {
+			result.ReasonCode = "sync_session_mutation_identity_mismatch"
+			result.Message = fmt.Sprintf("session entity_key %q does not match payload id %q", entityKey, payloadID)
+			return result
 		}
 		if op == SyncOpUpsert {
 			require("directory")

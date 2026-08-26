@@ -157,6 +157,66 @@ func TestCmdDoctorRepairPlanDryRunApplyJSON(t *testing.T) {
 	assertDoctorRepairProject(t, cfg, "repair-s1", "engram")
 }
 
+func TestCmdDoctorRepairInvalidSessionIdentityReportsExplicitImpossibility(t *testing.T) {
+	cfg := testConfig(t)
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close initialized store: %v", err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO sessions (id, project, directory) VALUES ('', 'engram', '/tmp/engram');
+		INSERT INTO sync_enrolled_projects (project) VALUES ('engram');`); err != nil {
+		_ = db.Close()
+		t.Fatalf("seed corrupt session: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close seeded database: %v", err)
+	}
+
+	for _, mode := range []string{"--plan", "--dry-run", "--apply"} {
+		t.Run(mode, func(t *testing.T) {
+			withArgs(t, "engram", "doctor", "repair", "--project", "engram", "--check", "invalid_session_identity", mode)
+			stdout, stderr := captureOutput(t, func() { cmdDoctor(cfg) })
+			if stderr != "" {
+				t.Fatalf("stderr=%q", stderr)
+			}
+			plan := decodeRepairPlan(t, stdout)
+			if plan["status"] != "noop" || len(plan["actions"].([]any)) != 0 {
+				t.Fatalf("plan=%v", plan)
+			}
+			skipped := plan["skipped"].([]any)
+			if len(skipped) != 1 || skipped[0].(map[string]any)["reason_code"] != "cannot_repair_without_explicit_canonical_session_id" {
+				t.Fatalf("skipped=%v", skipped)
+			}
+		})
+	}
+
+	db, err = sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
+	if err != nil {
+		t.Fatalf("reopen database: %v", err)
+	}
+	defer db.Close()
+	var sessions, mutations int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sessions WHERE id = ''`).Scan(&sessions); err != nil {
+		t.Fatalf("count source sessions: %v", err)
+	}
+	if sessions != 1 {
+		t.Fatalf("repair unexpectedly changed source session count=%d", sessions)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE entity = ?`, store.SyncEntitySession).Scan(&mutations); err != nil {
+		t.Fatalf("count session mutations: %v", err)
+	}
+	if mutations != 0 {
+		t.Fatalf("doctor startup emitted %d broken session mutation(s)", mutations)
+	}
+}
+
 func decodeRepairPlan(t *testing.T, out string) map[string]any {
 	t.Helper()
 	var plan map[string]any

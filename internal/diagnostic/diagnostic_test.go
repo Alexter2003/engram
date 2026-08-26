@@ -2,12 +2,16 @@ package diagnostic
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Gentleman-Programming/engram/internal/store"
+	_ "modernc.org/sqlite"
 )
 
 func newDiagnosticTestStore(t *testing.T) *store.Store {
@@ -75,7 +79,7 @@ func TestSQLiteLockContentionBranches(t *testing.T) {
 
 func TestRegistryLookupAndOrdering(t *testing.T) {
 	codes := RegisteredCodes()
-	want := []string{CheckManualSessionNameProjectMismatch, CheckSessionProjectDirectoryMismatch, CheckSQLiteLockContention, CheckSyncMutationRequiredFields}
+	want := []string{CheckInvalidSessionIdentity, CheckManualSessionNameProjectMismatch, CheckSessionProjectDirectoryMismatch, CheckSQLiteLockContention, CheckSyncMutationRequiredFields}
 	if strings.Join(codes, ",") != strings.Join(want, ",") {
 		t.Fatalf("RegisteredCodes = %v, want %v", codes, want)
 	}
@@ -144,12 +148,61 @@ func TestRunnerRunAllHealthyEvaluatesEveryMVPCheck(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunAll: %v", err)
 	}
-	if report.Status != StatusOK || report.Summary.OK != 4 || len(report.Checks) != 4 {
+	if report.Status != StatusOK || report.Summary.OK != 5 || len(report.Checks) != 5 {
 		t.Fatalf("report=%+v", report)
 	}
 	for _, check := range report.Checks {
 		if check.Result != StatusOK || len(check.Evidence) == 0 {
 			t.Fatalf("expected ok check with evidence, got %+v", check)
 		}
+	}
+}
+
+func TestInvalidSessionIdentityCheckReportsSourceReferencesAndJournal(t *testing.T) {
+	cfg, err := store.DefaultConfig()
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.DataDir = t.TempDir()
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	db, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
+	if err != nil {
+		t.Fatalf("open raw database: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.Exec(`INSERT INTO sessions (id, project, directory) VALUES ('', 'engram', '/tmp/engram');
+		INSERT INTO observations (sync_id, session_id, type, title, content, project, scope, normalized_hash, revision_count, duplicate_count, created_at, updated_at)
+		VALUES ('obs-empty-session', '', 'bugfix', 'title', 'content', 'engram', 'project', 'hash', 1, 1, datetime('now'), datetime('now'));
+		INSERT INTO user_prompts (sync_id, session_id, content, project, created_at) VALUES ('prompt-empty-session', '', 'prompt', 'engram', datetime('now'));
+		INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES ('cloud', 'session', '', 'upsert', '{"id":"","project":"engram","directory":"/tmp/engram"}', 'local', 'engram');`); err != nil {
+		t.Fatalf("seed corrupt identity: %v", err)
+	}
+
+	report, err := NewRunner().RunOne(context.Background(), Scope{Store: s, Project: "engram"}, CheckInvalidSessionIdentity)
+	if err != nil {
+		t.Fatalf("RunOne: %v", err)
+	}
+	if report.Status != StatusBlocked || len(report.Checks[0].Findings) != 1 {
+		t.Fatalf("report=%+v", report)
+	}
+	var evidence store.InvalidSessionIdentityEvidence
+	if err := json.Unmarshal(report.Checks[0].Findings[0].Evidence, &evidence); err != nil {
+		t.Fatalf("decode evidence: %v", err)
+	}
+	if evidence.ObservationCount != 1 || evidence.PromptCount != 1 || evidence.InvalidJournalCount != 1 {
+		t.Fatalf("evidence=%+v", evidence)
+	}
+
+	plan, err := BuildRepairPlan(context.Background(), Scope{Store: s, Project: "engram"}, report, CheckInvalidSessionIdentity, RepairModeApply)
+	if err != nil {
+		t.Fatalf("BuildRepairPlan: %v", err)
+	}
+	if plan.Status != "noop" || len(plan.Actions) != 0 || len(plan.Skipped) != 1 || plan.Skipped[0].ReasonCode != "cannot_repair_without_explicit_canonical_session_id" {
+		t.Fatalf("repair plan=%+v", plan)
 	}
 }
