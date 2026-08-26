@@ -3295,6 +3295,30 @@ func TestSessionEndClearsActivity(t *testing.T) {
 	}
 }
 
+func TestSessionEndRejectsBlankIDsWithoutMutation(t *testing.T) {
+	s := newMCPTestStore(t)
+	if err := s.CreateSession("valid-session", "engram", "/tmp"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	end := handleSessionEnd(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+	for _, id := range []string{"", " \t"} {
+		t.Run(fmt.Sprintf("%q", id), func(t *testing.T) {
+			res, err := end(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"id": id}}})
+			if err != nil || !res.IsError || !strings.Contains(callResultText(t, res), "session id is required") {
+				t.Fatalf("session end result=%+v err=%v", res, err)
+			}
+			session, err := s.GetSession("valid-session")
+			if err != nil || session.EndedAt != nil {
+				t.Fatalf("valid session changed: %+v, %v", session, err)
+			}
+			var mutations int
+			if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations WHERE entity = 'session' AND trim(entity_key) = ''`).Scan(&mutations); err != nil || mutations != 0 {
+				t.Fatalf("blank session mutations=%d, err=%v", mutations, err)
+			}
+		})
+	}
+}
+
 func TestCapturePassiveRecordsToolCall(t *testing.T) {
 	s := newMCPTestStore(t)
 

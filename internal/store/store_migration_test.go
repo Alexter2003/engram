@@ -602,6 +602,27 @@ func TestMigrate_PostPhase1_AddsSyncApplyDeferred(t *testing.T) {
 	}
 }
 
+func TestMigrate_ExtendsExistingDeferredRows(t *testing.T) {
+	s := newTestStoreWithLegacySchemaPostP1(t, nil, nil)
+	if _, err := s.DB().Exec(`DROP TABLE sync_apply_deferred;
+		CREATE TABLE sync_apply_deferred (
+			sync_id TEXT PRIMARY KEY, entity TEXT NOT NULL, payload TEXT NOT NULL,
+			apply_status TEXT NOT NULL DEFAULT 'deferred', retry_count INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT, last_attempted_at TEXT, first_seen_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+		INSERT INTO sync_apply_deferred (sync_id, entity, payload) VALUES ('legacy-deferred', 'relation', '{}')`); err != nil {
+		t.Fatalf("seed legacy deferred table: %v", err)
+	}
+	// Re-running migration is idempotent and must preserve pre-extension rows.
+	if err := s.migrate(); err != nil {
+		t.Fatalf("migrate existing deferred table: %v", err)
+	}
+	row, err := s.GetDeferred("legacy-deferred")
+	if err != nil || row.TargetKey != "" || row.RemoteSeq != 0 || row.ReasonCode != "" {
+		t.Fatalf("legacy deferred row=%+v, err=%v", row, err)
+	}
+}
+
 // TestMigrate_PostPhase1_PreservesExistingRows asserts that running migrate()
 // on a post-Phase-1 database preserves all pre-existing observations and
 // memory_relations rows with their original field values.

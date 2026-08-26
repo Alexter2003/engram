@@ -5105,7 +5105,72 @@ func TestImportRejectsBlankSessionIDAtomically(t *testing.T) {
 	}
 }
 
-func TestApplyPulledSessionMutationRejectsInvalidIdentityAtomically(t *testing.T) {
+func TestEndSessionRejectsRawBlankIDWithoutMutation(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.DB().Exec(`INSERT INTO sessions (id, project, directory, summary) VALUES ('', 'engram', '/tmp', 'before')`); err != nil {
+		t.Fatalf("seed corrupt session: %v", err)
+	}
+	if err := s.EndSession("", "after"); !errors.Is(err, ErrSessionIDRequired) {
+		t.Fatalf("EndSession error = %v, want ErrSessionIDRequired", err)
+	}
+	var endedAt, summary sql.NullString
+	if err := s.DB().QueryRow(`SELECT ended_at, summary FROM sessions WHERE id = ''`).Scan(&endedAt, &summary); err != nil || endedAt.Valid || !summary.Valid || summary.String != "before" {
+		t.Fatalf("corrupt session ended_at=%+v summary=%+v err=%v", endedAt, summary, err)
+	}
+	var mutations int
+	if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations WHERE entity = ? AND trim(entity_key) = ''`, SyncEntitySession).Scan(&mutations); err != nil || mutations != 0 {
+		t.Fatalf("blank session mutations=%d, err=%v", mutations, err)
+	}
+}
+
+func TestDeleteSessionRejectsRawBlankIDsWithoutMutation(t *testing.T) {
+	for _, tc := range []struct {
+		name, id, project string
+		enrolled          bool
+	}{
+		{name: "unenrolled empty", id: "", project: "local"},
+		{name: "enrolled whitespace", id: " \t", project: "synced", enrolled: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStore(t)
+			if _, err := s.DB().Exec(`INSERT INTO sessions (id, project, directory) VALUES (?, ?, '/tmp'); INSERT INTO sync_enrolled_projects (project) SELECT ? WHERE ?`, tc.id, tc.project, tc.project, tc.enrolled); err != nil {
+				t.Fatalf("seed corrupt session: %v", err)
+			}
+			if err := s.DeleteSession(tc.id); !errors.Is(err, ErrSessionIDRequired) {
+				t.Fatalf("DeleteSession error = %v, want ErrSessionIDRequired", err)
+			}
+			var sessions, mutations int
+			if err := s.DB().QueryRow(`SELECT count(*) FROM sessions WHERE id = ?`, tc.id).Scan(&sessions); err != nil {
+				t.Fatalf("count corrupt session: %v", err)
+			}
+			if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations WHERE entity = ? AND trim(entity_key) = ''`, SyncEntitySession).Scan(&mutations); err != nil || sessions != 1 || mutations != 0 {
+				t.Fatalf("sessions=%d blank mutations=%d err=%v", sessions, mutations, err)
+			}
+		})
+	}
+}
+
+func TestEnqueueSessionMutationRejectsBlankKeyAndRollsBack(t *testing.T) {
+	s := newTestStore(t)
+	err := s.withTx(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`INSERT INTO sessions (id, project, directory) VALUES ('prior-write', 'engram', '/tmp')`); err != nil {
+			return err
+		}
+		return s.enqueueSyncMutationTx(tx, SyncEntitySession, "", SyncOpUpsert, syncSessionPayload{})
+	})
+	if !errors.Is(err, ErrSessionIDRequired) {
+		t.Fatalf("enqueue error = %v, want ErrSessionIDRequired", err)
+	}
+	var sessions, mutations int
+	if err := s.DB().QueryRow(`SELECT count(*) FROM sessions WHERE id = 'prior-write'`).Scan(&sessions); err != nil {
+		t.Fatalf("count preceding write: %v", err)
+	}
+	if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations WHERE entity = ? AND trim(entity_key) = ''`, SyncEntitySession).Scan(&mutations); err != nil || sessions != 0 || mutations != 0 {
+		t.Fatalf("sessions=%d blank mutations=%d err=%v", sessions, mutations, err)
+	}
+}
+
+func TestApplyPulledSessionMutationSkipsInvalidIdentityWithEvidence(t *testing.T) {
 	tests := []struct {
 		name    string
 		entity  string
@@ -5118,9 +5183,9 @@ func TestApplyPulledSessionMutationRejectsInvalidIdentityAtomically(t *testing.T
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			s := newTestStore(t)
-			err := s.ApplyPulledMutation(DefaultSyncTargetKey, SyncMutation{Seq: 1, Entity: SyncEntitySession, EntityKey: tc.entity, Op: SyncOpUpsert, Payload: tc.payload})
-			if err == nil || !strings.Contains(err.Error(), "session mutation") {
-				t.Fatalf("ApplyPulledMutation error = %v, want identity error", err)
+			mutation := SyncMutation{Seq: 1, Entity: SyncEntitySession, EntityKey: tc.entity, Op: SyncOpUpsert, Payload: tc.payload}
+			if err := s.ApplyPulledMutation(DefaultSyncTargetKey, mutation); err != nil {
+				t.Fatalf("ApplyPulledMutation: %v", err)
 			}
 			var sessions int
 			if err := s.db.QueryRow(`SELECT COUNT(*) FROM sessions`).Scan(&sessions); err != nil {
@@ -5129,8 +5194,69 @@ func TestApplyPulledSessionMutationRejectsInvalidIdentityAtomically(t *testing.T
 			if sessions != 0 {
 				t.Fatalf("invalid mutation persisted %d sessions", sessions)
 			}
+			rows, err := s.ListDeferred(ListDeferredOptions{Status: "dead"})
+			if err != nil || len(rows) != 1 || rows[0].PayloadRaw != tc.payload || rows[0].TargetKey != DefaultSyncTargetKey || rows[0].ReasonCode != SyncSessionIdentityInvalidReasonCode || rows[0].RemoteSeq != 1 || rows[0].EntityKey != tc.entity || rows[0].Op != SyncOpUpsert {
+				t.Fatalf("dead evidence=%+v, err=%v", rows, err)
+			}
+			if row, err := s.GetDeferred(rows[0].SyncID); err != nil || row.PayloadRaw != tc.payload {
+				t.Fatalf("GetDeferred = %+v, %v", row, err)
+			}
+			state, err := s.GetSyncState(DefaultSyncTargetKey)
+			if err != nil || state.LastPulledSeq != 1 {
+				t.Fatalf("sync state=%+v, err=%v", state, err)
+			}
 		})
 	}
+}
+
+func TestApplyPulledSessionInvalidIdentityDoesNotBlockLaterMutations(t *testing.T) {
+	s := newTestStore(t)
+	invalid := SyncMutation{Seq: 1, Entity: SyncEntitySession, EntityKey: " ", Op: SyncOpUpsert, Payload: `{"id":"","project":"engram","directory":"/bad"}`}
+	valid := SyncMutation{Seq: 2, Entity: SyncEntitySession, EntityKey: "opaque id", Op: SyncOpUpsert, Payload: `{"id":"opaque id","project":"engram","directory":"/good"}`}
+	for _, mutation := range []SyncMutation{invalid, valid} {
+		if err := s.ApplyPulledMutation(DefaultSyncTargetKey, mutation); err != nil {
+			t.Fatalf("ApplyPulledMutation seq=%d: %v", mutation.Seq, err)
+		}
+	}
+	if session, err := s.GetSession("opaque id"); err != nil || session.Directory != "/good" {
+		t.Fatalf("GetSession = %+v, %v", session, err)
+	}
+	if replay, err := s.ReplayDeferred(); err != nil || replay.Retried != 0 {
+		t.Fatalf("ReplayDeferred = %+v, %v; want no retry", replay, err)
+	}
+}
+
+func TestApplyPulledChunkSkipsInvalidSessionButMalformedPayloadFailsClosed(t *testing.T) {
+	valid := SyncMutation{Entity: SyncEntitySession, EntityKey: "valid", Op: SyncOpUpsert, Payload: `{"id":"valid","project":"engram","directory":"/good"}`}
+	invalid := SyncMutation{Entity: SyncEntitySession, EntityKey: " ", Op: SyncOpUpsert, Payload: `{"id":"","project":"engram","directory":"/bad"}`}
+	t.Run("skip and continue atomically", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.ApplyPulledChunk(DefaultSyncTargetKey, "invalid-session", []SyncMutation{invalid, valid}); err != nil {
+			t.Fatalf("ApplyPulledChunk: %v", err)
+		}
+		if _, err := s.GetSession("valid"); err != nil {
+			t.Fatalf("valid session missing: %v", err)
+		}
+		state, _ := s.GetSyncState(DefaultSyncTargetKey)
+		if state.LastPulledSeq != 2 {
+			t.Fatalf("last pulled sequence=%d, want 2", state.LastPulledSeq)
+		}
+	})
+	t.Run("malformed remains closed", func(t *testing.T) {
+		s := newTestStore(t)
+		bad := invalid
+		bad.Payload = "not json"
+		if err := s.ApplyPulledChunk(DefaultSyncTargetKey, "malformed-session", []SyncMutation{bad, valid}); err == nil {
+			t.Fatal("ApplyPulledChunk succeeded for malformed session payload")
+		}
+		if _, err := s.GetSession("valid"); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("valid session applied despite rollback: %v", err)
+		}
+		rows, err := s.ListDeferred(ListDeferredOptions{})
+		if err != nil || len(rows) != 0 {
+			t.Fatalf("deferred rows=%+v, err=%v; want none", rows, err)
+		}
+	})
 }
 
 func TestApplyPulledLegacySessionMutationUsesEntityKeyForMissingPayloadID(t *testing.T) {
@@ -5151,7 +5277,7 @@ func TestApplyPulledLegacySessionMutationUsesEntityKeyForMissingPayloadID(t *tes
 	}
 }
 
-func TestApplyPulledSessionMutationRequiresExactOpaqueIdentity(t *testing.T) {
+func TestApplyPulledSessionMutationDoesNotNormalizeOpaqueIdentity(t *testing.T) {
 	s := newTestStore(t)
 	err := s.ApplyPulledMutation(DefaultSyncTargetKey, SyncMutation{
 		Seq:       1,
@@ -5160,8 +5286,11 @@ func TestApplyPulledSessionMutationRequiresExactOpaqueIdentity(t *testing.T) {
 		Op:        SyncOpUpsert,
 		Payload:   `{"id":"session","project":"engram","directory":"/tmp/engram"}`,
 	})
-	if err == nil || !strings.Contains(err.Error(), "does not match") {
-		t.Fatalf("ApplyPulledMutation error = %v, want exact identity mismatch", err)
+	if err != nil {
+		t.Fatalf("ApplyPulledMutation: %v", err)
+	}
+	if _, err := s.GetSession("session"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("mismatched opaque identity was normalized: %v", err)
 	}
 }
 
@@ -5186,6 +5315,30 @@ func TestBackfillSkipsInvalidSourceAndBackfillsValidSession(t *testing.T) {
 	}
 	if validMutations != 1 || invalidMutations != 0 {
 		t.Fatalf("valid mutations=%d invalid mutations=%d", validMutations, invalidMutations)
+	}
+}
+
+func TestProjectNeedsBackfillIgnoresBlankSessions(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.DB().Exec(`INSERT INTO sessions (id, project, directory) VALUES (' ', 'engram', '/tmp')`); err != nil {
+		t.Fatalf("seed blank session: %v", err)
+	}
+	if err := s.EnrollProject("engram"); err != nil {
+		t.Fatalf("EnrollProject: %v", err)
+	}
+	needs, err := s.projectNeedsBackfill("engram")
+	if err != nil || needs {
+		t.Fatalf("blank-only projectNeedsBackfill = %v, %v", needs, err)
+	}
+	if _, err := s.DB().Exec(`INSERT INTO sessions (id, project, directory) VALUES ('valid', 'engram', '/tmp')`); err != nil {
+		t.Fatalf("seed valid session: %v", err)
+	}
+	if err := s.repairEnrolledProjectSyncMutations(); err != nil {
+		t.Fatalf("backfill mixed sessions: %v", err)
+	}
+	var mutations int
+	if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations WHERE entity = ?`, SyncEntitySession).Scan(&mutations); err != nil || mutations != 1 {
+		t.Fatalf("session mutations=%d, err=%v; want only valid session", mutations, err)
 	}
 }
 
@@ -7899,6 +8052,21 @@ func TestValidateSyncMutationPayloadSessionIdentity(t *testing.T) {
 			validation := ValidateSyncMutationPayload(SyncEntitySession, SyncOpUpsert, tc.payload, tc.entityKey)
 			if validation.ReasonCode != tc.wantReason || strings.Join(validation.MissingFields, ",") != tc.wantMissing {
 				t.Fatalf("validation=%+v want reason=%q missing=%q", validation, tc.wantReason, tc.wantMissing)
+			}
+		})
+	}
+}
+
+func TestValidateSyncMutationPayloadTreatsWhitespaceEntityKeysAsMissing(t *testing.T) {
+	for _, entity := range []string{SyncEntityObservation, SyncEntityPrompt} {
+		t.Run(entity, func(t *testing.T) {
+			validation := ValidateSyncMutationPayload(entity, SyncOpUpsert, `{"sync_id":"","session_id":"s","type":"decision","title":"title","content":"content","scope":"project"}`, " \t")
+			if strings.Join(validation.MissingFields, ",") != "sync_id" || validation.EntityKey != " \t" {
+				t.Fatalf("validation=%+v", validation)
+			}
+			valid := ValidateSyncMutationPayload(entity, SyncOpUpsert, `{"sync_id":"","session_id":"s","type":"decision","title":"title","content":"content","scope":"project"}`, " opaque ")
+			if len(valid.MissingFields) != 0 {
+				t.Fatalf("opaque key validation=%+v", valid)
 			}
 		})
 	}

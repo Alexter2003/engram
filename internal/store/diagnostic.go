@@ -309,7 +309,7 @@ func ValidateSyncMutationPayload(entity, op, payload, entityKey string) SyncMuta
 			require("directory")
 		}
 	case SyncEntityObservation:
-		if field("sync_id") == "" && entityKey == "" {
+		if field("sync_id") == "" && strings.TrimSpace(entityKey) == "" {
 			missing = append(missing, "sync_id")
 		}
 		if op == SyncOpUpsert {
@@ -320,7 +320,7 @@ func ValidateSyncMutationPayload(entity, op, payload, entityKey string) SyncMuta
 			require("scope")
 		}
 	case SyncEntityPrompt:
-		if field("sync_id") == "" && entityKey == "" {
+		if field("sync_id") == "" && strings.TrimSpace(entityKey) == "" {
 			missing = append(missing, "sync_id")
 		}
 		if op == SyncOpUpsert {

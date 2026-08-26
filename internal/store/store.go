@@ -46,6 +46,7 @@ var sqliteWriteRetryBackoffs = []time.Duration{
 // Sentinel errors returned by Store operations so callers can use errors.Is.
 var (
 	ErrSessionNotFound            = errors.New("session not found")
+	ErrSessionIDRequired          = errors.New("session id is required")
 	ErrSessionHasObservations     = errors.New("session still has observations")
 	ErrSessionDeleteBlocked       = errors.New("session deletion is blocked while cloud sync enrollment is active")
 	ErrObservationNotFound        = errors.New("observation not found")
@@ -75,6 +76,9 @@ var (
 	// sync_apply_deferred with apply_status='dead' and is never retried
 	// automatically; Phase 3 adds a republish CLI.
 	ErrApplyDead = errors.New("relation apply permanently failed: payload invalid or undecodable")
+
+	// ErrPulledSessionIdentityInvalid identifies an invalid identity after successful decoding and legacy fallback.
+	ErrPulledSessionIdentityInvalid = errors.New("pulled session identity is invalid")
 )
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -240,6 +244,8 @@ const (
 
 	SyncSourceLocal  = "local"
 	SyncSourceRemote = "remote"
+
+	SyncSessionIdentityInvalidReasonCode = "sync_session_identity_invalid"
 
 	// Decay defaults — months added to now() to compute review_after on new inserts.
 	// expires_at is NULL for all types in Phase 1.
@@ -1082,6 +1088,11 @@ func (s *Store) migrate() error {
 			sync_id           TEXT    PRIMARY KEY,
 			entity            TEXT    NOT NULL,
 			payload           TEXT    NOT NULL,
+			target_key        TEXT    NOT NULL DEFAULT '',
+			remote_seq        INTEGER NOT NULL DEFAULT 0,
+			entity_key        TEXT    NOT NULL DEFAULT '',
+			op                TEXT    NOT NULL DEFAULT '',
+			reason_code       TEXT    NOT NULL DEFAULT '',
 			apply_status      TEXT    NOT NULL DEFAULT 'deferred',
 			retry_count       INTEGER NOT NULL DEFAULT 0,
 			last_error        TEXT,
@@ -1092,6 +1103,17 @@ func (s *Store) migrate() error {
 			ON sync_apply_deferred(apply_status, first_seen_at);
 	`); err != nil {
 		return err
+	}
+	for _, column := range []struct{ name, definition string }{
+		{"target_key", "TEXT NOT NULL DEFAULT ''"},
+		{"remote_seq", "INTEGER NOT NULL DEFAULT 0"},
+		{"entity_key", "TEXT NOT NULL DEFAULT ''"},
+		{"op", "TEXT NOT NULL DEFAULT ''"},
+		{"reason_code", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := s.addColumnIfNotExists("sync_apply_deferred", column.name, column.definition); err != nil {
+			return err
+		}
 	}
 
 	// Phase 3b: composite index for conflict-audit list/count queries.
@@ -2045,6 +2067,9 @@ func (s *Store) CreateSession(id, project, directory string) error {
 }
 
 func (s *Store) EndSession(id string, summary string) error {
+	if err := validateSessionID(id); err != nil {
+		return err
+	}
 	return s.withTx(func(tx *sql.Tx) error {
 		res, err := s.execHook(tx,
 			`UPDATE sessions SET ended_at = datetime('now'), summary = ? WHERE id = ?`,
@@ -2762,6 +2787,9 @@ func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt
 // When the session belongs to an enrolled project, this operation also enqueues
 // a session/delete mutation so cloud replicas can remove the session.
 func (s *Store) DeleteSession(id string) error {
+	if err := validateSessionID(id); err != nil {
+		return err
+	}
 	return s.withTx(func(tx *sql.Tx) error {
 		var project string
 		if err := tx.QueryRow(`SELECT project FROM sessions WHERE id = ?`, id).Scan(&project); err != nil {
@@ -4283,6 +4311,10 @@ func (s *Store) ApplyPulledMutation(targetKey string, mutation SyncMutation) err
 					return fmt.Errorf("ApplyPulledMutation: write dead row: %w", deferErr)
 				}
 				// Fall through to advance the cursor (ACK the seq).
+			} else if errors.Is(applyErr, ErrPulledSessionIdentityInvalid) {
+				if err := s.deadLetterPulledSessionIdentityTx(tx, targetKey, mutation); err != nil {
+					return err
+				}
 			} else {
 				return applyErr
 			}
@@ -4334,7 +4366,12 @@ func (s *Store) ApplyPulledChunk(targetKey, chunkID string, mutations []SyncMuta
 			mutation.TargetKey = targetKey
 			mutation.Source = SyncSourceRemote
 			if err := s.applyPulledMutationTx(tx, mutation); err != nil {
-				return fmt.Errorf("apply chunk mutation %d: %w", i, err)
+				if !errors.Is(err, ErrPulledSessionIdentityInvalid) {
+					return fmt.Errorf("apply chunk mutation %d: %w", i, err)
+				}
+				if err := s.deadLetterPulledSessionIdentityTx(tx, targetKey, mutation); err != nil {
+					return fmt.Errorf("apply chunk mutation %d: %w", i, err)
+				}
 			}
 		}
 
@@ -5080,6 +5117,7 @@ func (s *Store) projectNeedsBackfill(project string) (bool, error) {
 		{
 			q: `SELECT COUNT(*) FROM sessions
 			    WHERE project = ?
+			      AND trim(id) != ''
 			      AND NOT EXISTS (
 			        SELECT 1 FROM sync_mutations sm
 			        WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = sessions.id AND sm.source = ?
@@ -5533,6 +5571,9 @@ func (s *Store) backfillRelationSyncMutationsTx(tx *sql.Tx, project string) erro
 }
 
 func (s *Store) enqueueSyncMutationTx(tx *sql.Tx, entity, entityKey, op string, payload any) error {
+	if entity == SyncEntitySession && strings.TrimSpace(entityKey) == "" {
+		return ErrSessionIDRequired
+	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -5655,7 +5696,7 @@ func (s *Store) applyPulledMutationTx(tx *sql.Tx, mutation SyncMutation) error {
 			payload.ID = entityKey
 		}
 		if err := validateSessionMutationIdentity(payload.ID, entityKey); err != nil {
-			return err
+			return fmt.Errorf("%w: %v", ErrPulledSessionIdentityInvalid, err)
 		}
 		if mutation.Op == SyncOpDelete || isSessionDeletePayload(payload) {
 			return s.applySessionDeleteTx(tx, payload)
@@ -5682,6 +5723,25 @@ func (s *Store) applyPulledMutationTx(tx *sql.Tx, mutation SyncMutation) error {
 	default:
 		return fmt.Errorf("unknown sync entity %q", mutation.Entity)
 	}
+}
+
+func (s *Store) deadLetterPulledSessionIdentityTx(tx *sql.Tx, targetKey string, mutation SyncMutation) error {
+	keyHash := sha256.Sum256([]byte(targetKey + "\x00" + strconv.FormatInt(mutation.Seq, 10)))
+	syncID := "pulled-session-" + hex.EncodeToString(keyHash[:])
+	_, err := s.execHook(tx, `
+		INSERT INTO sync_apply_deferred
+			(sync_id, entity, payload, target_key, remote_seq, entity_key, op, reason_code, apply_status, retry_count, first_seen_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dead', 0, datetime('now'))
+		ON CONFLICT(sync_id) DO UPDATE SET
+			entity = excluded.entity, payload = excluded.payload, target_key = excluded.target_key,
+			remote_seq = excluded.remote_seq, entity_key = excluded.entity_key, op = excluded.op,
+			reason_code = excluded.reason_code, apply_status = 'dead', last_attempted_at = datetime('now')`,
+		syncID, mutation.Entity, mutation.Payload, targetKey, mutation.Seq, mutation.EntityKey, mutation.Op, SyncSessionIdentityInvalidReasonCode,
+	)
+	if err != nil {
+		return fmt.Errorf("write invalid pulled session evidence: %w", err)
+	}
+	return nil
 }
 
 // applyRelationUpsertTx handles a pulled mutation with entity='relation' and
@@ -5901,7 +5961,7 @@ func (s *Store) applySessionDeleteTx(tx *sql.Tx, payload syncSessionPayload) err
 
 func validateSessionID(id string) error {
 	if strings.TrimSpace(id) == "" {
-		return fmt.Errorf("session id is required")
+		return ErrSessionIDRequired
 	}
 	return nil
 }
@@ -7009,7 +7069,7 @@ func (s *Store) CountDeferredAndDead() (deferred, dead int, err error) {
 // JSON, PayloadValid is false and PayloadRaw is preserved.
 func (s *Store) ListDeferred(opts ListDeferredOptions) ([]DeferredRow, error) {
 	query := `
-		SELECT sync_id, entity, payload, apply_status, retry_count,
+		SELECT sync_id, entity, payload, target_key, remote_seq, entity_key, op, reason_code, apply_status, retry_count,
 		       last_error, last_attempted_at, first_seen_at
 		FROM sync_apply_deferred
 		WHERE 1=1`
@@ -7056,7 +7116,7 @@ func (s *Store) ListDeferred(opts ListDeferredOptions) ([]DeferredRow, error) {
 // Returns an error wrapping "not found" when no row exists (matches FindCandidates style).
 func (s *Store) GetDeferred(syncID string) (DeferredRow, error) {
 	row := s.db.QueryRow(`
-		SELECT sync_id, entity, payload, apply_status, retry_count,
+		SELECT sync_id, entity, payload, target_key, remote_seq, entity_key, op, reason_code, apply_status, retry_count,
 		       last_error, last_attempted_at, first_seen_at
 		FROM sync_apply_deferred
 		WHERE sync_id = ?
@@ -7082,7 +7142,7 @@ func scanDeferredRow(row scannable) (DeferredRow, error) {
 	var r DeferredRow
 	var rawPayload string
 	if err := row.Scan(
-		&r.SyncID, &r.Entity, &rawPayload, &r.ApplyStatus, &r.RetryCount,
+		&r.SyncID, &r.Entity, &rawPayload, &r.TargetKey, &r.RemoteSeq, &r.EntityKey, &r.Op, &r.ReasonCode, &r.ApplyStatus, &r.RetryCount,
 		&r.LastError, &r.LastAttemptedAt, &r.FirstSeenAt,
 	); err != nil {
 		return r, err
