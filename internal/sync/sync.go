@@ -27,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -441,6 +442,9 @@ func (sy *Syncer) Export(createdBy string, project string) (*SyncResult, error) 
 	if err != nil {
 		return nil, fmt.Errorf("export data: %w", err)
 	}
+	if !sy.cloudMode && strings.TrimSpace(project) != "" {
+		data = filterExportDataToProjectScope(data)
+	}
 	chunk := &ChunkData{}
 	mutationSeqs := []int64{}
 	if sy.cloudMode {
@@ -462,11 +466,14 @@ func (sy *Syncer) Export(createdBy string, project string) (*SyncResult, error) 
 
 		// Relations are filtered by chunk presence, not timestamp; see the
 		// rationale on filterRelationMutationsForExport and issue #353.
-		exportedRelations, err := sy.exportedRelationKeys(manifest)
+		exportedRelations, exportedObservations, err := sy.exportedChunkKeys(manifest)
 		if err != nil {
 			return nil, fmt.Errorf("scan exported relations: %w", err)
 		}
 		chunk.Mutations = filterRelationMutationsForExport(relationMutations, exportedRelations, lastChunkTime)
+		if err := filterRelationMutationsForEndpointAvailability(chunk, data, exportedObservations, strings.TrimSpace(project) != ""); err != nil {
+			return nil, fmt.Errorf("filter relation endpoints: %w", err)
+		}
 	}
 
 	// Nothing new to export
@@ -1222,19 +1229,98 @@ func (sy *Syncer) filterNewData(data *store.ExportData, lastChunkTime string) *C
 	return chunk
 }
 
-// exportedRelationKeys returns the set of relation EntityKeys already present
+// filterExportDataToProjectScope excludes personal observations from a local
+// project export. Scope is a privacy boundary even when an observation has the
+// same project as the requested chunk.
+func filterExportDataToProjectScope(data *store.ExportData) *store.ExportData {
+	filtered := *data
+	filtered.Observations = make([]store.Observation, 0, len(data.Observations))
+	for _, observation := range data.Observations {
+		if observation.Scope == "project" {
+			filtered.Observations = append(filtered.Observations, observation)
+		}
+	}
+	return &filtered
+}
+
+// filterRelationMutationsForEndpointAvailability retains relation upserts only
+// when both endpoints are available in the current or a prior manifest chunk.
+// It never re-exports stale observations as relation closure because a receiver
+// could overwrite newer local content. Relations involving endpoints outside
+// a named project export are skipped with a visible warning.
+func filterRelationMutationsForEndpointAvailability(chunk *ChunkData, data *store.ExportData, exportedObservations map[string]struct{}, requireProjectScope bool) error {
+	observationsBySyncID := make(map[string]store.Observation, len(data.Observations))
+	for _, observation := range data.Observations {
+		observationsBySyncID[observation.SyncID] = observation
+	}
+
+	includedObservations := make(map[string]struct{}, len(chunk.Observations)+len(exportedObservations))
+	for syncID := range exportedObservations {
+		includedObservations[syncID] = struct{}{}
+	}
+	for _, observation := range chunk.Observations {
+		includedObservations[observation.SyncID] = struct{}{}
+	}
+
+	retainedMutations := make([]store.SyncMutation, 0, len(chunk.Mutations))
+	for _, mutation := range chunk.Mutations {
+		if mutation.Entity != store.SyncEntityRelation || mutation.Op != store.SyncOpUpsert {
+			retainedMutations = append(retainedMutations, mutation)
+			continue
+		}
+		var payload struct {
+			SourceID string `json:"source_id"`
+			TargetID string `json:"target_id"`
+		}
+		if err := decodeSyncPayloadForProject([]byte(mutation.Payload), &payload); err != nil {
+			return fmt.Errorf("decode relation %s: %w", mutation.EntityKey, err)
+		}
+		skip := false
+		for _, endpointID := range []string{strings.TrimSpace(payload.SourceID), strings.TrimSpace(payload.TargetID)} {
+			if endpointID == "" {
+				return fmt.Errorf("relation %s has an empty endpoint", mutation.EntityKey)
+			}
+			observation, ok := observationsBySyncID[endpointID]
+			if !ok {
+				log.Printf("[sync] warning: skipping relation %s because endpoint %s is outside the project export", mutation.EntityKey, endpointID)
+				skip = true
+				break
+			}
+			if requireProjectScope && observation.Scope != "project" {
+				log.Printf("[sync] warning: skipping relation %s because endpoint %s has %q scope", mutation.EntityKey, endpointID, observation.Scope)
+				skip = true
+				break
+			}
+			if _, included := includedObservations[endpointID]; !included {
+				log.Printf("[sync] warning: skipping relation %s because endpoint %s was excluded by incremental export", mutation.EntityKey, endpointID)
+				skip = true
+				break
+			}
+		}
+		if skip {
+			continue
+		}
+
+		retainedMutations = append(retainedMutations, mutation)
+	}
+	chunk.Mutations = retainedMutations
+
+	return nil
+}
+
+// exportedChunkKeys returns the relation and observation keys already present
 // in the chunks recorded by the manifest. The manifest itself does not track
-// relations, so the chunk contents are the source of truth for "has this
-// relation ever been exported".
+// those keys, so chunk contents are the source of truth for their availability.
 //
 // Cost: this reads every chunk listed in the manifest on each export. A
 // relation may live in any chunk, so the scan cannot stop early. For very long
 // sync histories this is O(total chunks); tracking relation keys in the
 // manifest would remove the rescan if it ever becomes a bottleneck.
-func (sy *Syncer) exportedRelationKeys(m *Manifest) (map[string]struct{}, error) {
-	keys := make(map[string]struct{})
+func (sy *Syncer) exportedChunkKeys(m *Manifest) (map[string]struct{}, map[string]struct{}, error) {
+	relationKeys := make(map[string]struct{})
+	observationKeys := make(map[string]struct{})
 	if m == nil {
-		return keys, nil
+		return relationKeys, observationKeys, nil
 	}
 	for _, entry := range m.Chunks {
 		// Read through the transport (not the local filesystem directly) so the
@@ -1250,19 +1336,22 @@ func (sy *Syncer) exportedRelationKeys(m *Manifest) (map[string]struct{}, error)
 				// but cannot be read is a real fault and fails loudly below.
 				continue
 			}
-			return nil, fmt.Errorf("read chunk %s: %w", entry.ID, err)
+			return nil, nil, fmt.Errorf("read chunk %s: %w", entry.ID, err)
 		}
 		var chunk ChunkData
 		if err := json.Unmarshal(raw, &chunk); err != nil {
-			return nil, fmt.Errorf("unmarshal chunk %s: %w", entry.ID, err)
+			return nil, nil, fmt.Errorf("unmarshal chunk %s: %w", entry.ID, err)
+		}
+		for _, observation := range chunk.Observations {
+			observationKeys[observation.SyncID] = struct{}{}
 		}
 		for _, mutation := range chunk.Mutations {
 			if mutation.Entity == store.SyncEntityRelation {
-				keys[mutation.EntityKey] = struct{}{}
+				relationKeys[mutation.EntityKey] = struct{}{}
 			}
 		}
 	}
-	return keys, nil
+	return relationKeys, observationKeys, nil
 }
 
 // filterRelationMutationsForExport returns the relation mutations that still
