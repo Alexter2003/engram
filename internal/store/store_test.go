@@ -800,6 +800,72 @@ func TestTopicKeyUpsertUpdatesSameTopicWithoutCreatingNewRow(t *testing.T) {
 	}
 }
 
+func TestTopicKeyUpsertMovesObservationToLatestSession(t *testing.T) {
+	s := newTestStore(t)
+
+	for _, sessionID := range []string{"session-a", "session-b"} {
+		if err := s.CreateSession(sessionID, "engram", "/tmp/engram"); err != nil {
+			t.Fatalf("create %s: %v", sessionID, err)
+		}
+	}
+
+	firstID, err := s.AddObservation(AddObservationParams{
+		SessionID: "session-a",
+		Type:      "architecture",
+		Title:     "Auth model",
+		Content:   "content-written-by-session-a",
+		Project:   "engram",
+		Scope:     "project",
+		TopicKey:  "architecture/auth-model",
+	})
+	if err != nil {
+		t.Fatalf("add session A observation: %v", err)
+	}
+
+	secondID, err := s.AddObservation(AddObservationParams{
+		SessionID: "session-b",
+		Type:      "architecture",
+		Title:     "Auth model",
+		Content:   "content-written-by-session-b",
+		Project:   "engram",
+		Scope:     "project",
+		TopicKey:  "architecture/auth-model",
+	})
+	if err != nil {
+		t.Fatalf("upsert session B observation: %v", err)
+	}
+	if firstID != secondID {
+		t.Fatalf("expected cross-session topic upsert to reuse id, got %d and %d", firstID, secondID)
+	}
+
+	observation, err := s.GetObservation(firstID)
+	if err != nil {
+		t.Fatalf("get upserted observation: %v", err)
+	}
+	if observation.SessionID != "session-b" {
+		t.Fatalf("expected latest writer session, got %q", observation.SessionID)
+	}
+	if observation.RevisionCount != 2 {
+		t.Fatalf("expected revision_count=2, got %d", observation.RevisionCount)
+	}
+
+	context, err := s.FormatCompactionContext("session-a")
+	if err != nil {
+		t.Fatalf("format session A compaction context: %v", err)
+	}
+	if strings.Contains(context, "content-written-by-session-b") {
+		t.Fatalf("session A compaction context leaked session B content: %s", context)
+	}
+
+	observations, err := s.AllObservations("engram", "project", 10)
+	if err != nil {
+		t.Fatalf("list observations: %v", err)
+	}
+	if len(observations) != 1 {
+		t.Fatalf("expected one topic observation, got %d", len(observations))
+	}
+}
+
 func TestDifferentTopicsDoNotReplaceEachOther(t *testing.T) {
 	s := newTestStore(t)
 
@@ -4591,7 +4657,7 @@ func TestStoreUncoveredBranchesPushToHundred(t *testing.T) {
 		}
 		origExec := s.hooks.exec
 		s.hooks.exec = func(db execer, query string, args ...any) (sql.Result, error) {
-			if strings.Contains(query, "SET type = ?") {
+			if strings.Contains(query, "SET session_id = ?") {
 				return nil, errors.New("forced topic update error")
 			}
 			return origExec(db, query, args...)

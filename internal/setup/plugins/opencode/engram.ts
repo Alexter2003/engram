@@ -122,7 +122,7 @@ This is NOT optional. If you skip this, the next session starts blind.
 
 If you see a message about compaction or context reset, or if you see "FIRST ACTION REQUIRED" in your context:
 1. IMMEDIATELY call \`mem_session_summary\` with the compacted summary content — this persists what was done before compaction
-2. Then call \`mem_context\` to recover any additional context from previous sessions
+2. The session-only compaction context has already been injected. Do not automatically call \`mem_context\`, which is project-scoped; use it only when explicitly requested.
 3. Only THEN continue working
 
 Do not skip step 1. Without it, everything done before compaction is lost from memory.

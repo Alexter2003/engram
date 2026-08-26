@@ -506,6 +506,14 @@ test("compaction resolves an unobserved child and registers only its root", asyn
   assert.match(output.context.at(-1), /FIRST ACTION REQUIRED/)
 })
 
+test("post-compaction protocol relies on injected session-only context", () => {
+	const afterCompaction = source.match(/### AFTER COMPACTION[\s\S]*?Do not skip step 1\.[\s\S]*?memory\./)?.[0]
+  assert.ok(afterCompaction, "AFTER COMPACTION protocol must exist")
+  assert.match(afterCompaction, /session-only compaction context has already been injected/)
+  assert.match(afterCompaction, /use it only when explicitly requested/)
+  assert.doesNotMatch(afterCompaction, /\d\.\s+(?:Then )?call `mem_context`/)
+})
+
 test("compaction skips invalid or missing sessions and still injects recovery context", async (t) => {
   for (const scenario of [
     {

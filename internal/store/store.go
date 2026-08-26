@@ -2290,7 +2290,8 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 			if err == nil {
 				if _, err := s.execHook(tx,
 					`UPDATE observations
-					 SET type = ?,
+					 SET session_id = ?,
+					     type = ?,
 					     title = ?,
 					     content = ?,
 					     tool_name = ?,
@@ -2300,6 +2301,7 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 					     last_seen_at = datetime('now'),
 					     updated_at = datetime('now')
 					 WHERE id = ?`,
+					p.SessionID,
 					p.Type,
 					title,
 					content,
