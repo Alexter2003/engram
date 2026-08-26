@@ -47,15 +47,17 @@ var sqliteWriteRetryBackoffs = []time.Duration{
 
 // Sentinel errors returned by Store operations so callers can use errors.Is.
 var (
-	ErrSessionNotFound            = errors.New("session not found")
-	ErrSessionHasObservations     = errors.New("session still has observations")
-	ErrSessionDeleteBlocked       = errors.New("session deletion is blocked while cloud sync enrollment is active")
-	ErrObservationNotFound        = errors.New("observation not found")
-	ErrPromptNotFound             = errors.New("prompt not found")
-	ErrProjectNotFound            = errors.New("project not found")
-	ErrObservationTitleRequired   = errors.New("observation title is required")
-	ErrObservationContentRequired = errors.New("observation content is required")
-	ErrPromptContentRequired      = errors.New("prompt content is required")
+	ErrSessionNotFound             = errors.New("session not found")
+	ErrSessionHasObservations      = errors.New("session still has observations")
+	ErrSessionDeleteBlocked        = errors.New("session deletion is blocked while cloud sync enrollment is active")
+	ErrObservationNotFound         = errors.New("observation not found")
+	ErrPromptNotFound              = errors.New("prompt not found")
+	ErrProjectNotFound             = errors.New("project not found")
+	ErrProjectRequired             = errors.New("project identity is required")
+	ErrObservationProjectImmutable = errors.New("observation project cannot be reassigned")
+	ErrObservationTitleRequired    = errors.New("observation title is required")
+	ErrObservationContentRequired  = errors.New("observation content is required")
+	ErrPromptContentRequired       = errors.New("prompt content is required")
 )
 
 // Sentinel errors for relation sync apply path (Phase 2).
@@ -2101,6 +2103,9 @@ func (s *Store) migrateFTSTopicKey() error {
 func (s *Store) CreateSession(id, project, directory string) error {
 	// Normalize project name before storing
 	project, _ = NormalizeProject(project)
+	if strings.TrimSpace(project) == "" {
+		return ErrProjectRequired
+	}
 
 	return s.withTx(func(tx *sql.Tx) error {
 		if err := s.createSessionTx(tx, id, project, directory); err != nil {
@@ -2363,6 +2368,19 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 
 	var observationID int64
 	err := s.withTx(func(tx *sql.Tx) error {
+		if strings.TrimSpace(p.Project) == "" {
+			var sessionProject string
+			if err := tx.QueryRow(`SELECT project FROM sessions WHERE id = ?`, p.SessionID).Scan(&sessionProject); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return ErrProjectRequired
+				}
+				return err
+			}
+			p.Project, _ = NormalizeProject(sessionProject)
+			if strings.TrimSpace(p.Project) == "" {
+				return ErrProjectRequired
+			}
+		}
 		var obs *Observation
 		if topicKey != "" {
 			var existingID int64
@@ -2675,6 +2693,18 @@ func (s *Store) AddPrompt(p AddPromptParams) (int64, error) {
 
 	var promptID int64
 	err := s.withTx(func(tx *sql.Tx) error {
+		if strings.TrimSpace(p.Project) == "" {
+			if err := tx.QueryRow(`SELECT project FROM sessions WHERE id = ?`, p.SessionID).Scan(&p.Project); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return ErrProjectRequired
+				}
+				return err
+			}
+			p.Project, _ = NormalizeProject(p.Project)
+			if strings.TrimSpace(p.Project) == "" {
+				return ErrProjectRequired
+			}
+		}
 		syncID := newSyncID("prompt")
 		res, err := s.execHook(tx,
 			`INSERT INTO user_prompts (sync_id, session_id, content, project) VALUES (?, ?, ?, ?)`,
@@ -2718,6 +2748,18 @@ func (s *Store) AddPromptIfMissing(p AddPromptParams) (int64, bool, error) {
 	var promptID int64
 	inserted := false
 	err := s.withTx(func(tx *sql.Tx) error {
+		if strings.TrimSpace(p.Project) == "" {
+			if err := tx.QueryRow(`SELECT project FROM sessions WHERE id = ?`, p.SessionID).Scan(&p.Project); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return ErrProjectRequired
+				}
+				return err
+			}
+			p.Project, _ = NormalizeProject(p.Project)
+			if strings.TrimSpace(p.Project) == "" {
+				return ErrProjectRequired
+			}
+		}
 		err := tx.QueryRow(
 			`SELECT id FROM user_prompts WHERE session_id = ? AND ifnull(project, '') = ? AND content = ? ORDER BY id DESC LIMIT 1`,
 			p.SessionID, p.Project, content,
@@ -3031,6 +3073,9 @@ func (s *Store) UpdateObservation(id int64, p UpdateObservationParams) (*Observa
 		title := obs.Title
 		content := obs.Content
 		project := derefString(obs.Project)
+		if strings.TrimSpace(project) == "" {
+			return ErrProjectRequired
+		}
 		scope := obs.Scope
 		topicKey := derefString(obs.TopicKey)
 
@@ -3047,7 +3092,10 @@ func (s *Store) UpdateObservation(id int64, p UpdateObservationParams) (*Observa
 			}
 		}
 		if p.Project != nil {
-			project, _ = NormalizeProject(*p.Project)
+			requestedProject, _ := NormalizeProject(*p.Project)
+			if requestedProject != project {
+				return ErrObservationProjectImmutable
+			}
 		}
 		if p.Scope != nil {
 			scope = normalizeScope(*p.Scope)
@@ -4708,6 +4756,147 @@ type MigrateResult struct {
 	PromptsUpdated      int64 `json:"prompts_updated"`
 }
 
+// ProjectRescueParams identifies historical rows whose missing project ownership
+// was explicitly confirmed by an operator. Only rows with a NULL project qualify.
+type ProjectRescueParams struct {
+	TargetProject  string
+	ObservationIDs []int64
+	SessionIDs     []string
+	PromptIDs      []int64
+}
+
+// ProjectRescueResult reports local ownership recovery. Journaled means local
+// canonical mutations were enqueued; it does not imply a cloud acknowledgement.
+type ProjectRescueResult struct {
+	RescuedObservations int64 `json:"rescued_observations"`
+	RescuedSessions     int64 `json:"rescued_sessions"`
+	RescuedPrompts      int64 `json:"rescued_prompts"`
+	ConflictingRecords  int64 `json:"conflicting_records"`
+	SkippedRecords      int64 `json:"skipped_records"`
+	Journaled           bool  `json:"journaled"`
+}
+
+func (r ProjectRescueResult) Rescued() int64 {
+	return r.RescuedObservations + r.RescuedSessions + r.RescuedPrompts
+}
+
+// RescueNullProjectOwnership assigns an explicit project only to selected legacy
+// records with NULL ownership and enqueues their missing canonical mutations.
+func (s *Store) RescueNullProjectOwnership(p ProjectRescueParams) (*ProjectRescueResult, error) {
+	target, _ := NormalizeProject(p.TargetProject)
+	if strings.TrimSpace(target) == "" {
+		return nil, ErrProjectRequired
+	}
+	if len(p.ObservationIDs) == 0 && len(p.SessionIDs) == 0 && len(p.PromptIDs) == 0 {
+		return nil, fmt.Errorf("project rescue requires at least one record id")
+	}
+	for _, id := range append(append([]int64{}, p.ObservationIDs...), p.PromptIDs...) {
+		if id <= 0 {
+			return nil, fmt.Errorf("project rescue record ids must be positive")
+		}
+	}
+	for _, id := range p.SessionIDs {
+		if strings.TrimSpace(id) == "" {
+			return nil, fmt.Errorf("project rescue session ids must not be blank")
+		}
+	}
+
+	result := &ProjectRescueResult{}
+	err := s.withTx(func(tx *sql.Tx) error {
+		var err error
+		result.RescuedObservations, result.ConflictingRecords, result.SkippedRecords, err = rescueNullProjectIDsTx(tx, "observations", "id", p.ObservationIDs, target)
+		if err != nil {
+			return err
+		}
+		var conflicts, skipped int64
+		result.RescuedPrompts, conflicts, skipped, err = rescueNullProjectIDsTx(tx, "user_prompts", "id", p.PromptIDs, target)
+		if err != nil {
+			return err
+		}
+		result.ConflictingRecords += conflicts
+		result.SkippedRecords += skipped
+		result.RescuedSessions, conflicts, skipped, err = rescueNullProjectSessionIDsTx(tx, p.SessionIDs, target)
+		if err != nil {
+			return err
+		}
+		result.ConflictingRecords += conflicts
+		result.SkippedRecords += skipped
+
+		journaled, err := s.enqueueRescuedProjectMutationsTx(tx, target, p)
+		if err != nil {
+			return err
+		}
+		result.Journaled = journaled
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func rescueNullProjectIDsTx(tx *sql.Tx, table, idColumn string, ids []int64, target string) (rescued, conflicts, skipped int64, err error) {
+	for _, id := range ids {
+		var project sql.NullString
+		err = tx.QueryRow(`SELECT project FROM `+table+` WHERE `+idColumn+` = ?`, id).Scan(&project)
+		if errors.Is(err, sql.ErrNoRows) {
+			skipped++
+			continue
+		}
+		if err != nil {
+			return
+		}
+		if project.Valid {
+			owned, _ := NormalizeProject(project.String)
+			if owned == target {
+				skipped++
+			} else {
+				conflicts++
+			}
+			continue
+		}
+		res, execErr := tx.Exec(`UPDATE `+table+` SET project = ? WHERE `+idColumn+` = ? AND project IS NULL`, target, id)
+		if execErr != nil {
+			err = execErr
+			return
+		}
+		updated, _ := res.RowsAffected()
+		rescued += updated
+	}
+	return
+}
+
+func rescueNullProjectSessionIDsTx(tx *sql.Tx, ids []string, target string) (rescued, conflicts, skipped int64, err error) {
+	for _, id := range ids {
+		var project sql.NullString
+		err = tx.QueryRow(`SELECT project FROM sessions WHERE id = ?`, id).Scan(&project)
+		if errors.Is(err, sql.ErrNoRows) {
+			skipped++
+			continue
+		}
+		if err != nil {
+			return
+		}
+		if project.Valid {
+			owned, _ := NormalizeProject(project.String)
+			if owned == target {
+				skipped++
+			} else {
+				conflicts++
+			}
+			continue
+		}
+		res, execErr := tx.Exec(`UPDATE sessions SET project = ? WHERE id = ? AND project IS NULL`, target, id)
+		if execErr != nil {
+			err = execErr
+			return
+		}
+		updated, _ := res.RowsAffected()
+		rescued += updated
+	}
+	return
+}
+
 func (s *Store) MigrateProject(oldName, newName string) (*MigrateResult, error) {
 	if oldName == "" || newName == "" || oldName == newName {
 		return &MigrateResult{}, nil
@@ -5311,6 +5500,83 @@ func (s *Store) backfillProjectSyncMutationsTx(tx *sql.Tx, project string) error
 		return err
 	}
 	return s.backfillRelationSyncMutationsTx(tx, project)
+}
+
+func (s *Store) enqueueRescuedProjectMutationsTx(tx *sql.Tx, target string, p ProjectRescueParams) (bool, error) {
+	journaled := false
+	for _, id := range p.SessionIDs {
+		var payload syncSessionPayload
+		err := tx.QueryRow(`SELECT id, project, directory, started_at, ended_at, summary FROM sessions WHERE id = ? AND project = ?`, id, target).
+			Scan(&payload.ID, &payload.Project, &payload.Directory, &payload.StartedAt, &payload.EndedAt, &payload.Summary)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		canonical, err := s.enqueueMissingLocalMutationTx(tx, SyncEntitySession, payload.ID, payload)
+		if err != nil {
+			return false, err
+		}
+		journaled = journaled || canonical
+	}
+	for _, id := range p.ObservationIDs {
+		var payload syncObservationPayload
+		err := tx.QueryRow(`SELECT sync_id, session_id, type, title, content, tool_name, project, scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at FROM observations WHERE id = ? AND project = ?`, id, target).
+			Scan(&payload.SyncID, &payload.SessionID, &payload.Type, &payload.Title, &payload.Content, &payload.ToolName, &payload.Project, &payload.Scope, &payload.TopicKey, &payload.RevisionCount, &payload.DuplicateCount, &payload.LastSeenAt, &payload.CreatedAt, &payload.UpdatedAt, &payload.DeletedAt)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		op := SyncOpUpsert
+		if payload.DeletedAt != nil {
+			op = SyncOpDelete
+			payload.Deleted = true
+		}
+		canonical, err := s.enqueueMissingLocalMutationTx(tx, SyncEntityObservation, payload.SyncID, payload, op)
+		if err != nil {
+			return false, err
+		}
+		journaled = journaled || canonical
+	}
+	for _, id := range p.PromptIDs {
+		var payload syncPromptPayload
+		err := tx.QueryRow(`SELECT sync_id, session_id, content, project, created_at FROM user_prompts WHERE id = ? AND project = ?`, id, target).
+			Scan(&payload.SyncID, &payload.SessionID, &payload.Content, &payload.Project, &payload.CreatedAt)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		canonical, err := s.enqueueMissingLocalMutationTx(tx, SyncEntityPrompt, payload.SyncID, payload)
+		if err != nil {
+			return false, err
+		}
+		journaled = journaled || canonical
+	}
+	return journaled, nil
+}
+
+func (s *Store) enqueueMissingLocalMutationTx(tx *sql.Tx, entity, entityKey string, payload any, ops ...string) (bool, error) {
+	project, _ := NormalizeProject(extractProjectFromPayload(payload))
+	op := SyncOpUpsert
+	if len(ops) > 0 {
+		op = ops[0]
+	}
+	var canonical bool
+	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM sync_mutations WHERE target_key = ? AND entity = ? AND entity_key = ? AND op = ? AND source = ? AND project = ? AND acked_at IS NULL AND json_extract(payload, '$.project') = ?)`, DefaultSyncTargetKey, entity, entityKey, op, SyncSourceLocal, project, project).Scan(&canonical); err != nil {
+		return false, err
+	}
+	if canonical {
+		return true, nil
+	}
+	if err := s.enqueueSyncMutationTx(tx, entity, entityKey, op, payload); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // projectNeedsBackfill returns true when a project has any sessions, live observations,

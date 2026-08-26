@@ -169,6 +169,151 @@ func TestClaudeSaveNudgeCompatibilityRoutes(t *testing.T) {
 	}
 }
 
+func TestHandleMigrateProjectRequiresConfirmedBoundedRescue(t *testing.T) {
+	const token = "rescue-token"
+	t.Setenv("ENGRAM_HTTP_TOKEN", token)
+	h := New(newServerTestStore(t), 0).Handler()
+	for _, body := range []string{
+		`{"target_project":"target","observation_ids":[1]}`,
+		`{"target_project":"target","confirmed":true}`,
+		`{"confirmed":true,"observation_ids":[1]}`,
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/projects/migrate", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("body %s returned %d: %s", body, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestHandleMigrateProjectRescuesNullOwnershipAndReportsLocalJournal(t *testing.T) {
+	const token = "rescue-token"
+	t.Setenv("ENGRAM_HTTP_TOKEN", token)
+	st := newServerTestStore(t)
+	if err := st.CreateSession("legacy-session", "legacy", "/tmp"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	id, err := st.AddObservation(store.AddObservationParams{SessionID: "legacy-session", Type: "note", Title: "legacy", Content: "content", Project: "legacy"})
+	if err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+	if _, err := st.DB().Exec(`UPDATE observations SET project = NULL WHERE id = ?`, id); err != nil {
+		t.Fatalf("clear legacy ownership: %v", err)
+	}
+	if _, err := st.DB().Exec(`DELETE FROM sync_mutations WHERE entity_key = (SELECT sync_id FROM observations WHERE id = ?)`, id); err != nil {
+		t.Fatalf("clear legacy mutation: %v", err)
+	}
+	srv := New(st, 0)
+	var writes int32
+	srv.SetOnWrite(func() { atomic.AddInt32(&writes, 1) })
+	body := fmt.Sprintf(`{"target_project":"target","confirmed":true,"observation_ids":[%d]}`, id)
+	req := httptest.NewRequest(http.MethodPost, "/projects/migrate", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("rescue returned %d: %s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode rescue response: %v", err)
+	}
+	if response["status"] != "rescued" || response["journaled_local"] != true || response["reconciliation_status"] != "local journal pending autosync" {
+		t.Fatalf("unexpected rescue response: %#v", response)
+	}
+	if atomic.LoadInt32(&writes) != 1 {
+		t.Fatalf("autosync notification count = %d, want 1", writes)
+	}
+	var project sql.NullString
+	if err := st.DB().QueryRow(`SELECT project FROM observations WHERE id = ?`, id).Scan(&project); err != nil {
+		t.Fatalf("read rescued ownership: %v", err)
+	}
+	if !project.Valid || project.String != "target" {
+		t.Fatalf("rescued ownership = %#v, want target", project)
+	}
+	var journaled int
+	if err := st.DB().QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE entity_key = (SELECT sync_id FROM observations WHERE id = ?)`, id).Scan(&journaled); err != nil {
+		t.Fatalf("count rescued mutations: %v", err)
+	}
+	if journaled != 1 {
+		t.Fatalf("rescued mutation count = %d, want 1", journaled)
+	}
+}
+
+func TestHandleMigrateProjectRejectsUnauthorizedRescueWithoutSideEffects(t *testing.T) {
+	tests := []struct {
+		name          string
+		serverToken   string
+		authorization string
+		wantStatus    int
+		wantError     string
+	}{
+		{name: "token unset", authorization: "Bearer rescue-token", wantStatus: http.StatusServiceUnavailable, wantError: "server authorization is not configured"},
+		{name: "credential missing", serverToken: "rescue-token", wantStatus: http.StatusUnauthorized, wantError: "authorization required"},
+		{name: "credential wrong", serverToken: "rescue-token", authorization: "Bearer wrong-token", wantStatus: http.StatusUnauthorized, wantError: "invalid token"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("ENGRAM_HTTP_TOKEN", tt.serverToken)
+			st := newServerTestStore(t)
+			if err := st.CreateSession("legacy-session", "legacy", "/tmp"); err != nil {
+				t.Fatalf("CreateSession: %v", err)
+			}
+			id, err := st.AddObservation(store.AddObservationParams{SessionID: "legacy-session", Type: "note", Title: "legacy", Content: "sensitive content", Project: "legacy"})
+			if err != nil {
+				t.Fatalf("AddObservation: %v", err)
+			}
+			if _, err := st.DB().Exec(`UPDATE observations SET project = NULL WHERE id = ?`, id); err != nil {
+				t.Fatalf("clear legacy ownership: %v", err)
+			}
+			if _, err := st.DB().Exec(`DELETE FROM sync_mutations WHERE entity_key = (SELECT sync_id FROM observations WHERE id = ?)`, id); err != nil {
+				t.Fatalf("clear legacy mutation: %v", err)
+			}
+
+			srv := New(st, 0)
+			var writes int32
+			srv.SetOnWrite(func() { atomic.AddInt32(&writes, 1) })
+			body := fmt.Sprintf(`{"target_project":"target","confirmed":true,"observation_ids":[%d]}`, id)
+			req := httptest.NewRequest(http.MethodPost, "/projects/migrate", strings.NewReader(body))
+			if tt.authorization != "" {
+				req.Header.Set("Authorization", tt.authorization)
+			}
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, req)
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("rejected rescue returned %d, want %d: %s", rec.Code, tt.wantStatus, rec.Body.String())
+			}
+			var response map[string]string
+			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+				t.Fatalf("decode rejection response: %v", err)
+			}
+			if response["error"] != tt.wantError {
+				t.Fatalf("rejection error = %q, want %q", response["error"], tt.wantError)
+			}
+
+			var project sql.NullString
+			if err := st.DB().QueryRow(`SELECT project FROM observations WHERE id = ?`, id).Scan(&project); err != nil {
+				t.Fatalf("read legacy ownership: %v", err)
+			}
+			if project.Valid {
+				t.Fatalf("rejected rescue assigned project %q", project.String)
+			}
+			var journaled int
+			if err := st.DB().QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE entity_key = (SELECT sync_id FROM observations WHERE id = ?)`, id).Scan(&journaled); err != nil {
+				t.Fatalf("count legacy mutations: %v", err)
+			}
+			if journaled != 0 {
+				t.Fatalf("rejected rescue journaled %d mutations", journaled)
+			}
+			if atomic.LoadInt32(&writes) != 0 {
+				t.Fatalf("rejected rescue autosync notification count = %d, want 0", writes)
+			}
+		})
+	}
+}
+
 func TestHandleSearchForwardsMatchModeAndAllProjects(t *testing.T) {
 	st := newServerTestStore(t)
 	h := New(st, 0).Handler()
@@ -2188,46 +2333,15 @@ func TestJudgeAndCompareRoutesValidateInput(t *testing.T) {
 	}
 }
 
-// TestMigrateProjectCaseOnlySkipped asserts that POST /projects/migrate
-// returns status "skipped" when old_project and new_project differ only by
-// case — fixing #438 where the exact-string comparison let case-only renames
-// slip through and create duplicate projects.
-//
-// The test seeds a session under "repo_name" so that the store would actually
-// migrate if the server did not guard against case-only differences first.
-func TestMigrateProjectCaseOnlySkipped(t *testing.T) {
-	st := newServerTestStore(t)
-	h := New(st, 0).Handler()
-
-	// Seed a session under the lowercase project name so the store has data
-	// to migrate; without the fix the handler would call store.MigrateProject
-	// and rename "repo_name" → "Repo_Name", creating a duplicate.
-	seedReq := httptest.NewRequest(http.MethodPost, "/sessions", strings.NewReader(
-		`{"id":"s-case-migrate","project":"repo_name","directory":"/tmp/repo"}`,
-	))
-	seedReq.Header.Set("Content-Type", "application/json")
-	seedRec := httptest.NewRecorder()
-	h.ServeHTTP(seedRec, seedReq)
-	if seedRec.Code != http.StatusCreated {
-		t.Fatalf("seed session: expected 201, got %d body=%s", seedRec.Code, seedRec.Body.String())
-	}
-
-	body := bytes.NewBufferString(`{"old_project":"repo_name","new_project":"Repo_Name"}`)
-	req := httptest.NewRequest(http.MethodPost, "/projects/migrate", body)
-	req.Header.Set("Content-Type", "application/json")
+func TestMigrateProjectRejectsLegacyRenamePayload(t *testing.T) {
+	const token = "rescue-token"
+	t.Setenv("ENGRAM_HTTP_TOKEN", token)
+	h := New(newServerTestStore(t), 0).Handler()
+	req := httptest.NewRequest(http.MethodPost, "/projects/migrate", bytes.NewBufferString(`{"old_project":"repo_name","new_project":"Repo_Name"}`))
+	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
-
 	h.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
-	}
-
-	var resp map[string]any
-	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if resp["status"] != "skipped" {
-		t.Fatalf("expected status=skipped for case-only difference, got %v (full response: %#v)", resp["status"], resp)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected legacy rename payload to be rejected, got %d body=%s", rec.Code, rec.Body.String())
 	}
 }

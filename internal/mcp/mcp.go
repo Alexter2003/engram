@@ -1417,12 +1417,32 @@ func handleUpdate(s *store.Store) server.ToolHandlerFunc {
 			return mcp.NewToolResultError("provide at least one field to update"), nil
 		}
 
+		detRes, err := resolveWriteProject()
+		if err != nil {
+			return writeProjectErrorResult(nil, "", detRes, err), nil
+		}
+		obs, err := s.GetObservation(id)
+		if err != nil {
+			return mcp.NewToolResultError("Failed to update memory: " + err.Error()), nil
+		}
+		resolvedProject, _ := store.NormalizeProject(detRes.Project)
+		storedProject := ""
+		if obs.Project != nil {
+			storedProject, _ = store.NormalizeProject(*obs.Project)
+		}
+		if storedProject == "" {
+			return mcp.NewToolResultError("Failed to update memory: " + store.ErrProjectRequired.Error()), nil
+		}
+		if storedProject != resolvedProject {
+			return mcp.NewToolResultError("Failed to update memory: resolved project does not match the observation project"), nil
+		}
+
 		var contentLen int
 		if update.Content != nil {
 			contentLen = len(*update.Content)
 		}
 
-		obs, err := s.UpdateObservation(id, update)
+		obs, err = s.UpdateObservation(id, update)
 		if err != nil {
 			return mcp.NewToolResultError("Failed to update memory: " + err.Error()), nil
 		}
@@ -1432,12 +1452,6 @@ func handleUpdate(s *store.Store) server.ToolHandlerFunc {
 			msg += fmt.Sprintf("\n⚠ WARNING: Content was truncated from %d to %d chars. Consider splitting into smaller observations.", contentLen, s.MaxObservationLength())
 		}
 
-		// Auto-detect for envelope; tolerant — don't fail update on resolution error
-		detRes, detErr := resolveWriteProject()
-		if detErr != nil {
-			// Still return success for the update itself.
-			return mcp.NewToolResultText(msg), nil
-		}
 		return respondWithProject(detRes, msg, nil), nil
 	}
 }

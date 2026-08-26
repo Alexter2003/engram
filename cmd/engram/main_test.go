@@ -486,6 +486,69 @@ func TestCmdSaveAndSearch(t *testing.T) {
 	}
 }
 
+func TestCmdSaveResolvesConfiguredProjectWithoutFlag(t *testing.T) {
+	cfg := testConfig(t)
+	cwd := t.TempDir()
+	configDir := filepath.Join(cwd, ".engram")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatalf("create project config directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(`{"project_name":"Configured-Project"}`), 0644); err != nil {
+		t.Fatalf("write project config: %v", err)
+	}
+	withCwd(t, cwd)
+	withArgs(t, "engram", "save", "resolved-title", "resolved-content")
+
+	stdout, stderr := captureOutput(t, func() { cmdSave(cfg) })
+	if stderr != "" || !strings.Contains(stdout, "Memory saved:") {
+		t.Fatalf("cmdSave output = stdout %q stderr %q", stdout, stderr)
+	}
+
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+	session, err := s.GetSession("manual-save-configured-project")
+	if err != nil || session.Project != "configured-project" {
+		t.Fatalf("resolved session = %#v, err=%v", session, err)
+	}
+	observations, err := s.RecentObservations("configured-project", "project", 10)
+	if err != nil || len(observations) != 1 || observations[0].Title != "resolved-title" {
+		t.Fatalf("resolved observations = %#v, err=%v", observations, err)
+	}
+	var mutations int
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE project = ?`, "configured-project").Scan(&mutations); err != nil || mutations != 2 {
+		t.Fatalf("resolved journal mutations = %d, err=%v, want 2", mutations, err)
+	}
+}
+
+func TestCmdSaveRejectsUnresolvableProjectBeforeOpeningStore(t *testing.T) {
+	stubExitWithPanic(t)
+	cfg := testConfig(t)
+	cwd := t.TempDir()
+	configDir := filepath.Join(cwd, ".engram")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatalf("create project config directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(`{"project_name":""}`), 0644); err != nil {
+		t.Fatalf("write invalid project config: %v", err)
+	}
+	withCwd(t, cwd)
+	withArgs(t, "engram", "save", "rejected-title", "rejected-content")
+
+	_, stderr, recovered := captureOutputAndRecover(t, func() { cmdSave(cfg) })
+	if _, ok := recovered.(exitCode); !ok {
+		t.Fatalf("expected fatal exit, got %v", recovered)
+	}
+	if !strings.Contains(stderr, "cannot save without an unambiguous project identity") {
+		t.Fatalf("unexpected rejection: %q", stderr)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.DataDir, "engram.db")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unresolvable project opened store or left state: %v", err)
+	}
+}
+
 func TestCmdTimeline(t *testing.T) {
 	cfg := testConfig(t)
 	mustSeedObservation(t, cfg, "s-1", "proj", "note", "first", "first content", "project")

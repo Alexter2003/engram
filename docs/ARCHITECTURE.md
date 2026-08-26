@@ -295,7 +295,7 @@ engram version            Show version
 
 Local server auth:
 
-- `ENGRAM_HTTP_TOKEN`: optional Bearer auth for `engram serve`. When set, the following routes require `Authorization: Bearer <token>`: `DELETE /sessions/{id}`, `DELETE /observations/{id}`, `DELETE /prompts/{id}`, `GET /export`, `POST /import`, `POST /projects/migrate`. Comparison is constant-time; token is read per-request. When unset, all routes are open (zero-config default).
+- `ENGRAM_HTTP_TOKEN`: optional Bearer auth for `engram serve`. When set, `DELETE /sessions/{id}`, `DELETE /observations/{id}`, `DELETE /prompts/{id}`, `GET /export`, and `POST /import` require `Authorization: Bearer <token>`. `POST /projects/migrate` always requires a configured token and matching Bearer credential. Comparison is constant-time; token is read per-request. Other routes remain open when unset (zero-config default).
 - `ENGRAM_TIMEZONE`: IANA zone name for timestamp display in TUI and cloud dashboard (e.g. `America/New_York`). Falls back to system local when unset or invalid.
 
 Cloud constraints (current behavior):

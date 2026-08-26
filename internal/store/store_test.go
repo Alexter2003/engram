@@ -41,6 +41,258 @@ func newTestStore(t *testing.T) *Store {
 	return s
 }
 
+func TestProjectIdentityAdmissionRejectsEmptyWritesWithoutJournalState(t *testing.T) {
+	s := newTestStore(t)
+	assertCounts := func(wantSessions, wantObservations, wantPrompts, wantMutations int) {
+		t.Helper()
+		for table, want := range map[string]int{"sessions": wantSessions, "observations": wantObservations, "user_prompts": wantPrompts, "sync_mutations": wantMutations} {
+			var got int
+			if err := s.DB().QueryRow("SELECT COUNT(*) FROM " + table).Scan(&got); err != nil {
+				t.Fatalf("count %s: %v", table, err)
+			}
+			if got != want {
+				t.Fatalf("%s count = %d, want %d", table, got, want)
+			}
+		}
+	}
+
+	if err := s.CreateSession("missing-project", " ", "/tmp"); !errors.Is(err, ErrProjectRequired) {
+		t.Fatalf("CreateSession error = %v, want ErrProjectRequired", err)
+	}
+	if _, err := s.AddObservation(AddObservationParams{SessionID: "missing-project", Type: "note", Title: "title", Content: "content"}); !errors.Is(err, ErrProjectRequired) {
+		t.Fatalf("AddObservation error = %v, want ErrProjectRequired", err)
+	}
+	if _, err := s.AddPrompt(AddPromptParams{SessionID: "missing-project", Content: "content"}); !errors.Is(err, ErrProjectRequired) {
+		t.Fatalf("AddPrompt error = %v, want ErrProjectRequired", err)
+	}
+	assertCounts(0, 0, 0, 0)
+}
+
+func TestProjectIdentityAdmissionAllowsOwnedWritesAndRejectsReassignment(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("owned-session", "Project", "/tmp"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	id, err := s.AddObservation(AddObservationParams{SessionID: "owned-session", Type: "note", Title: "title", Content: "content", Project: "Project"})
+	if err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+	other := "other"
+	if _, err := s.UpdateObservation(id, UpdateObservationParams{Project: &other}); !errors.Is(err, ErrObservationProjectImmutable) {
+		t.Fatalf("UpdateObservation error = %v, want ErrObservationProjectImmutable", err)
+	}
+	obs, err := s.GetObservation(id)
+	if err != nil {
+		t.Fatalf("GetObservation: %v", err)
+	}
+	if obs.Project == nil || *obs.Project != "project" {
+		t.Fatalf("project = %v, want project", obs.Project)
+	}
+	var mutations int
+	if err := s.DB().QueryRow("SELECT COUNT(*) FROM sync_mutations").Scan(&mutations); err != nil {
+		t.Fatalf("count sync mutations: %v", err)
+	}
+	if mutations != 2 {
+		t.Fatalf("sync mutations = %d, want 2", mutations)
+	}
+}
+
+func TestRescueNullProjectOwnershipRequiresExplicitScope(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.RescueNullProjectOwnership(ProjectRescueParams{TargetProject: "target"}); err == nil {
+		t.Fatal("expected empty rescue scope to fail")
+	}
+	if _, err := s.RescueNullProjectOwnership(ProjectRescueParams{ObservationIDs: []int64{1}}); !errors.Is(err, ErrProjectRequired) {
+		t.Fatalf("missing target error = %v, want ErrProjectRequired", err)
+	}
+}
+
+func TestRescueNullProjectOwnershipRescuesOnlyNullRecordsAndJournalsOnce(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("legacy-session", "legacy", "/tmp"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	observationID, err := s.AddObservation(AddObservationParams{SessionID: "legacy-session", Type: "note", Title: "legacy", Content: "content", Project: "legacy"})
+	if err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+	promptID, err := s.AddPrompt(AddPromptParams{SessionID: "legacy-session", Content: "prompt", Project: "legacy"})
+	if err != nil {
+		t.Fatalf("AddPrompt: %v", err)
+	}
+	if err := s.CreateSession("owned-session", "other", "/tmp"); err != nil {
+		t.Fatalf("CreateSession owned: %v", err)
+	}
+	ownedID, err := s.AddObservation(AddObservationParams{SessionID: "owned-session", Type: "note", Title: "owned", Content: "content", Project: "other"})
+	if err != nil {
+		t.Fatalf("AddObservation owned: %v", err)
+	}
+	for _, statement := range []struct {
+		query string
+		args  []any
+	}{
+		{`UPDATE observations SET project = NULL WHERE id = ?`, []any{observationID}},
+		{`UPDATE user_prompts SET project = NULL WHERE id = ?`, []any{promptID}},
+		{`DELETE FROM sync_mutations WHERE entity_key = (SELECT sync_id FROM observations WHERE id = ?)`, []any{observationID}},
+		{`DELETE FROM sync_mutations WHERE entity_key = (SELECT sync_id FROM user_prompts WHERE id = ?)`, []any{promptID}},
+	} {
+		if _, err := s.DB().Exec(statement.query, statement.args...); err != nil {
+			t.Fatalf("seed legacy ownership: %v", err)
+		}
+	}
+
+	params := ProjectRescueParams{TargetProject: "target", ObservationIDs: []int64{observationID, ownedID}, PromptIDs: []int64{promptID}}
+	result, err := s.RescueNullProjectOwnership(params)
+	if err != nil {
+		t.Fatalf("RescueNullProjectOwnership: %v", err)
+	}
+	if result.Rescued() != 2 || result.ConflictingRecords != 1 || !result.Journaled {
+		t.Fatalf("unexpected rescue result: %#v", result)
+	}
+	for _, query := range []string{
+		`SELECT project FROM observations WHERE id = ` + fmt.Sprint(observationID),
+		`SELECT project FROM user_prompts WHERE id = ` + fmt.Sprint(promptID),
+	} {
+		var project string
+		if err := s.DB().QueryRow(query).Scan(&project); err != nil || project != "target" {
+			t.Fatalf("rescued project query %q = %q, %v", query, project, err)
+		}
+	}
+	var ownedProject string
+	if err := s.DB().QueryRow(`SELECT project FROM observations WHERE id = ?`, ownedID).Scan(&ownedProject); err != nil || ownedProject != "other" {
+		t.Fatalf("owned record changed to %q, err=%v", ownedProject, err)
+	}
+	var mutations int
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE project = 'target'`).Scan(&mutations); err != nil || mutations != 2 {
+		t.Fatalf("target mutations = %d, err=%v, want 2", mutations, err)
+	}
+
+	again, err := s.RescueNullProjectOwnership(params)
+	if err != nil {
+		t.Fatalf("repeat rescue: %v", err)
+	}
+	if again.Rescued() != 0 || again.ConflictingRecords != 1 || again.SkippedRecords != 2 || !again.Journaled {
+		t.Fatalf("repeat rescue result = %#v", again)
+	}
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE project = 'target'`).Scan(&mutations); err != nil || mutations != 2 {
+		t.Fatalf("repeat target mutations = %d, err=%v, want 2", mutations, err)
+	}
+}
+
+func TestRescueNullProjectOwnershipReplacesStaleAcknowledgedJournal(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("legacy-session", "legacy", "/tmp"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	id, err := s.AddObservation(AddObservationParams{SessionID: "legacy-session", Type: "note", Title: "legacy", Content: "content", Project: "legacy"})
+	if err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+	var syncID string
+	if err := s.DB().QueryRow(`SELECT sync_id FROM observations WHERE id = ?`, id).Scan(&syncID); err != nil {
+		t.Fatalf("read observation sync id: %v", err)
+	}
+	if _, err := s.DB().Exec(`UPDATE observations SET project = NULL WHERE id = ?`, id); err != nil {
+		t.Fatalf("seed NULL ownership: %v", err)
+	}
+	if _, err := s.DB().Exec(`UPDATE sync_mutations SET project = 'stale', payload = '{"project":"stale"}', acked_at = datetime('now') WHERE entity = ? AND entity_key = ?`, SyncEntityObservation, syncID); err != nil {
+		t.Fatalf("seed stale journal: %v", err)
+	}
+	params := ProjectRescueParams{TargetProject: "target", ObservationIDs: []int64{id}}
+	result, err := s.RescueNullProjectOwnership(params)
+	if err != nil || !result.Journaled {
+		t.Fatalf("rescue result = %#v, err=%v", result, err)
+	}
+	assertCanonical := func() {
+		t.Helper()
+		var pending int
+		if err := s.DB().QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE entity = ? AND entity_key = ? AND op = ? AND project = 'target' AND acked_at IS NULL AND json_extract(payload, '$.project') = 'target'`, SyncEntityObservation, syncID, SyncOpUpsert).Scan(&pending); err != nil || pending != 1 {
+			t.Fatalf("canonical pending mutations = %d, err=%v, want 1", pending, err)
+		}
+	}
+	assertCanonical()
+	if _, err := s.RescueNullProjectOwnership(params); err != nil {
+		t.Fatalf("repeat rescue: %v", err)
+	}
+	assertCanonical()
+}
+
+func TestRescueNullProjectOwnershipEnqueuesDeleteDespitePendingOppositeOperation(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("legacy-session", "legacy", "/tmp"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	id, err := s.AddObservation(AddObservationParams{SessionID: "legacy-session", Type: "note", Title: "legacy", Content: "content", Project: "legacy"})
+	if err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+	var syncID string
+	if err := s.DB().QueryRow(`SELECT sync_id FROM observations WHERE id = ?`, id).Scan(&syncID); err != nil {
+		t.Fatalf("read observation sync id: %v", err)
+	}
+	if _, err := s.DB().Exec(`UPDATE observations SET project = NULL, deleted_at = datetime('now') WHERE id = ?`, id); err != nil {
+		t.Fatalf("seed soft-deleted NULL ownership: %v", err)
+	}
+	if _, err := s.DB().Exec(`UPDATE sync_mutations SET project = 'target', payload = json_set(payload, '$.project', 'target') WHERE entity = ? AND entity_key = ? AND op = ?`, SyncEntityObservation, syncID, SyncOpUpsert); err != nil {
+		t.Fatalf("seed pending opposite mutation: %v", err)
+	}
+
+	params := ProjectRescueParams{TargetProject: "target", ObservationIDs: []int64{id}}
+	assertCanonicalDelete := func() {
+		t.Helper()
+		var deletes int
+		if err := s.DB().QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE entity = ? AND entity_key = ? AND op = ? AND project = 'target' AND acked_at IS NULL AND json_extract(payload, '$.project') = 'target'`, SyncEntityObservation, syncID, SyncOpDelete).Scan(&deletes); err != nil || deletes != 1 {
+			t.Fatalf("canonical pending deletes = %d, err=%v, want 1", deletes, err)
+		}
+	}
+
+	result, err := s.RescueNullProjectOwnership(params)
+	if err != nil || !result.Journaled {
+		t.Fatalf("rescue result = %#v, err=%v", result, err)
+	}
+	assertCanonicalDelete()
+	result, err = s.RescueNullProjectOwnership(params)
+	if err != nil || !result.Journaled {
+		t.Fatalf("repeat rescue result = %#v, err=%v", result, err)
+	}
+	assertCanonicalDelete()
+}
+
+func TestRescueNullProjectOwnershipRollsBackWhenJournalEnqueueFails(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("legacy-session", "legacy", "/tmp"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	id, err := s.AddObservation(AddObservationParams{SessionID: "legacy-session", Type: "note", Title: "legacy", Content: "content", Project: "legacy"})
+	if err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+	if _, err := s.DB().Exec(`UPDATE observations SET project = NULL WHERE id = ?`, id); err != nil {
+		t.Fatalf("seed legacy observation ownership: %v", err)
+	}
+	if _, err := s.DB().Exec(`DELETE FROM sync_mutations WHERE entity_key = (SELECT sync_id FROM observations WHERE id = ?)`, id); err != nil {
+		t.Fatalf("seed legacy observation: %v", err)
+	}
+	originalExec := s.hooks.exec
+	s.hooks.exec = func(db execer, query string, args ...any) (sql.Result, error) {
+		if strings.Contains(query, "INSERT INTO sync_mutations") {
+			return nil, errors.New("journal unavailable")
+		}
+		return originalExec(db, query, args...)
+	}
+	t.Cleanup(func() { s.hooks.exec = originalExec })
+	if _, err := s.RescueNullProjectOwnership(ProjectRescueParams{TargetProject: "target", ObservationIDs: []int64{id}}); err == nil {
+		t.Fatal("expected journal failure")
+	}
+	var project sql.NullString
+	if err := s.DB().QueryRow(`SELECT project FROM observations WHERE id = ?`, id).Scan(&project); err != nil {
+		t.Fatalf("read rolled back observation: %v", err)
+	}
+	if project.Valid {
+		t.Fatalf("ownership persisted after rollback: %q", project.String)
+	}
+}
+
 type fakeRows struct {
 	next     []bool
 	scanErr  error
@@ -3761,14 +4013,17 @@ func TestStoreAdditionalQueryAndMutationBranches(t *testing.T) {
 		t.Fatalf("expected truncated content marker, got %q", obs.Content)
 	}
 
-	newProject := ""
 	newTopic := ""
-	updated, err := s.UpdateObservation(obsID, UpdateObservationParams{Project: &newProject, TopicKey: &newTopic})
+	newProject := ""
+	if _, err := s.UpdateObservation(obsID, UpdateObservationParams{Project: &newProject}); !errors.Is(err, ErrObservationProjectImmutable) {
+		t.Fatalf("empty-project update error = %v, want ErrObservationProjectImmutable", err)
+	}
+	updated, err := s.UpdateObservation(obsID, UpdateObservationParams{TopicKey: &newTopic})
 	if err != nil {
 		t.Fatalf("update observation: %v", err)
 	}
-	if updated.Project != nil {
-		t.Fatalf("expected nil project after empty update")
+	if updated.Project == nil || *updated.Project != "engram" {
+		t.Fatalf("expected immutable project engram after rejected update, got %v", updated.Project)
 	}
 	if updated.TopicKey != nil {
 		t.Fatalf("expected nil topic key after empty update")
@@ -5245,18 +5500,23 @@ func TestStoreUncoveredBranchesPushToHundred(t *testing.T) {
 
 // ─── Issue #25: Session collision regression tests ──────────────────────────
 
-func TestCreateSessionUpsertsEmptyProjectAndDirectory(t *testing.T) {
+func TestCreateSessionRejectsEmptyProjectWithoutPartialState(t *testing.T) {
 	s := newTestStore(t)
 
-	// Create session with empty project/directory (simulates first MCP call without context)
-	if err := s.CreateSession("sess-upsert", "", ""); err != nil {
-		t.Fatalf("create session: %v", err)
+	if err := s.CreateSession("sess-upsert", "", ""); !errors.Is(err, ErrProjectRequired) {
+		t.Fatalf("empty-project create error = %v, want ErrProjectRequired", err)
+	}
+	if _, err := s.GetSession("sess-upsert"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("empty-project create left session state: %v", err)
+	}
+	var mutations int
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM sync_mutations`).Scan(&mutations); err != nil || mutations != 0 {
+		t.Fatalf("empty-project create mutations = %d, err=%v, want 0", mutations, err)
 	}
 
-	// Second call with real project/directory should fill in the blanks.
-	// Project names are normalized to lowercase, so "projectA" becomes "projecta".
+	// A later valid request remains an ordinary normalized create.
 	if err := s.CreateSession("sess-upsert", "projectA", "/tmp/a"); err != nil {
-		t.Fatalf("upsert session: %v", err)
+		t.Fatalf("valid create session: %v", err)
 	}
 
 	sess, err := s.GetSession("sess-upsert")
@@ -5320,41 +5580,21 @@ func TestCreateSessionPartialUpsert(t *testing.T) {
 		}
 	})
 
-	t.Run("fills project when directory already set", func(t *testing.T) {
-		if err := s.CreateSession("sess-partial-2", "", "/existing/dir"); err != nil {
-			t.Fatalf("create: %v", err)
+	t.Run("rejects missing project even when directory is present", func(t *testing.T) {
+		if err := s.CreateSession("sess-partial-2", "", "/existing/dir"); !errors.Is(err, ErrProjectRequired) {
+			t.Fatalf("create: %v, want ErrProjectRequired", err)
 		}
-		if err := s.CreateSession("sess-partial-2", "newproject", ""); err != nil {
-			t.Fatalf("upsert: %v", err)
-		}
-		sess, err := s.GetSession("sess-partial-2")
-		if err != nil {
-			t.Fatalf("get: %v", err)
-		}
-		if sess.Project != "newproject" {
-			t.Fatalf("project should be filled, got %q", sess.Project)
-		}
-		if sess.Directory != "/existing/dir" {
-			t.Fatalf("directory should be preserved, got %q", sess.Directory)
+		if _, err := s.GetSession("sess-partial-2"); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("missing-project create left a session: %v", err)
 		}
 	})
 
-	t.Run("both empty stays empty", func(t *testing.T) {
-		if err := s.CreateSession("sess-partial-3", "", ""); err != nil {
-			t.Fatalf("create: %v", err)
+	t.Run("rejects fully empty request without a session", func(t *testing.T) {
+		if err := s.CreateSession("sess-partial-3", "", ""); !errors.Is(err, ErrProjectRequired) {
+			t.Fatalf("create: %v, want ErrProjectRequired", err)
 		}
-		if err := s.CreateSession("sess-partial-3", "", ""); err != nil {
-			t.Fatalf("upsert: %v", err)
-		}
-		sess, err := s.GetSession("sess-partial-3")
-		if err != nil {
-			t.Fatalf("get: %v", err)
-		}
-		if sess.Project != "" {
-			t.Fatalf("project should stay empty, got %q", sess.Project)
-		}
-		if sess.Directory != "" {
-			t.Fatalf("directory should stay empty, got %q", sess.Directory)
+		if _, err := s.GetSession("sess-partial-3"); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("empty create left a session: %v", err)
 		}
 	})
 }
@@ -6644,81 +6884,58 @@ func TestSkipAckPreservesEnrolledProjectMutations(t *testing.T) {
 	}
 }
 
-// ─── Phase 5: Empty/global project always syncs ──────────────────────────────
+// ─── Phase 5: Identity-less writes are rejected ──────────────────────────────
 
-func TestEmptyProjectMutationsAlwaysSync(t *testing.T) {
+func TestIdentitylessSessionCreatesNoMutation(t *testing.T) {
 	s := newTestStore(t)
 
-	// Create a session with empty project (global).
-	if err := s.CreateSession("global-session", "", "/tmp"); err != nil {
-		t.Fatalf("create session: %v", err)
+	if err := s.CreateSession("global-session", "", "/tmp"); !errors.Is(err, ErrProjectRequired) {
+		t.Fatalf("identity-less create error = %v, want ErrProjectRequired", err)
 	}
-
-	// No projects enrolled, but empty-project mutations should still appear.
 	mutations, err := s.ListPendingSyncMutations(DefaultSyncTargetKey, 100)
 	if err != nil {
 		t.Fatalf("list pending: %v", err)
 	}
-
-	if len(mutations) == 0 {
-		t.Fatal("expected empty-project mutations to always sync regardless of enrollment")
-	}
-
-	// Verify they have project = ''.
-	for _, m := range mutations {
-		if m.Project != "" {
-			t.Fatalf("expected empty project, got %q", m.Project)
-		}
+	if len(mutations) != 0 {
+		t.Fatalf("identity-less create left pending mutations: %+v", mutations)
 	}
 }
 
-func TestSkipAckDoesNotAffectEmptyProjectMutations(t *testing.T) {
+func TestSkipAckAfterIdentitylessSessionRejectionHasNoState(t *testing.T) {
 	s := newTestStore(t)
 
-	// Create a session with empty project (global).
-	if err := s.CreateSession("global-session-2", "", "/tmp"); err != nil {
-		t.Fatalf("create session: %v", err)
+	if err := s.CreateSession("global-session-2", "", "/tmp"); !errors.Is(err, ErrProjectRequired) {
+		t.Fatalf("identity-less create error = %v, want ErrProjectRequired", err)
 	}
-
-	// Count pending before skip-ack.
-	beforeMutations, err := s.ListPendingSyncMutations(DefaultSyncTargetKey, 100)
-	if err != nil {
-		t.Fatalf("list pending: %v", err)
-	}
-	beforeCount := len(beforeMutations)
-
-	// Skip-ack should not affect empty-project mutations.
 	skipped, err := s.SkipAckNonEnrolledMutations(DefaultSyncTargetKey)
 	if err != nil {
 		t.Fatalf("skip-ack: %v", err)
 	}
 	if skipped != 0 {
-		t.Fatalf("expected 0 mutations to be skip-acked (all empty project), got %d", skipped)
+		t.Fatalf("expected 0 mutations to be skip-acked after rejection, got %d", skipped)
 	}
-
-	// Verify count unchanged.
-	afterMutations, err := s.ListPendingSyncMutations(DefaultSyncTargetKey, 100)
+	mutations, err := s.ListPendingSyncMutations(DefaultSyncTargetKey, 100)
 	if err != nil {
 		t.Fatalf("list pending: %v", err)
 	}
-	if len(afterMutations) != beforeCount {
-		t.Fatalf("expected %d mutations after skip-ack, got %d", beforeCount, len(afterMutations))
+	if len(mutations) != 0 {
+		t.Fatalf("identity-less create left pending mutations: %+v", mutations)
 	}
 }
 
-func TestMixedEnrolledAndEmptyProjectMutations(t *testing.T) {
+func TestMixedEnrolledAndRejectedIdentitylessSessions(t *testing.T) {
 	s := newTestStore(t)
 
 	if err := s.EnrollProject("enrolled-mix"); err != nil {
 		t.Fatalf("enroll: %v", err)
 	}
 
-	// Create sessions with different project states.
+	// Create sessions with enrolled, rejected, and unenrolled project states.
 	if err := s.CreateSession("mix-enrolled", "enrolled-mix", "/tmp"); err != nil {
 		t.Fatalf("create enrolled session: %v", err)
 	}
-	if err := s.CreateSession("mix-global", "", "/tmp"); err != nil {
-		t.Fatalf("create global session: %v", err)
+	if err := s.CreateSession("mix-global", "", "/tmp"); !errors.Is(err, ErrProjectRequired) {
+		t.Fatalf("create identity-less session: %v, want ErrProjectRequired", err)
 	}
 	if err := s.CreateSession("mix-unenrolled", "unenrolled-mix", "/tmp"); err != nil {
 		t.Fatalf("create unenrolled session: %v", err)
@@ -6729,8 +6946,8 @@ func TestMixedEnrolledAndEmptyProjectMutations(t *testing.T) {
 		t.Fatalf("list pending: %v", err)
 	}
 
-	// Should have enrolled-mix and empty-project mutations, but NOT unenrolled-mix.
-	var hasEnrolled, hasGlobal bool
+	// Only enrolled identity-bearing mutations may remain pending.
+	var hasEnrolled bool
 	for _, m := range mutations {
 		if m.Project == "unenrolled-mix" {
 			t.Fatal("unenrolled project mutations should not appear")
@@ -6739,14 +6956,11 @@ func TestMixedEnrolledAndEmptyProjectMutations(t *testing.T) {
 			hasEnrolled = true
 		}
 		if m.Project == "" {
-			hasGlobal = true
+			t.Fatal("identity-less mutation should never be enqueued")
 		}
 	}
 	if !hasEnrolled {
 		t.Fatal("expected enrolled-mix mutations to appear")
-	}
-	if !hasGlobal {
-		t.Fatal("expected empty-project (global) mutations to appear")
 	}
 }
 

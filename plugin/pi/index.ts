@@ -119,11 +119,6 @@ interface PassiveCaptureBody {
   source: string;
 }
 
-interface MigrationBody {
-  old_project: string;
-  new_project: string;
-}
-
 interface CurrentProjectResponse {
   project?: string;
   project_source?: string;
@@ -478,7 +473,6 @@ async function initOnce(cwd: string): Promise<void> {
   initialized = true;
   directory = cwd;
 
-  const oldProject = rawBasenameProjectName(cwd);
   project = fallbackProjectName(cwd);
 
   const running = await isEngramRunning();
@@ -488,14 +482,6 @@ async function initOnce(cwd: string): Promise<void> {
   }
 
   applyDetectedProject(await detectServerProject(cwd));
-
-  const migrationSources = new Set([oldProject, fallbackProjectName(cwd)]);
-  for (const sourceProject of migrationSources) {
-    if (sourceProject !== project) {
-      const body: MigrationBody = { old_project: sourceProject, new_project: project };
-      await bestEffortEngramFetch("/projects/migrate", { method: "POST", body });
-    }
-  }
 
   const manifestFile = `${cwd}/.engram/manifest.json`;
   if (existsSync(manifestFile)) {

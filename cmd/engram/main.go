@@ -1004,7 +1004,7 @@ func cmdSave(cfg store.Config) {
 	title := os.Args[2]
 	content := os.Args[3]
 	typ := "manual"
-	project := ""
+	projectName := ""
 	scope := "project"
 	topicKey := ""
 
@@ -1017,7 +1017,7 @@ func cmdSave(cfg store.Config) {
 			}
 		case "--project":
 			if i+1 < len(os.Args) {
-				project = os.Args[i+1]
+				projectName = os.Args[i+1]
 				i++
 			}
 		case "--scope":
@@ -1033,6 +1033,29 @@ func cmdSave(cfg store.Config) {
 		}
 	}
 
+	cwd, err := os.Getwd()
+	if err != nil {
+		fatal(err)
+		return
+	}
+	if strings.TrimSpace(projectName) == "" {
+		resolved := project.DetectProjectFull(cwd)
+		if resolved.Error != nil || strings.TrimSpace(resolved.Project) == "" {
+			if resolved.Error != nil {
+				fatal(fmt.Errorf("cannot save without an unambiguous project identity: %w; use --project <name>", resolved.Error))
+			} else {
+				fatal(errors.New("cannot save without an unambiguous project identity; use --project <name>"))
+			}
+			return
+		}
+		projectName = resolved.Project
+	}
+	projectName, _ = store.NormalizeProject(projectName)
+	if strings.TrimSpace(projectName) == "" {
+		fatal(errors.New("cannot save without an unambiguous project identity; use --project <name>"))
+		return
+	}
+
 	s, err := storeNew(cfg)
 	if err != nil {
 		fatal(err)
@@ -1040,14 +1063,10 @@ func cmdSave(cfg store.Config) {
 	defer s.Close()
 
 	sessionID := "manual-save"
-	if project != "" {
-		sessionID = "manual-save-" + project
+	if projectName != "" {
+		sessionID = "manual-save-" + projectName
 	}
-	cwd, err := os.Getwd()
-	if err != nil {
-		fatal(err)
-	}
-	if err := s.CreateSession(sessionID, project, cwd); err != nil {
+	if err := s.CreateSession(sessionID, projectName, cwd); err != nil {
 		fatal(err)
 	}
 	id, err := storeAddObservation(s, store.AddObservationParams{
@@ -1055,7 +1074,7 @@ func cmdSave(cfg store.Config) {
 		Type:      typ,
 		Title:     title,
 		Content:   content,
-		Project:   project,
+		Project:   projectName,
 		Scope:     scope,
 		TopicKey:  topicKey,
 	})

@@ -156,6 +156,18 @@ func requireAuth(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// requireConfiguredAuth rejects requests when the server token is not configured.
+// It is reserved for endpoints that must never use the zero-config auth default.
+func requireConfiguredAuth(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if os.Getenv("ENGRAM_HTTP_TOKEN") == "" {
+			jsonError(w, http.StatusServiceUnavailable, "server authorization is not configured")
+			return
+		}
+		requireAuth(h)(w, r)
+	}
+}
+
 func (s *Server) Start() error {
 	addr := fmt.Sprintf("127.0.0.1:%d", s.port)
 	listenFn := s.listen
@@ -228,7 +240,7 @@ func (s *Server) routes() {
 
 	// Project detection / migration
 	s.mux.HandleFunc("GET /project/current", s.handleCurrentProject)
-	s.mux.HandleFunc("POST /projects/migrate", requireAuth(s.handleMigrateProject))
+	s.mux.HandleFunc("POST /projects/migrate", requireConfiguredAuth(s.handleMigrateProject))
 
 	// Sync status (degraded-state visibility for autosync)
 	s.mux.HandleFunc("GET /sync/status", s.handleSyncStatus)
@@ -961,53 +973,51 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 // ─── Project Migration ───────────────────────────────────────────────────────
 
 func (s *Server) handleMigrateProject(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<10) // 1 KB max
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<10) // 8 KB max
 	var body struct {
-		OldProject string `json:"old_project"`
-		NewProject string `json:"new_project"`
+		TargetProject  string   `json:"target_project"`
+		Confirmed      bool     `json:"confirmed"`
+		ObservationIDs []int64  `json:"observation_ids"`
+		SessionIDs     []string `json:"session_ids"`
+		PromptIDs      []int64  `json:"prompt_ids"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	if body.OldProject == "" || body.NewProject == "" {
-		jsonError(w, http.StatusBadRequest, "old_project and new_project are required")
+	target, _ := store.NormalizeProject(body.TargetProject)
+	if target == "" {
+		jsonError(w, http.StatusBadRequest, "target_project is required")
 		return
 	}
-	// Normalize both names using the same rules the store applies so that
-	// case-only differences (e.g. "repo_name" vs "Repo_Name") are treated as
-	// identical and do not trigger a migration that would create duplicates.
-	// See: https://github.com/Gentleman-Programming/engram/issues/438
-	normalizedOld, _ := store.NormalizeProject(body.OldProject)
-	normalizedNew, _ := store.NormalizeProject(body.NewProject)
-	if normalizedOld == normalizedNew {
-		jsonResponse(w, http.StatusOK, map[string]any{"status": "skipped", "reason": "names are identical"})
+	if !body.Confirmed {
+		jsonError(w, http.StatusBadRequest, "confirmed must be true")
 		return
 	}
-
-	result, err := s.store.MigrateProject(body.OldProject, body.NewProject)
+	result, err := s.store.RescueNullProjectOwnership(store.ProjectRescueParams{
+		TargetProject:  target,
+		ObservationIDs: body.ObservationIDs,
+		SessionIDs:     body.SessionIDs,
+		PromptIDs:      body.PromptIDs,
+	})
 	if err != nil {
-		log.Printf("[engram] project migration failed: %v", err)
-		jsonError(w, http.StatusInternalServerError, "migration failed")
+		log.Printf("[engram] project ownership rescue failed: %v", err)
+		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
-	if !result.Migrated {
-		jsonResponse(w, http.StatusOK, map[string]any{"status": "skipped", "reason": "no records found"})
-		return
+	if result.Rescued() > 0 {
+		s.notifyWrite()
 	}
-
-	log.Printf("[engram] migrated project %q → %q (obs: %d, sessions: %d, prompts: %d)",
-		body.OldProject, body.NewProject,
-		result.ObservationsUpdated, result.SessionsUpdated, result.PromptsUpdated)
-
 	jsonResponse(w, http.StatusOK, map[string]any{
-		"status":       "migrated",
-		"old_project":  body.OldProject,
-		"new_project":  body.NewProject,
-		"observations": result.ObservationsUpdated,
-		"sessions":     result.SessionsUpdated,
-		"prompts":      result.PromptsUpdated,
+		"status":                "rescued",
+		"target_project":        target,
+		"rescued_observations":  result.RescuedObservations,
+		"rescued_sessions":      result.RescuedSessions,
+		"rescued_prompts":       result.RescuedPrompts,
+		"conflicting_records":   result.ConflictingRecords,
+		"skipped_records":       result.SkippedRecords,
+		"journaled_local":       result.Journaled,
+		"reconciliation_status": "local journal pending autosync",
 	})
 }
 
