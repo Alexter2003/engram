@@ -428,7 +428,7 @@ func TestMigrate_DoesNotTouchFTS5OrSyncMutations(t *testing.T) {
 		t.Fatalf("smRows.Err: %v", err)
 	}
 
-	requiredSMCols := []string{"seq", "target_key", "entity", "entity_key", "op", "payload", "source", "project", "occurred_at", "acked_at"}
+	requiredSMCols := []string{"seq", "target_key", "entity", "entity_key", "op", "payload", "source", "project", "occurred_at", "acked_at", "disposition", "disposition_reason", "disposition_evidence", "disposition_at"}
 	colSet := make(map[string]bool, len(smCols))
 	for _, c := range smCols {
 		colSet[c] = true

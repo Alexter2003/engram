@@ -278,16 +278,44 @@ type SyncState struct {
 }
 
 type SyncMutation struct {
-	Seq        int64   `json:"seq"`
-	TargetKey  string  `json:"target_key"`
-	Entity     string  `json:"entity"`
-	EntityKey  string  `json:"entity_key"`
-	Op         string  `json:"op"`
-	Payload    string  `json:"payload"`
-	Source     string  `json:"source"`
-	Project    string  `json:"project"`
-	OccurredAt string  `json:"occurred_at"`
-	AckedAt    *string `json:"acked_at,omitempty"`
+	Seq                 int64   `json:"seq"`
+	TargetKey           string  `json:"target_key"`
+	Entity              string  `json:"entity"`
+	EntityKey           string  `json:"entity_key"`
+	Op                  string  `json:"op"`
+	Payload             string  `json:"payload"`
+	Source              string  `json:"source"`
+	Project             string  `json:"project"`
+	OccurredAt          string  `json:"occurred_at"`
+	AckedAt             *string `json:"acked_at,omitempty"`
+	Disposition         string  `json:"disposition"`
+	DispositionReason   string  `json:"disposition_reason,omitempty"`
+	DispositionEvidence string  `json:"disposition_evidence,omitempty"`
+	DispositionAt       *string `json:"disposition_at,omitempty"`
+}
+
+const (
+	SyncMutationDispositionPending     = "pending"
+	SyncMutationDispositionQuarantined = "quarantined"
+)
+
+// SyncMutationQuarantineAction records one deterministic local quarantine.
+type SyncMutationQuarantineAction struct {
+	Seq        int64  `json:"seq"`
+	Project    string `json:"project"`
+	Entity     string `json:"entity"`
+	EntityKey  string `json:"entity_key"`
+	Op         string `json:"op"`
+	ReasonCode string `json:"reason_code"`
+	Message    string `json:"message"`
+	Evidence   string `json:"evidence"`
+}
+
+// SyncMutationQuarantineReport is the explicit local recovery result.
+type SyncMutationQuarantineReport struct {
+	Project string                         `json:"project,omitempty"`
+	Applied bool                           `json:"applied"`
+	Actions []SyncMutationQuarantineAction `json:"actions"`
 }
 
 type PendingSyncMutationProjectCount struct {
@@ -828,6 +856,10 @@ func (s *Store) migrate() error {
 				source      TEXT NOT NULL DEFAULT 'local',
 				occurred_at TEXT NOT NULL DEFAULT (datetime('now')),
 				acked_at    TEXT,
+				disposition TEXT NOT NULL DEFAULT 'pending',
+				disposition_reason TEXT,
+				disposition_evidence TEXT,
+				disposition_at TEXT,
 				FOREIGN KEY (target_key) REFERENCES sync_state(target_key)
 			);
 
@@ -895,6 +927,19 @@ func (s *Store) migrate() error {
 
 	// Project-scoped sync: add project column to sync_mutations and enrollment table.
 	if err := s.addColumnIfNotExists("sync_mutations", "project", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	for _, c := range []struct{ name, definition string }{
+		{"disposition", "TEXT NOT NULL DEFAULT 'pending'"},
+		{"disposition_reason", "TEXT"},
+		{"disposition_evidence", "TEXT"},
+		{"disposition_at", "TEXT"},
+	} {
+		if err := s.addColumnIfNotExists("sync_mutations", c.name, c.definition); err != nil {
+			return err
+		}
+	}
+	if _, err := s.execHook(s.db, `UPDATE sync_mutations SET disposition = 'pending' WHERE disposition IS NULL OR disposition = ''`); err != nil {
 		return err
 	}
 	if err := s.addColumnIfNotExists("sync_state", "reason_code", "TEXT"); err != nil {
@@ -1030,7 +1075,8 @@ func (s *Store) migrate() error {
 	}
 	if _, err := s.execHook(s.db, `
 		CREATE INDEX IF NOT EXISTS idx_cloud_upgrade_state_stage ON cloud_upgrade_state(stage);
-		CREATE INDEX IF NOT EXISTS idx_sync_mutations_lookup ON sync_mutations(target_key, entity, entity_key, source);
+			CREATE INDEX IF NOT EXISTS idx_sync_mutations_lookup ON sync_mutations(target_key, entity, entity_key, source);
+			CREATE INDEX IF NOT EXISTS idx_sync_mutations_transport ON sync_mutations(target_key, disposition, acked_at, seq);
 	`); err != nil {
 		return err
 	}
@@ -3948,10 +3994,10 @@ func (s *Store) ListPendingSyncMutations(targetKey string, limit int) ([]SyncMut
 	// Only return mutations for enrolled projects or empty-project (global) mutations.
 	// Empty-project mutations always sync regardless of enrollment.
 	rows, err := s.queryItHook(s.db, `
-		SELECT sm.seq, sm.target_key, sm.entity, sm.entity_key, sm.op, sm.payload, sm.source, sm.project, sm.occurred_at, sm.acked_at
+		SELECT sm.seq, sm.target_key, sm.entity, sm.entity_key, sm.op, sm.payload, sm.source, sm.project, sm.occurred_at, sm.acked_at, sm.disposition, ifnull(sm.disposition_reason, ''), ifnull(sm.disposition_evidence, ''), sm.disposition_at
 		FROM sync_mutations sm
 		LEFT JOIN sync_enrolled_projects sep ON sm.project = sep.project
-		WHERE sm.target_key = ? AND sm.acked_at IS NULL
+		WHERE sm.target_key = ? AND sm.acked_at IS NULL AND sm.disposition = 'pending'
 		  AND (sm.project = '' OR sep.project IS NOT NULL)
 		ORDER BY sm.seq ASC
 		LIMIT ?`, targetKey, limit)
@@ -3963,7 +4009,7 @@ func (s *Store) ListPendingSyncMutations(targetKey string, limit int) ([]SyncMut
 	var mutations []SyncMutation
 	for rows.Next() {
 		var mutation SyncMutation
-		if err := rows.Scan(&mutation.Seq, &mutation.TargetKey, &mutation.Entity, &mutation.EntityKey, &mutation.Op, &mutation.Payload, &mutation.Source, &mutation.Project, &mutation.OccurredAt, &mutation.AckedAt); err != nil {
+		if err := rows.Scan(&mutation.Seq, &mutation.TargetKey, &mutation.Entity, &mutation.EntityKey, &mutation.Op, &mutation.Payload, &mutation.Source, &mutation.Project, &mutation.OccurredAt, &mutation.AckedAt, &mutation.Disposition, &mutation.DispositionReason, &mutation.DispositionEvidence, &mutation.DispositionAt); err != nil {
 			return nil, err
 		}
 		mutations = append(mutations, mutation)
@@ -3977,10 +4023,10 @@ func (s *Store) ListPendingSyncMutationsAfterSeq(targetKey string, afterSeq int6
 		limit = 100
 	}
 	rows, err := s.queryItHook(s.db, `
-		SELECT sm.seq, sm.target_key, sm.entity, sm.entity_key, sm.op, sm.payload, sm.source, sm.project, sm.occurred_at, sm.acked_at
+		SELECT sm.seq, sm.target_key, sm.entity, sm.entity_key, sm.op, sm.payload, sm.source, sm.project, sm.occurred_at, sm.acked_at, sm.disposition, ifnull(sm.disposition_reason, ''), ifnull(sm.disposition_evidence, ''), sm.disposition_at
 		FROM sync_mutations sm
 		LEFT JOIN sync_enrolled_projects sep ON sm.project = sep.project
-		WHERE sm.target_key = ? AND sm.acked_at IS NULL
+		WHERE sm.target_key = ? AND sm.acked_at IS NULL AND sm.disposition = 'pending'
 		  AND sm.seq > ?
 		  AND (sm.project = '' OR sep.project IS NOT NULL)
 		ORDER BY sm.seq ASC
@@ -3993,12 +4039,66 @@ func (s *Store) ListPendingSyncMutationsAfterSeq(targetKey string, afterSeq int6
 	mutations := make([]SyncMutation, 0, limit)
 	for rows.Next() {
 		var mutation SyncMutation
-		if err := rows.Scan(&mutation.Seq, &mutation.TargetKey, &mutation.Entity, &mutation.EntityKey, &mutation.Op, &mutation.Payload, &mutation.Source, &mutation.Project, &mutation.OccurredAt, &mutation.AckedAt); err != nil {
+		if err := rows.Scan(&mutation.Seq, &mutation.TargetKey, &mutation.Entity, &mutation.EntityKey, &mutation.Op, &mutation.Payload, &mutation.Source, &mutation.Project, &mutation.OccurredAt, &mutation.AckedAt, &mutation.Disposition, &mutation.DispositionReason, &mutation.DispositionEvidence, &mutation.DispositionAt); err != nil {
 			return nil, err
 		}
 		mutations = append(mutations, mutation)
 	}
 	return mutations, rows.Err()
+}
+
+// QuarantineIrreparableSyncMutations explicitly disposes of pending mutations
+// the existing legacy validator proves cannot be repaired from local state.
+// It never acknowledges, rewrites, or deletes a mutation.
+func (s *Store) QuarantineIrreparableSyncMutations(project string, apply bool) (SyncMutationQuarantineReport, error) {
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	report := SyncMutationQuarantineReport{Project: project, Applied: apply, Actions: []SyncMutationQuarantineAction{}}
+	err := s.withTx(func(tx *sql.Tx) error {
+		query := `SELECT seq, target_key, entity, entity_key, op, payload, source, project, occurred_at, acked_at
+			FROM sync_mutations WHERE target_key = ? AND acked_at IS NULL AND disposition = 'pending'`
+		args := []any{DefaultSyncTargetKey}
+		if project != "" {
+			query += ` AND project = ?`
+			args = append(args, project)
+		}
+		query += ` ORDER BY seq ASC`
+		rows, err := s.queryItHook(tx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var mutation SyncMutation
+			if err := rows.Scan(&mutation.Seq, &mutation.TargetKey, &mutation.Entity, &mutation.EntityKey, &mutation.Op, &mutation.Payload, &mutation.Source, &mutation.Project, &mutation.OccurredAt, &mutation.AckedAt); err != nil {
+				return err
+			}
+			evaluation, err := s.evaluateCloudUpgradeLegacyMutationTx(tx, mutation)
+			if err != nil {
+				return err
+			}
+			if !evaluation.hasIssue || evaluation.canRepair {
+				continue
+			}
+			evidence, err := json.Marshal(map[string]any{"check": "sync_mutation_required_fields", "finding": evaluation.finding})
+			if err != nil {
+				return err
+			}
+			action := SyncMutationQuarantineAction{Seq: mutation.Seq, Project: mutation.Project, Entity: mutation.Entity, EntityKey: mutation.EntityKey, Op: mutation.Op, ReasonCode: evaluation.finding.ReasonCode, Message: evaluation.finding.Message, Evidence: string(evidence)}
+			report.Actions = append(report.Actions, action)
+			if !apply {
+				continue
+			}
+			if _, err := s.execHook(tx, `UPDATE sync_mutations SET disposition = 'quarantined', disposition_reason = ?, disposition_evidence = ?, disposition_at = datetime('now') WHERE target_key = ? AND seq = ? AND acked_at IS NULL AND disposition = 'pending'`, action.ReasonCode, action.Evidence, DefaultSyncTargetKey, action.Seq); err != nil {
+				return err
+			}
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return SyncMutationQuarantineReport{}, fmt.Errorf("quarantine irreparable sync mutations: %w", err)
+	}
+	return report, nil
 }
 
 func (s *Store) CountPendingNonEnrolledSyncMutations(targetKey string) ([]PendingSyncMutationProjectCount, error) {
@@ -4009,6 +4109,7 @@ func (s *Store) CountPendingNonEnrolledSyncMutations(targetKey string) ([]Pendin
 		LEFT JOIN sync_enrolled_projects sep ON sm.project = sep.project
 		WHERE sm.target_key = ?
 		  AND sm.acked_at IS NULL
+		  AND sm.disposition = 'pending'
 		  AND sm.project != ''
 		  AND sep.project IS NULL
 		GROUP BY sm.project
@@ -4039,6 +4140,7 @@ func (s *Store) SkipAckNonEnrolledMutations(targetKey string) (int64, error) {
 		SET acked_at = datetime('now')
 		WHERE target_key = ?
 		  AND acked_at IS NULL
+		  AND disposition = 'pending'
 		  AND project != ''
 		  AND project NOT IN (SELECT project FROM sync_enrolled_projects)`,
 		targetKey,
@@ -4059,7 +4161,7 @@ func (s *Store) AckSyncMutations(targetKey string, lastAckedSeq int64) error {
 		if targetKey == DefaultSyncTargetKey {
 			rows, err := s.queryItHook(tx,
 				`SELECT DISTINCT ifnull(project, '') FROM sync_mutations
-				 WHERE target_key = ? AND seq <= ? AND acked_at IS NULL`,
+				 WHERE target_key = ? AND seq <= ? AND acked_at IS NULL AND disposition = 'pending'`,
 				targetKey, lastAckedSeq,
 			)
 			if err != nil {
@@ -4089,7 +4191,7 @@ func (s *Store) AckSyncMutations(targetKey string, lastAckedSeq int64) error {
 			return err
 		}
 		if _, err := s.execHook(tx,
-			`UPDATE sync_mutations SET acked_at = datetime('now') WHERE target_key = ? AND seq <= ? AND acked_at IS NULL`,
+			`UPDATE sync_mutations SET acked_at = datetime('now') WHERE target_key = ? AND seq <= ? AND acked_at IS NULL AND disposition = 'pending'`,
 			targetKey, lastAckedSeq,
 		); err != nil {
 			return err
@@ -4178,7 +4280,7 @@ func (s *Store) AckSyncMutationSeqs(targetKey string, seqs []int64) error {
 				continue
 			}
 			if _, err := s.execHook(tx,
-				`UPDATE sync_mutations SET acked_at = datetime('now') WHERE target_key = ? AND seq = ? AND acked_at IS NULL`,
+				`UPDATE sync_mutations SET acked_at = datetime('now') WHERE target_key = ? AND seq = ? AND acked_at IS NULL AND disposition = 'pending'`,
 				targetKey, seq,
 			); err != nil {
 				return err
@@ -4188,7 +4290,7 @@ func (s *Store) AckSyncMutationSeqs(targetKey string, seqs []int64) error {
 			}
 		}
 		var remaining int
-		if err := tx.QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE target_key = ? AND acked_at IS NULL`, targetKey).Scan(&remaining); err != nil {
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE target_key = ? AND acked_at IS NULL AND disposition = 'pending'`, targetKey).Scan(&remaining); err != nil {
 			return err
 		}
 		lifecycle := SyncLifecyclePending
@@ -4233,7 +4335,7 @@ func (s *Store) HasPendingSyncMutationsForProject(project string) (bool, error) 
 
 	var count int
 	err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM sync_mutations WHERE target_key = ? AND project = ? AND acked_at IS NULL`,
+		`SELECT COUNT(*) FROM sync_mutations WHERE target_key = ? AND project = ? AND acked_at IS NULL AND disposition = 'pending'`,
 		DefaultSyncTargetKey,
 		project,
 	).Scan(&count)
@@ -4287,7 +4389,7 @@ func (s *Store) refreshProjectSyncStateTx(tx *sql.Tx, project string) error {
 	if err := tx.QueryRow(
 		`SELECT COUNT(*)
 		 FROM sync_mutations
-		 WHERE target_key = ? AND project = ? AND acked_at IS NULL`,
+		 WHERE target_key = ? AND project = ? AND acked_at IS NULL AND disposition = 'pending'`,
 		DefaultSyncTargetKey,
 		project,
 	).Scan(&pendingCount); err != nil {

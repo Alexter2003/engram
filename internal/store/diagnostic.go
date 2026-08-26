@@ -104,7 +104,7 @@ type rowQuerier interface {
 
 func (s *Store) listPendingProjectMutationsTxLike(q rowQuerier, project string) ([]SyncMutation, error) {
 	query := `
-		SELECT seq, target_key, entity, entity_key, op, payload, source, project, occurred_at, acked_at
+		SELECT seq, target_key, entity, entity_key, op, payload, source, project, occurred_at, acked_at, disposition, ifnull(disposition_reason, ''), ifnull(disposition_evidence, ''), disposition_at
 		FROM sync_mutations
 		WHERE target_key = ? AND acked_at IS NULL`
 	args := []any{DefaultSyncTargetKey}
@@ -121,7 +121,7 @@ func (s *Store) listPendingProjectMutationsTxLike(q rowQuerier, project string) 
 	mutations := make([]SyncMutation, 0)
 	for rows.Next() {
 		var m SyncMutation
-		if err := rows.Scan(&m.Seq, &m.TargetKey, &m.Entity, &m.EntityKey, &m.Op, &m.Payload, &m.Source, &m.Project, &m.OccurredAt, &m.AckedAt); err != nil {
+		if err := rows.Scan(&m.Seq, &m.TargetKey, &m.Entity, &m.EntityKey, &m.Op, &m.Payload, &m.Source, &m.Project, &m.OccurredAt, &m.AckedAt, &m.Disposition, &m.DispositionReason, &m.DispositionEvidence, &m.DispositionAt); err != nil {
 			return nil, err
 		}
 		mutations = append(mutations, m)
