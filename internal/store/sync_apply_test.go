@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -13,6 +14,14 @@ import (
 // syncRelationPayload.
 func buildRelationMutation(t *testing.T, p syncRelationPayload) SyncMutation {
 	t.Helper()
+	if p.MarkedByActor == nil {
+		actor := "test-actor"
+		p.MarkedByActor = &actor
+	}
+	if p.MarkedByKind == nil {
+		kind := "test"
+		p.MarkedByKind = &kind
+	}
 	raw, err := json.Marshal(p)
 	if err != nil {
 		t.Fatalf("buildRelationMutation: marshal: %v", err)
@@ -255,6 +264,58 @@ func TestApplyPulledChunk_MarksMalformedRelationDeadAndContinues(t *testing.T) {
 	}
 }
 
+func TestApplyPulledChunk_MarksInvalidRelationContractsDead(t *testing.T) {
+	s, syncA, syncB := setupSyncApplyStore(t)
+	validPayload, err := json.Marshal(syncRelationPayload{
+		SyncID:         "rel-invalid-contract",
+		SourceID:       syncA,
+		TargetID:       syncB,
+		Relation:       RelationRelated,
+		JudgmentStatus: JudgmentStatusJudged,
+		Project:        "proj-apply",
+		CreatedAt:      "2026-08-25T00:00:00Z",
+		UpdatedAt:      "2026-08-25T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("marshal relation payload: %v", err)
+	}
+
+	tests := []struct {
+		name     string
+		mutation SyncMutation
+	}{
+		{
+			name: "unsupported operation",
+			mutation: SyncMutation{
+				Entity: SyncEntityRelation, EntityKey: "rel-invalid-contract", Op: SyncOpDelete, Payload: string(validPayload),
+			},
+		},
+		{
+			name: "missing required provenance fields",
+			mutation: SyncMutation{
+				Entity:    SyncEntityRelation,
+				EntityKey: "rel-missing-provenance",
+				Op:        SyncOpUpsert,
+				Payload:   fmt.Sprintf(`{"sync_id":"rel-missing-provenance","source_id":%q,"target_id":%q,"relation":"related","judgment_status":"judged","project":"proj-apply"}`, syncA, syncB),
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := s.ApplyPulledChunk(DefaultSyncTargetKey, "chunk-"+tt.mutation.EntityKey, []SyncMutation{tt.mutation}); err != nil {
+				t.Fatalf("ApplyPulledChunk: %v", err)
+			}
+			status, _ := getDeferredRow(t, s, tt.mutation.EntityKey)
+			if status != "dead" {
+				t.Fatalf("apply_status: want dead, got %q", status)
+			}
+			if got := countRelationRows(t, s, tt.mutation.EntityKey); got != 0 {
+				t.Fatalf("expected invalid relation to remain unapplied, got %d rows", got)
+			}
+		})
+	}
+}
+
 // C.3b — ApplyPulledRelation_DefersOnFKMiss: target observation absent →
 // row written to sync_apply_deferred; no halt; seq is ACK-able.
 func TestApplyPulledRelation_DefersOnFKMiss(t *testing.T) {
@@ -383,6 +444,8 @@ func getDeferredRow(t *testing.T, s *Store, syncID string) (applyStatus string, 
 // and ReplayDeferred runs, the row is applied and removed.
 func TestReplayDeferred_RetrySucceeds(t *testing.T) {
 	s, syncA, _ := setupSyncApplyStore(t)
+	actor := "test-actor"
+	kind := "test"
 
 	// Missing target obs.
 	missingTarget := "obs-missing-" + newSyncID("x")
@@ -394,6 +457,8 @@ func TestReplayDeferred_RetrySucceeds(t *testing.T) {
 		TargetID:       missingTarget,
 		Relation:       RelationRelated,
 		JudgmentStatus: JudgmentStatusJudged,
+		MarkedByActor:  &actor,
+		MarkedByKind:   &kind,
 		Project:        "proj-apply",
 		CreatedAt:      "2026-04-26T10:00:00Z",
 		UpdatedAt:      "2026-04-26T10:00:00Z",
@@ -426,6 +491,8 @@ func TestReplayDeferred_RetrySucceeds(t *testing.T) {
 		TargetID:       missingTargetSync,
 		Relation:       RelationRelated,
 		JudgmentStatus: JudgmentStatusJudged,
+		MarkedByActor:  &actor,
+		MarkedByKind:   &kind,
 		Project:        "proj-apply",
 		CreatedAt:      "2026-04-26T10:00:00Z",
 		UpdatedAt:      "2026-04-26T10:00:00Z",
@@ -462,6 +529,8 @@ func TestReplayDeferred_RetrySucceeds(t *testing.T) {
 // TestReplayDeferred_DeadAtFiveRetries: retry_count=4; FK still missing → row becomes dead.
 func TestReplayDeferred_DeadAtFiveRetries(t *testing.T) {
 	s, syncA, _ := setupSyncApplyStore(t)
+	actor := "test-actor"
+	kind := "test"
 
 	missingTarget := "obs-ghost-" + newSyncID("x")
 	relSyncID := newSyncID("rel-dead")
@@ -471,6 +540,8 @@ func TestReplayDeferred_DeadAtFiveRetries(t *testing.T) {
 		TargetID:       missingTarget,
 		Relation:       RelationRelated,
 		JudgmentStatus: JudgmentStatusJudged,
+		MarkedByActor:  &actor,
+		MarkedByKind:   &kind,
 		Project:        "proj-apply",
 		CreatedAt:      "2026-04-26T10:00:00Z",
 		UpdatedAt:      "2026-04-26T10:00:00Z",

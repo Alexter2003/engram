@@ -5679,16 +5679,63 @@ func (s *Store) applyPulledMutationTx(tx *sql.Tx, mutation SyncMutation) error {
 //  4. On successful apply, DELETE any pre-existing deferred row for this sync_id
 //     so it is not retried unnecessarily.
 func (s *Store) applyRelationUpsertTx(tx *sql.Tx, mutation SyncMutation) error {
+	if mutation.Op != SyncOpUpsert {
+		return fmt.Errorf("%w: unsupported relation operation %q", ErrApplyDead, mutation.Op)
+	}
+
 	// Step 1: decode payload.
 	var p syncRelationPayload
 	if err := decodeSyncPayload([]byte(mutation.Payload), &p); err != nil {
 		return fmt.Errorf("%w: decode relation payload: %v", ErrApplyDead, err)
 	}
 
-	// Step 1b: required field validation — missing source_id or target_id is not
-	// a retryable FK miss; it is a permanent payload defect (ErrApplyDead).
-	if strings.TrimSpace(p.SourceID) == "" || strings.TrimSpace(p.TargetID) == "" {
-		return fmt.Errorf("%w: relation payload missing required source_id or target_id", ErrApplyDead)
+	p.SyncID = strings.TrimSpace(p.SyncID)
+	p.SourceID = strings.TrimSpace(p.SourceID)
+	p.TargetID = strings.TrimSpace(p.TargetID)
+	p.Relation = strings.TrimSpace(p.Relation)
+	p.JudgmentStatus = strings.TrimSpace(p.JudgmentStatus)
+	p.Project = strings.TrimSpace(p.Project)
+	if p.MarkedByActor != nil {
+		actor := strings.TrimSpace(*p.MarkedByActor)
+		p.MarkedByActor = &actor
+	}
+	if p.MarkedByKind != nil {
+		kind := strings.TrimSpace(*p.MarkedByKind)
+		p.MarkedByKind = &kind
+	}
+
+	// Step 1b: validate the relation wire contract before classifying an FK miss.
+	// A malformed relation is terminal evidence, never a retryable dependency.
+	missing := make([]string, 0, 8)
+	if p.SyncID == "" {
+		missing = append(missing, "sync_id")
+	}
+	if p.SourceID == "" {
+		missing = append(missing, "source_id")
+	}
+	if p.TargetID == "" {
+		missing = append(missing, "target_id")
+	}
+	if p.Relation == "" {
+		missing = append(missing, "relation")
+	}
+	if p.JudgmentStatus == "" {
+		missing = append(missing, "judgment_status")
+	}
+	if p.MarkedByActor == nil || *p.MarkedByActor == "" {
+		missing = append(missing, "marked_by_actor")
+	}
+	if p.MarkedByKind == nil || *p.MarkedByKind == "" {
+		missing = append(missing, "marked_by_kind")
+	}
+	if p.Project == "" {
+		missing = append(missing, "project")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("%w: relation payload missing required fields: %s", ErrApplyDead, strings.Join(missing, ", "))
+	}
+	if entityKey := strings.TrimSpace(mutation.EntityKey); entityKey == "" || entityKey != p.SyncID {
+		return fmt.Errorf("%w: relation entity_key %q does not match payload sync_id %q", ErrApplyDead, mutation.EntityKey, p.SyncID)
 	}
 
 	// Step 2: FK precondition — both observations must exist locally (by sync_id).
@@ -6887,10 +6934,11 @@ func (s *Store) ReplayDeferred() (result ReplayDeferredResult, err error) {
 	for _, row := range pending {
 		result.Retried++
 		mut := SyncMutation{
-			Entity:  row.entity,
-			Op:      SyncOpUpsert,
-			Payload: row.payload,
-			Source:  SyncSourceRemote,
+			Entity:    row.entity,
+			EntityKey: row.syncID,
+			Op:        SyncOpUpsert,
+			Payload:   row.payload,
+			Source:    SyncSourceRemote,
 		}
 
 		applyErr := s.withTx(func(tx *sql.Tx) error {

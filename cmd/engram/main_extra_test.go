@@ -3858,6 +3858,30 @@ func TestCmdSyncImportEmptyAndMixedChunks(t *testing.T) {
 	})
 }
 
+func TestCmdSyncImportPrintsRelationCounts(t *testing.T) {
+	stubExitWithPanic(t)
+	workDir := t.TempDir()
+	withCwd(t, workDir)
+	cfg := testConfig(t)
+
+	originalSyncImport := syncImport
+	t.Cleanup(func() { syncImport = originalSyncImport })
+	syncImport = func(*engramsync.Syncer) (*engramsync.ImportResult, error) {
+		return &engramsync.ImportResult{RelationsReplayed: 2, RelationsDeferred: 3, RelationsDead: 4}, nil
+	}
+
+	withArgs(t, "engram", "sync", "--import")
+	stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdSync(cfg) })
+	if recovered != nil || stderr != "" {
+		t.Fatalf("sync import failed: panic=%v stderr=%q", recovered, stderr)
+	}
+	for _, want := range []string{"No new chunks to import", "Relations replayed: 2", "Relations deferred: 3", "Relations dead:     4"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("expected output to contain %q, got %q", want, stdout)
+		}
+	}
+}
+
 func TestCommandErrorSeamsAndUncoveredBranches(t *testing.T) {
 	stubRuntimeHooks(t)
 	stubExitWithPanic(t)

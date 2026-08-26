@@ -113,6 +113,9 @@ type ImportResult struct {
 	SessionsImported     int `json:"sessions_imported"`
 	ObservationsImported int `json:"observations_imported"`
 	PromptsImported      int `json:"prompts_imported"`
+	RelationsReplayed    int `json:"relations_replayed"`
+	RelationsDeferred    int `json:"relations_deferred"`
+	RelationsDead        int `json:"relations_dead"`
 }
 
 // ─── Syncer ──────────────────────────────────────────────────────────────────
@@ -514,7 +517,7 @@ func (sy *Syncer) Import() (*ImportResult, error) {
 	}
 
 	if len(manifest.Chunks) == 0 {
-		return &ImportResult{}, nil
+		return sy.finalizeImport(&ImportResult{})
 	}
 
 	// Get chunks we've already imported
@@ -524,10 +527,31 @@ func (sy *Syncer) Import() (*ImportResult, error) {
 	}
 
 	entries := manifest.Chunks
+	var result *ImportResult
 	if sy.cloudMode {
-		return sy.importEntriesDependencySafe(entries, knownChunks, importModeCloud)
+		result, err = sy.importEntriesDependencySafe(entries, knownChunks, importModeCloud)
+	} else {
+		result, err = sy.importEntriesDependencySafe(entries, knownChunks, importModeLocal)
 	}
-	return sy.importEntriesDependencySafe(entries, knownChunks, importModeLocal)
+	if err != nil {
+		return nil, err
+	}
+	return sy.finalizeImport(result)
+}
+
+// finalizeImport drives the bounded deferred-relation lifecycle after every
+// successful import, including imports with no new chunks.
+func (sy *Syncer) finalizeImport(result *ImportResult) (*ImportResult, error) {
+	replay, err := sy.store.ReplayDeferred()
+	if err != nil {
+		return nil, fmt.Errorf("replay deferred relations: %w", err)
+	}
+	result.RelationsReplayed = replay.Succeeded
+	result.RelationsDeferred, result.RelationsDead, err = sy.store.CountDeferredAndDead()
+	if err != nil {
+		return nil, fmt.Errorf("count deferred relations: %w", err)
+	}
+	return result, nil
 }
 
 type importMode string

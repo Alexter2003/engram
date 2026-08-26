@@ -1574,6 +1574,7 @@ func cmdSync(cfg store.Config) {
 			if result.ChunksSkipped > 0 {
 				fmt.Printf("  (%d chunks already imported)\n", result.ChunksSkipped)
 			}
+			printImportRelationCounts(result)
 			return
 		}
 
@@ -1588,6 +1589,7 @@ func cmdSync(cfg store.Config) {
 		if result.ChunksSkipped > 0 {
 			fmt.Printf("  Skipped:      %d (already imported)\n", result.ChunksSkipped)
 		}
+		printImportRelationCounts(result)
 		return
 	}
 
@@ -1635,6 +1637,12 @@ func cmdSync(cfg store.Config) {
 	fmt.Println()
 	fmt.Println("Add to git:")
 	fmt.Printf("  git add .engram/ && git commit -m \"sync engram memories\"\n")
+}
+
+func printImportRelationCounts(result *engramsync.ImportResult) {
+	fmt.Printf("  Relations replayed: %d\n", result.RelationsReplayed)
+	fmt.Printf("  Relations deferred: %d\n", result.RelationsDeferred)
+	fmt.Printf("  Relations dead:     %d\n", result.RelationsDead)
 }
 
 func printSyncUsage() {
