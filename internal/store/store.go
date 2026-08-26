@@ -4943,28 +4943,39 @@ type MergeResult struct {
 }
 
 // MergeProjects migrates all records from each source project name into the
-// canonical name. Sources that equal the canonical (after normalization) or
-// have no records are silently skipped — the operation is idempotent.
+// canonical name. Every source must normalize to the canonical name; sources
+// that exactly equal the canonical name or have no records are skipped.
 // All updates are performed inside a single transaction for atomicity.
 func (s *Store) MergeProjects(sources []string, canonical string) (*MergeResult, error) {
 	canonical, _ = NormalizeProject(canonical)
 	if canonical == "" {
 		return nil, fmt.Errorf("canonical project name must not be empty")
 	}
+	validatedSources := make([]string, len(sources))
+	for i, source := range sources {
+		normalizedSource, _ := NormalizeProject(source)
+		if normalizedSource == "" {
+			return nil, fmt.Errorf("source project name must not be empty")
+		}
+		if normalizedSource != canonical {
+			return nil, fmt.Errorf("source project %q must normalize to canonical project %q", source, canonical)
+		}
+		validatedSources[i] = normalizedSource
+	}
 
 	result := &MergeResult{Canonical: canonical}
 
 	err := s.withTx(func(tx *sql.Tx) error {
 		seenSources := make(map[string]struct{})
-		for _, srcInput := range sources {
-			srcNormalized, _ := NormalizeProject(srcInput)
-			if srcNormalized == "" || srcNormalized == canonical {
+		for i, srcInput := range sources {
+			srcNormalized := validatedSources[i]
+			if srcInput == canonical {
 				continue
 			}
-			if _, seen := seenSources[srcNormalized]; seen {
+			if _, seen := seenSources[srcInput]; seen {
 				continue
 			}
-			seenSources[srcNormalized] = struct{}{}
+			seenSources[srcInput] = struct{}{}
 
 			sourceVariants := projectMergeSourceVariants(srcInput, srcNormalized, canonical)
 			if len(sourceVariants) == 0 {
@@ -4977,6 +4988,7 @@ func (s *Store) MergeProjects(sources []string, canonical string) (*MergeResult,
 			for _, variant := range sourceVariants {
 				args = append(args, variant)
 			}
+			sourceUpdated := false
 
 			res, err := s.execHook(tx, `UPDATE observations SET project = ? WHERE project IN (`+placeholders+`)`, args...)
 			if err != nil {
@@ -4984,6 +4996,7 @@ func (s *Store) MergeProjects(sources []string, canonical string) (*MergeResult,
 			}
 			n, _ := res.RowsAffected()
 			result.ObservationsUpdated += n
+			sourceUpdated = sourceUpdated || n > 0
 
 			res, err = s.execHook(tx, `UPDATE sessions SET project = ? WHERE project IN (`+placeholders+`)`, args...)
 			if err != nil {
@@ -4991,6 +5004,7 @@ func (s *Store) MergeProjects(sources []string, canonical string) (*MergeResult,
 			}
 			n, _ = res.RowsAffected()
 			result.SessionsUpdated += n
+			sourceUpdated = sourceUpdated || n > 0
 
 			res, err = s.execHook(tx, `UPDATE user_prompts SET project = ? WHERE project IN (`+placeholders+`)`, args...)
 			if err != nil {
@@ -4998,8 +5012,11 @@ func (s *Store) MergeProjects(sources []string, canonical string) (*MergeResult,
 			}
 			n, _ = res.RowsAffected()
 			result.PromptsUpdated += n
+			sourceUpdated = sourceUpdated || n > 0
 
-			result.SourcesMerged = append(result.SourcesMerged, srcNormalized)
+			if sourceUpdated {
+				result.SourcesMerged = append(result.SourcesMerged, srcNormalized)
+			}
 		}
 		// Enqueue sync mutations so cloud sync picks up the merged records.
 		// Same pattern used by EnrollProject.
@@ -5020,35 +5037,11 @@ func sqlPlaceholders(count int) string {
 }
 
 func projectMergeSourceVariants(rawSource, normalizedSource, canonical string) []string {
-	seen := make(map[string]struct{})
-	variants := make([]string, 0, 5)
-	// Match both the historical raw project name and its normalized form so
-	// legacy rows are migrated without reintroducing canonical-source churn.
-	candidates := []string{strings.TrimSpace(rawSource), normalizedSource}
-	parts := strings.FieldsFunc(normalizedSource, func(r rune) bool {
-		return r == ' ' || r == '-' || r == '_'
-	})
-	if len(parts) > 1 {
-		for _, sep := range []string{" ", "-", "_"} {
-			candidates = append(candidates, strings.Join(parts, sep))
-		}
+	rawSource = strings.TrimSpace(rawSource)
+	if rawSource == "" || rawSource == canonical || normalizedSource != canonical {
+		return nil
 	}
-	for _, candidate := range candidates {
-		candidate = strings.TrimSpace(candidate)
-		if candidate == "" || candidate == canonical {
-			continue
-		}
-		candidateNormalized, _ := NormalizeProject(candidate)
-		if candidateNormalized == canonical {
-			continue
-		}
-		if _, ok := seen[candidate]; ok {
-			continue
-		}
-		seen[candidate] = struct{}{}
-		variants = append(variants, candidate)
-	}
-	return variants
+	return []string{rawSource}
 }
 
 // ─── Project Pruning ─────────────────────────────────────────────────────────

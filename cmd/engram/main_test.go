@@ -1,12 +1,14 @@
 package main
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -124,6 +126,22 @@ func mustSeedObservation(t *testing.T, cfg store.Config, sessionID, project, typ
 	}
 
 	return id
+}
+
+func rewriteLegacyProjectName(t *testing.T, cfg store.Config, from, to string) {
+	t.Helper()
+
+	db, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer db.Close()
+
+	for _, table := range []string{"observations", "sessions", "user_prompts"} {
+		if _, err := db.Exec("UPDATE "+table+" SET project = ? WHERE project = ?", to, from); err != nil {
+			t.Fatalf("rewrite %s project: %v", table, err)
+		}
+	}
 }
 
 func TestTruncate(t *testing.T) {
@@ -908,12 +926,46 @@ func TestCmdProjectsConsolidateNoSimilar(t *testing.T) {
 	}
 }
 
+func TestCmdProjectsConsolidateRejectsWeakCandidates(t *testing.T) {
+	tests := []struct {
+		name      string
+		canonical string
+		candidate string
+	}{
+		{name: "shared directory", canonical: "alpha", candidate: "beta"},
+		{name: "substring", canonical: "engram", candidate: "engram-memory"},
+		{name: "levenshtein", canonical: "engram", candidate: "engramm"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testConfig(t)
+			mustSeedObservation(t, cfg, "s-canonical", tt.canonical, "note", "canonical", "content", "project")
+			mustSeedObservation(t, cfg, "s-candidate", tt.candidate, "note", "candidate", "content", "project")
+
+			old := detectProject
+			detectProject = func(string) string { return tt.canonical }
+			t.Cleanup(func() { detectProject = old })
+
+			withArgs(t, "engram", "projects", "consolidate")
+			stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
+			if stderr != "" {
+				t.Fatalf("expected no stderr, got: %q", stderr)
+			}
+			if !strings.Contains(stdout, "No similar") {
+				t.Fatalf("expected no-candidate message, got: %q", stdout)
+			}
+		})
+	}
+}
+
 func TestCmdProjectsConsolidateDryRun(t *testing.T) {
 	cfg := testConfig(t)
 
-	// Seed a canonical and a similar variant (substring match, distinct after normalize)
+	// Seed a canonical name and rewrite a second project's records as a legacy case variant.
 	mustSeedObservation(t, cfg, "s-eng", "engram", "note", "eng note", "content", "project")
-	mustSeedObservation(t, cfg, "s-engm", "engram-memory", "note", "engm note", "content", "project")
+	mustSeedObservation(t, cfg, "s-legacy", "legacy-source", "note", "legacy note", "content", "project")
+	rewriteLegacyProjectName(t, cfg, "legacy-source", "ENGRAM")
 
 	old := detectProject
 	detectProject = func(string) string { return "engram" }
@@ -927,7 +979,7 @@ func TestCmdProjectsConsolidateDryRun(t *testing.T) {
 	if !strings.Contains(stdout, "dry-run") {
 		t.Fatalf("expected dry-run message, got: %q", stdout)
 	}
-	// Verify no actual merge happened (both projects still exist)
+	// Verify no actual merge happened (both project names still exist).
 	s, err := store.New(cfg)
 	if err != nil {
 		t.Fatalf("store.New: %v", err)
@@ -938,17 +990,18 @@ func TestCmdProjectsConsolidateDryRun(t *testing.T) {
 		t.Fatalf("ListProjectNames: %v", err)
 	}
 	// Should still have both names (no merge happened)
-	if len(names) < 2 {
-		t.Fatalf("expected 2 project names after dry-run, got: %v", names)
+	if len(names) != 2 || names[0] != "ENGRAM" || names[1] != "engram" {
+		t.Fatalf("expected legacy and canonical names after dry-run, got: %v", names)
 	}
 }
 
 func TestCmdProjectsConsolidateSingleProject(t *testing.T) {
 	cfg := testConfig(t)
 
-	// Seed canonical and a similar variant (substring match, distinct after normalize)
+	// Seed canonical and normalization-equivalent legacy records.
 	mustSeedObservation(t, cfg, "s-eng", "engram", "note", "eng note", "content", "project")
-	mustSeedObservation(t, cfg, "s-engm", "engram-memory", "note", "engm note", "content", "project")
+	mustSeedObservation(t, cfg, "s-legacy", "legacy-source", "note", "legacy note", "content", "project")
+	rewriteLegacyProjectName(t, cfg, "legacy-source", "ENGRAM")
 
 	old := detectProject
 	detectProject = func(string) string { return "engram" }
@@ -973,7 +1026,7 @@ func TestCmdProjectsConsolidateSingleProject(t *testing.T) {
 		t.Fatalf("expected merge result, got: %q", stdout)
 	}
 
-	// Verify engram-memory was merged into engram
+	// Verify the legacy variant was merged into engram.
 	s, err := store.New(cfg)
 	if err != nil {
 		t.Fatalf("store.New: %v", err)
@@ -991,9 +1044,10 @@ func TestCmdProjectsConsolidateSingleProject(t *testing.T) {
 func TestCmdProjectsConsolidateAllDryRun(t *testing.T) {
 	cfg := testConfig(t)
 
-	// Seed similar projects (substring match, stays distinct after normalize)
+	// Seed normalization-equivalent legacy project records.
 	mustSeedObservation(t, cfg, "s-eng", "engram", "note", "eng note", "content", "project")
-	mustSeedObservation(t, cfg, "s-engm", "engram-memory", "note", "engm note", "content", "project")
+	mustSeedObservation(t, cfg, "s-legacy", "legacy-source", "note", "legacy note", "content", "project")
+	rewriteLegacyProjectName(t, cfg, "legacy-source", "ENGRAM")
 
 	withArgs(t, "engram", "projects", "consolidate", "--all", "--dry-run")
 	stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
@@ -1005,22 +1059,40 @@ func TestCmdProjectsConsolidateAllDryRun(t *testing.T) {
 	}
 }
 
-func TestCmdProjectsAllNoGroups(t *testing.T) {
+func TestCmdProjectsAllRejectsWeakAndTransitiveGroups(t *testing.T) {
 	cfg := testConfig(t)
 
-	// Seed completely unrelated projects
-	mustSeedObservation(t, cfg, "s-foo", "fooproject", "note", "foo", "content", "project")
-	mustSeedObservation(t, cfg, "s-bar", "barproject", "note", "bar", "content", "project")
-	mustSeedObservation(t, cfg, "s-qux", "quxproject", "note", "qux", "content", "project")
+	// These names form substring and Levenshtein weak edges and all share /tmp.
+	mustSeedObservation(t, cfg, "s-client", "client", "note", "client", "content", "project")
+	mustSeedObservation(t, cfg, "s-client-api", "client-api", "note", "client api", "content", "project")
+	mustSeedObservation(t, cfg, "s-client-apj", "client-apj", "note", "client apj", "content", "project")
 
 	withArgs(t, "engram", "projects", "consolidate", "--all")
 	stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
 	if stderr != "" {
 		t.Fatalf("expected no stderr, got: %q", stderr)
 	}
-	// The three "project"-suffixed names might be grouped by similarity.
-	// We just verify it runs without error and produces readable output.
-	_ = stdout
+	if !strings.Contains(stdout, "No similar") {
+		t.Fatalf("expected no weak-edge group, got: %q", stdout)
+	}
+}
+
+func TestGroupSimilarProjectsUsesNormalizationEquivalenceAndStableTieBreak(t *testing.T) {
+	groups := groupSimilarProjects([]store.ProjectStats{
+		{Name: "engram", ObservationCount: 1, Directories: []string{"/shared"}},
+		{Name: "ENGRAM", ObservationCount: 1, Directories: []string{"/shared"}},
+		{Name: "engram-memory", ObservationCount: 100, Directories: []string{"/shared"}},
+	})
+
+	if len(groups) != 1 {
+		t.Fatalf("expected one normalization-equivalent group, got: %#v", groups)
+	}
+	if got, want := groups[0].Names, []string{"ENGRAM", "engram"}; !slices.Equal(got, want) {
+		t.Fatalf("group names = %v, want %v", got, want)
+	}
+	if groups[0].Canonical != "ENGRAM" {
+		t.Fatalf("canonical = %q, want stable alphabetical tie winner %q", groups[0].Canonical, "ENGRAM")
+	}
 }
 
 func TestCmdMCPDetectsProjectFromFlag(t *testing.T) {

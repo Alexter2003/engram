@@ -7116,8 +7116,8 @@ func TestListProjectsWithStats(t *testing.T) {
 func TestMergeProjects(t *testing.T) {
 	s := newTestStore(t)
 
-	// Set up three source projects
-	sources := []string{"engram", "Engram", "engram-memory"}
+	// Set up normalization-equivalent source projects.
+	sources := []string{"engram", "Engram"}
 	canonical := "engram"
 
 	if err := s.CreateSession("s1", "engram", "/work"); err != nil {
@@ -7125,7 +7125,7 @@ func TestMergeProjects(t *testing.T) {
 	}
 
 	// Add observations to each source
-	for _, src := range []string{"engram", "engram-memory"} {
+	for _, src := range []string{"engram"} {
 		for i := 0; i < 2; i++ {
 			_, err := s.AddObservation(AddObservationParams{
 				SessionID: "s1",
@@ -7150,26 +7150,23 @@ func TestMergeProjects(t *testing.T) {
 		t.Errorf("canonical = %q, want \"engram\"", result.Canonical)
 	}
 
-	// "Engram" normalizes to "engram" (same as canonical) → skipped
-	// "engram-memory" is different → merged
-	// Only "engram-memory" should appear in SourcesMerged (and possibly "engram" if it had records,
-	// but it equals canonical after normalization → skipped)
+	// Equivalent sources are allowed, while the exact canonical source is skipped.
 	for _, merged := range result.SourcesMerged {
 		if merged == "engram" {
 			t.Error("canonical 'engram' should not appear in SourcesMerged")
 		}
 	}
 
-	// All records from engram-memory should now be under "engram"
+	// All records remain under "engram".
 	obs, err := s.RecentObservations("engram", "", 20)
 	if err != nil {
 		t.Fatalf("RecentObservations: %v", err)
 	}
-	if len(obs) < 4 {
-		t.Errorf("expected ≥4 observations under 'engram' after merge, got %d", len(obs))
+	if len(obs) != 2 {
+		t.Errorf("expected 2 observations under 'engram', got %d", len(obs))
 	}
 
-	// engram-memory should have 0 observations
+	// An unrelated project name is untouched.
 	obsMerged, err := s.RecentObservations("engram-memory", "", 10)
 	if err != nil {
 		t.Fatalf("RecentObservations engram-memory: %v", err)
@@ -7182,8 +7179,8 @@ func TestMergeProjects(t *testing.T) {
 func TestMergeProjectsIdempotent(t *testing.T) {
 	s := newTestStore(t)
 
-	// Merge a nonexistent source — should not error
-	result, err := s.MergeProjects([]string{"ghost-project"}, "engram")
+	// Merge an equivalent nonexistent source — should not error.
+	result, err := s.MergeProjects([]string{"Engram"}, "engram")
 	if err != nil {
 		t.Fatalf("MergeProjects with nonexistent source: %v", err)
 	}
@@ -7240,7 +7237,7 @@ func TestMergeProjectsNormalizesAliasSourcesWithoutLosingLegacyRows(t *testing.T
 		t.Fatalf("seed legacy prompt: %v", err)
 	}
 
-	result, err := s.MergeProjects([]string{"Engram Memory"}, "engram")
+	result, err := s.MergeProjects([]string{"Engram Memory"}, "engram memory")
 	if err != nil {
 		t.Fatalf("MergeProjects: %v", err)
 	}
@@ -7265,7 +7262,7 @@ func TestMergeProjectsNormalizesAliasSourcesWithoutLosingLegacyRows(t *testing.T
 func TestMergeProjectsConsolidatesDeterministicAliasSpellings(t *testing.T) {
 	s := newTestStore(t)
 
-	for i, project := range []string{"Engram Memory", "engram memory", "engram-memory", "engram_memory"} {
+	for i, project := range []string{"Engram Memory", "engram memory"} {
 		sessionID := fmt.Sprintf("alias-session-%d", i)
 		if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)`, sessionID, project, "/work/engram"); err != nil {
 			t.Fatalf("seed alias session %q: %v", project, err)
@@ -7278,11 +7275,11 @@ func TestMergeProjectsConsolidatesDeterministicAliasSpellings(t *testing.T) {
 		}
 	}
 
-	result, err := s.MergeProjects([]string{"Engram Memory"}, "engram")
+	result, err := s.MergeProjects([]string{"Engram Memory"}, "engram memory")
 	if err != nil {
 		t.Fatalf("MergeProjects: %v", err)
 	}
-	if result.ObservationsUpdated != 4 || result.SessionsUpdated != 4 || result.PromptsUpdated != 4 {
+	if result.ObservationsUpdated != 1 || result.SessionsUpdated != 1 || result.PromptsUpdated != 1 {
 		t.Fatalf("unexpected merge result: %+v", result)
 	}
 }
@@ -7290,14 +7287,14 @@ func TestMergeProjectsConsolidatesDeterministicAliasSpellings(t *testing.T) {
 func TestMergeProjectsAliasVariantsDoNotRewriteCanonicalProject(t *testing.T) {
 	s := newTestStore(t)
 
-	if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)`, "canonical-session", "engram-memory", "/work/engram"); err != nil {
+	if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)`, "canonical-session", "engram memory", "/work/engram"); err != nil {
 		t.Fatalf("seed canonical session: %v", err)
 	}
 	if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)`, "source-session", "Engram Memory", "/work/engram"); err != nil {
 		t.Fatalf("seed source session: %v", err)
 	}
 
-	result, err := s.MergeProjects([]string{"Engram Memory"}, "engram-memory")
+	result, err := s.MergeProjects([]string{"Engram Memory"}, "engram memory")
 	if err != nil {
 		t.Fatalf("MergeProjects: %v", err)
 	}
@@ -7305,11 +7302,99 @@ func TestMergeProjectsAliasVariantsDoNotRewriteCanonicalProject(t *testing.T) {
 		t.Fatalf("SessionsUpdated = %d, want 1", result.SessionsUpdated)
 	}
 	var canonicalRows int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sessions WHERE project = ?`, "engram-memory").Scan(&canonicalRows); err != nil {
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sessions WHERE project = ?`, "engram memory").Scan(&canonicalRows); err != nil {
 		t.Fatalf("count canonical rows: %v", err)
 	}
 	if canonicalRows != 2 {
 		t.Fatalf("canonical rows = %d, want 2", canonicalRows)
+	}
+}
+
+func TestMergeProjectsRejectsNonEquivalentSources(t *testing.T) {
+	tests := []struct {
+		name      string
+		source    string
+		errorPart string
+	}{
+		{name: "empty", source: "", errorPart: "must not be empty"},
+		{name: "substring", source: "engram-memory", errorPart: "must normalize"},
+		{name: "levenshtein", source: "engramm", errorPart: "must normalize"},
+		{name: "shared directory", source: "other-project", errorPart: "must normalize"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestStore(t)
+			if tt.name == "shared directory" {
+				if err := s.CreateSession("shared-directory", tt.source, "/shared"); err != nil {
+					t.Fatalf("create source session: %v", err)
+				}
+			}
+			if _, err := s.MergeProjects([]string{tt.source}, "engram"); err == nil || !strings.Contains(err.Error(), tt.errorPart) {
+				t.Fatalf("MergeProjects error = %v, want normalization rejection", err)
+			}
+		})
+	}
+}
+
+func TestMergeProjectsRejectsSeparatorVariants(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.MergeProjects([]string{"foo-bar"}, "foo_bar"); err == nil || !strings.Contains(err.Error(), "must normalize") {
+		t.Fatalf("MergeProjects error = %v, want separator variant rejection", err)
+	}
+}
+
+func TestMergeProjectsRejectsMixedSourcesWithoutMutation(t *testing.T) {
+	s := newTestStore(t)
+	for _, statement := range []string{
+		`INSERT INTO sessions (id, project, directory) VALUES ('legacy-session', 'Engram', '/work/engram')`,
+		`INSERT INTO observations (sync_id, session_id, type, title, content, project, scope, normalized_hash) VALUES ('legacy-obs', 'legacy-session', 'decision', 'legacy', 'content', 'Engram', 'project', 'legacy-hash')`,
+		`INSERT INTO user_prompts (sync_id, session_id, content, project) VALUES ('legacy-prompt', 'legacy-session', 'prompt', 'Engram')`,
+	} {
+		if _, err := s.db.Exec(statement); err != nil {
+			t.Fatalf("seed legacy record: %v", err)
+		}
+	}
+
+	var beforeMutations int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_mutations`).Scan(&beforeMutations); err != nil {
+		t.Fatalf("count sync mutations before merge: %v", err)
+	}
+	_, err := s.MergeProjects([]string{"Engram", "engram-memory"}, "engram")
+	if err == nil || !strings.Contains(err.Error(), "must normalize") {
+		t.Fatalf("MergeProjects error = %v, want normalization rejection", err)
+	}
+
+	for _, table := range []string{"sessions", "observations", "user_prompts"} {
+		var count int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM ` + table + ` WHERE project = 'Engram'`).Scan(&count); err != nil {
+			t.Fatalf("count %s legacy records: %v", table, err)
+		}
+		if count != 1 {
+			t.Fatalf("%s legacy records = %d, want 1", table, count)
+		}
+	}
+	var afterMutations int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_mutations`).Scan(&afterMutations); err != nil {
+		t.Fatalf("count sync mutations after merge: %v", err)
+	}
+	if afterMutations != beforeMutations {
+		t.Fatalf("sync mutations = %d, want %d", afterMutations, beforeMutations)
+	}
+}
+
+func TestProjectMergeSourceVariantsStayNormalizationEquivalent(t *testing.T) {
+	for _, rawSource := range []string{"Engram", " ENGRAM ", "engram", "foo-bar"} {
+		normalizedSource, _ := NormalizeProject(rawSource)
+		variants := projectMergeSourceVariants(rawSource, normalizedSource, "engram")
+		for _, variant := range variants {
+			normalizedVariant, _ := NormalizeProject(variant)
+			if normalizedVariant != "engram" {
+				t.Fatalf("variant %q normalizes to %q, want engram", variant, normalizedVariant)
+			}
+		}
+	}
+	if variants := projectMergeSourceVariants("foo-bar", "foo-bar", "foo_bar"); len(variants) != 0 {
+		t.Fatalf("separator variants = %v, want none", variants)
 	}
 }
 

@@ -1112,7 +1112,7 @@ When saving to a project that doesn't exist yet, Engram checks for similar exist
 
 ### Retroactive cleanup
 
-Use `engram projects consolidate` to interactively merge variant project names, or `mem_merge_projects` for agent-driven consolidation.
+Use `engram projects consolidate` to interactively merge legacy project names that are equivalent after normalization, or `mem_merge_projects` for agent-driven consolidation.
 
 ---
 

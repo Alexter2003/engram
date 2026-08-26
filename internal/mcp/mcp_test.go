@@ -98,6 +98,40 @@ func TestNewServerRegistersTools(t *testing.T) {
 	}
 }
 
+func TestHandleMergeProjectsRejectsNonEquivalentSourceWithoutMutation(t *testing.T) {
+	s := newMCPTestStore(t)
+	if err := s.CreateSession("merge-source", "engram-memory", "/tmp/engram-memory"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "merge-source",
+		Type:      "decision",
+		Title:     "Unrelated project",
+		Content:   "This record must not be merged.",
+		Project:   "engram-memory",
+		Scope:     "project",
+	}); err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	result, err := handleMergeProjects(s)(context.Background(), mcppkg.CallToolRequest{
+		Params: mcppkg.CallToolParams{Arguments: map[string]any{"from": "engram-memory", "to": "engram"}},
+	})
+	if err != nil {
+		t.Fatalf("handle merge projects: %v", err)
+	}
+	if !result.IsError || !strings.Contains(callResultText(t, result), "must normalize") {
+		t.Fatalf("merge result = %q, want normalization rejection", callResultText(t, result))
+	}
+	observations, err := s.RecentObservations("engram-memory", "", 10)
+	if err != nil {
+		t.Fatalf("recent observations: %v", err)
+	}
+	if len(observations) != 1 {
+		t.Fatalf("source observations = %d, want 1", len(observations))
+	}
+}
+
 func TestHandleSuggestTopicKeyReturnsFamilyBasedKey(t *testing.T) {
 	h := handleSuggestTopicKey()
 	req := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
@@ -3023,7 +3057,7 @@ func TestHandleSaveNoSimilarWarningWhenProjectExists(t *testing.T) {
 func TestHandleMergeProjects(t *testing.T) {
 	s := newMCPTestStore(t)
 
-	// Set up observations under different project name variants
+	// Set up an observation under the canonical project.
 	if err := s.CreateSession("s-Engram", "Engram", ""); err != nil {
 		t.Fatalf("create session Engram: %v", err)
 	}
@@ -3037,23 +3071,10 @@ func TestHandleMergeProjects(t *testing.T) {
 		t.Fatalf("add observation Engram: %v", err)
 	}
 
-	if err := s.CreateSession("s-engram-memory", "engram-memory", ""); err != nil {
-		t.Fatalf("create session engram-memory: %v", err)
-	}
-	if _, err := s.AddObservation(store.AddObservationParams{
-		SessionID: "s-engram-memory",
-		Type:      "decision",
-		Title:     "From engram-memory",
-		Content:   "Content from engram-memory",
-		Project:   "engram-memory",
-	}); err != nil {
-		t.Fatalf("add observation engram-memory: %v", err)
-	}
-
 	h := handleMergeProjects(s)
 
 	req := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
-		"from": "engram-memory, ENGRAM", // comma-separated, with spaces and uppercase
+		"from": "ENGRAM", // uppercase normalization-equivalent source
 		"to":   "engram",
 	}}}
 
@@ -3073,14 +3094,13 @@ func TestHandleMergeProjects(t *testing.T) {
 		t.Fatalf("expected observations count in result, got %q", text)
 	}
 
-	// Verify that engram-memory observations are now under "engram"
+	// Verify that the canonical observation remains available.
 	obs, err := s.RecentObservations("engram", "project", 10)
 	if err != nil {
 		t.Fatalf("recent observations: %v", err)
 	}
-	// Should have both: original "engram" obs + migrated "engram-memory" obs
-	if len(obs) < 2 {
-		t.Fatalf("expected at least 2 observations after merge, got %d", len(obs))
+	if len(obs) != 1 {
+		t.Fatalf("expected 1 observation after merge, got %d", len(obs))
 	}
 }
 
