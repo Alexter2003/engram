@@ -985,6 +985,41 @@ func TestHandleSearchAndCRUDHandlers(t *testing.T) {
 	}
 }
 
+func TestHandleSearch_PropagatesCanceledContext(t *testing.T) {
+	s := newMCPTestStore(t)
+	if err := s.CreateSession("s-canceled-search", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s-canceled-search",
+		Type:      "decision",
+		Title:     "Canceled search must stop",
+		Content:   "Search cancellation is observable at the handler boundary.",
+		Project:   "engram",
+		Scope:     "project",
+	}); err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result, err := handleSearch(s, MCPConfig{}, NewSessionActivity(10*time.Minute))(ctx, mcppkg.CallToolRequest{
+		Params: mcppkg.CallToolParams{Arguments: map[string]any{
+			"query":   "canceled search",
+			"project": "engram",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("handle search: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("expected canceled search to be a tool error, got %s", callResultText(t, result))
+	}
+	if !strings.Contains(callResultText(t, result), context.Canceled.Error()) {
+		t.Fatalf("expected cancellation error, got %s", callResultText(t, result))
+	}
+}
+
 func TestHandleSaveReturnsLifecycleState(t *testing.T) {
 	s := newMCPTestStore(t)
 	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
@@ -1228,6 +1263,43 @@ func TestHandlePromptContextStatsTimelineAndSessionHandlers(t *testing.T) {
 	}
 	if endRes.IsError {
 		t.Fatalf("unexpected session end error: %s", callResultText(t, endRes))
+	}
+}
+
+func TestMemContextRemainsProjectScopedAcrossSessions(t *testing.T) {
+	s := newMCPTestStore(t)
+	for _, sessionID := range []string{"manual-a", "manual-b"} {
+		if err := s.CreateSession(sessionID, "engram", "/tmp/engram"); err != nil {
+			t.Fatalf("create %s: %v", sessionID, err)
+		}
+		if _, err := s.AddObservation(store.AddObservationParams{
+			SessionID: sessionID,
+			Type:      "decision",
+			Title:     sessionID,
+			Content:   "content-" + sessionID,
+			Project:   "engram",
+			Scope:     "project",
+		}); err != nil {
+			t.Fatalf("add %s observation: %v", sessionID, err)
+		}
+	}
+
+	h := handleContext(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"project": "engram",
+		"scope":   "project",
+	}}})
+	if err != nil {
+		t.Fatalf("mem_context handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected mem_context error: %s", callResultText(t, res))
+	}
+	context := callResultText(t, res)
+	for _, value := range []string{"manual-a", "manual-b"} {
+		if !strings.Contains(context, value) {
+			t.Fatalf("manual mem_context must remain project-scoped and include %q:\n%s", value, context)
+		}
 	}
 }
 

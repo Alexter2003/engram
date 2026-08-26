@@ -6,6 +6,7 @@
 package store
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -19,6 +20,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Gentleman-Programming/engram/internal/timeutil"
@@ -317,9 +319,8 @@ const (
 )
 
 type CloudUpgradeSnapshot struct {
-	CloudConfigPresent bool   `json:"cloud_config_present"`
-	CloudConfigJSON    string `json:"cloud_config_json,omitempty"`
-	ProjectEnrolled    bool   `json:"project_enrolled"`
+	Captured        bool `json:"captured"`
+	ProjectEnrolled bool `json:"project_enrolled"`
 }
 
 type CloudUpgradeState struct {
@@ -498,6 +499,16 @@ type Store struct {
 	db    *sql.DB
 	cfg   Config
 	hooks storeHooks
+
+	repairMu        sync.Mutex
+	repairDone      bool
+	repairInFlight  *enrolledProjectRepair
+	repairOperation func() error // test seam; production uses repairEnrolledProjectSyncMutations.
+}
+
+type enrolledProjectRepair struct {
+	done chan struct{}
+	err  error
 }
 
 type execer interface {
@@ -543,11 +554,12 @@ func closeRowsWithError(rows rowScanner, err error) error {
 }
 
 type storeHooks struct {
-	exec    func(db execer, query string, args ...any) (sql.Result, error)
-	query   func(db queryer, query string, args ...any) (*sql.Rows, error)
-	queryIt func(db queryer, query string, args ...any) (rowScanner, error)
-	beginTx func(db *sql.DB) (*sql.Tx, error)
-	commit  func(tx *sql.Tx) error
+	exec           func(db execer, query string, args ...any) (sql.Result, error)
+	query          func(db queryer, query string, args ...any) (*sql.Rows, error)
+	queryIt        func(db queryer, query string, args ...any) (rowScanner, error)
+	queryItContext func(ctx context.Context, db *sql.DB, query string, args ...any) (rowScanner, error)
+	beginTx        func(db *sql.DB) (*sql.Tx, error)
+	commit         func(tx *sql.Tx) error
 }
 
 func defaultStoreHooks() storeHooks {
@@ -560,6 +572,13 @@ func defaultStoreHooks() storeHooks {
 		},
 		queryIt: func(db queryer, query string, args ...any) (rowScanner, error) {
 			rows, err := db.Query(query, args...)
+			if err != nil {
+				return nil, err
+			}
+			return sqlRowScanner{rows: rows}, nil
+		},
+		queryItContext: func(ctx context.Context, db *sql.DB, query string, args ...any) (rowScanner, error) {
+			rows, err := db.QueryContext(ctx, query, args...)
 			if err != nil {
 				return nil, err
 			}
@@ -598,6 +617,17 @@ func (s *Store) queryItHook(db queryer, query string, args ...any) (rowScanner, 
 		return s.hooks.queryIt(db, query, args...)
 	}
 	rows, err := s.queryHook(db, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return sqlRowScanner{rows: rows}, nil
+}
+
+func (s *Store) queryItContextHook(ctx context.Context, query string, args ...any) (rowScanner, error) {
+	if s.hooks.queryItContext != nil {
+		return s.hooks.queryItContext(ctx, s.db, query, args...)
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -656,16 +686,13 @@ func New(cfg Config) (*Store, error) {
 	if err := s.migrate(); err != nil {
 		return nil, fmt.Errorf("engram: migration: %w", err)
 	}
-	if err := s.repairEnrolledProjectSyncMutations(); err != nil {
-		return nil, fmt.Errorf("engram: repair enrolled sync journal: %w", err)
-	}
 
 	succeeded = true
 	return s, nil
 }
 
-// newWithoutRepair is the same as New but skips repairEnrolledProjectSyncMutations.
-// It exists solely to support tests that need to seed data and call repair manually.
+// newWithoutRepair is retained as a test helper alias for New. Enrolled-project
+// repair is deferred until the first synchronization operation in both cases.
 func newWithoutRepair(cfg Config) (*Store, error) {
 	if !filepath.IsAbs(cfg.DataDir) {
 		return nil, fmt.Errorf("engram: data directory must be an absolute path, got %q — set ENGRAM_DATA_DIR or ensure your home directory is resolvable", cfg.DataDir)
@@ -830,6 +857,9 @@ func (s *Store) migrate() error {
 			);
 		`
 	if _, err := s.execHook(s.db, schema); err != nil {
+		return err
+	}
+	if err := s.redactCloudUpgradeSnapshots(); err != nil {
 		return err
 	}
 
@@ -1093,6 +1123,8 @@ func (s *Store) migrate() error {
 			entity_key        TEXT    NOT NULL DEFAULT '',
 			op                TEXT    NOT NULL DEFAULT '',
 			reason_code       TEXT    NOT NULL DEFAULT '',
+			project           TEXT    NOT NULL DEFAULT '',
+			scope_class       TEXT    NOT NULL DEFAULT 'legacy_unscoped',
 			apply_status      TEXT    NOT NULL DEFAULT 'deferred',
 			retry_count       INTEGER NOT NULL DEFAULT 0,
 			last_error        TEXT,
@@ -1104,16 +1136,28 @@ func (s *Store) migrate() error {
 	`); err != nil {
 		return err
 	}
-	for _, column := range []struct{ name, definition string }{
-		{"target_key", "TEXT NOT NULL DEFAULT ''"},
-		{"remote_seq", "INTEGER NOT NULL DEFAULT 0"},
-		{"entity_key", "TEXT NOT NULL DEFAULT ''"},
-		{"op", "TEXT NOT NULL DEFAULT ''"},
-		{"reason_code", "TEXT NOT NULL DEFAULT ''"},
-	} {
-		if err := s.addColumnIfNotExists("sync_apply_deferred", column.name, column.definition); err != nil {
+	deferredColumns := []struct {
+		name       string
+		definition string
+	}{
+		{name: "target_key", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "remote_seq", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "entity_key", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "op", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "reason_code", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "project", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "scope_class", definition: "TEXT NOT NULL DEFAULT 'legacy_unscoped'"},
+	}
+	for _, c := range deferredColumns {
+		if err := s.addColumnIfNotExists("sync_apply_deferred", c.name, c.definition); err != nil {
 			return err
 		}
+	}
+	if _, err := s.execHook(s.db, `
+		CREATE INDEX IF NOT EXISTS idx_sad_scope_status_seen
+			ON sync_apply_deferred(target_key, project, apply_status, first_seen_at);
+	`); err != nil {
+		return err
 	}
 
 	// Phase 3b: composite index for conflict-audit list/count queries.
@@ -1125,6 +1169,35 @@ func (s *Store) migrate() error {
 	}
 
 	return nil
+}
+
+func (s *Store) redactCloudUpgradeSnapshots() error {
+	_, err := s.execHook(s.db, `
+		UPDATE cloud_upgrade_state
+		SET snapshot_json = CASE json_valid(snapshot_json)
+			WHEN 1 THEN CASE
+				WHEN json_type(snapshot_json, '$.cloud_config_present') IS NOT NULL
+					OR json_type(snapshot_json, '$.cloud_config_json') IS NOT NULL
+					THEN CASE
+						WHEN stage IN ('planned', 'doctor_ready', 'doctor_blocked', 'repair_applied', 'bootstrap_enrolled', 'bootstrap_pushed')
+							AND (
+								json_extract(snapshot_json, '$.cloud_config_present') = 1
+								OR ifnull(json_extract(snapshot_json, '$.cloud_config_json'), '') != ''
+								OR json_extract(snapshot_json, '$.project_enrolled') = 1
+							)
+							THEN '{"captured":true,"project_enrolled":' ||
+								CASE json_extract(snapshot_json, '$.project_enrolled') WHEN 1 THEN 'true' ELSE 'false' END || '}'
+						ELSE '{"captured":false,"project_enrolled":false}'
+					END
+				ELSE '{"captured":' ||
+					CASE json_extract(snapshot_json, '$.captured') WHEN 1 THEN 'true' ELSE 'false' END ||
+					',"project_enrolled":' ||
+					CASE json_extract(snapshot_json, '$.project_enrolled') WHEN 1 THEN 'true' ELSE 'false' END || '}'
+			END
+			ELSE '{"captured":false,"project_enrolled":false}'
+		END
+	`)
+	return err
 }
 
 func (s *Store) SaveCloudUpgradeState(state CloudUpgradeState) error {
@@ -1149,7 +1222,12 @@ func (s *Store) SaveCloudUpgradeState(state CloudUpgradeState) error {
 		ON CONFLICT(project) DO UPDATE SET
 			stage = excluded.stage,
 			repair_class = excluded.repair_class,
-			snapshot_json = excluded.snapshot_json,
+			snapshot_json = CASE
+				WHEN json_extract(excluded.snapshot_json, '$.captured') = 0
+					AND json_extract(cloud_upgrade_state.snapshot_json, '$.captured') = 1
+					THEN cloud_upgrade_state.snapshot_json
+				ELSE excluded.snapshot_json
+			END,
 			last_error_code = excluded.last_error_code,
 			last_error_message = excluded.last_error_message,
 			findings_json = excluded.findings_json,
@@ -1208,7 +1286,7 @@ func (s *Store) CanRollbackCloudUpgrade(project string) (bool, error) {
 	if state == nil {
 		return false, nil
 	}
-	return state.Stage != UpgradeStageBootstrapVerified, nil
+	return state.Snapshot.Captured && state.Stage != UpgradeStageBootstrapVerified, nil
 }
 
 func (s *Store) RollbackCloudUpgrade(project string) (CloudUpgradeState, error) {
@@ -1224,6 +1302,9 @@ func (s *Store) RollbackCloudUpgrade(project string) (CloudUpgradeState, error) 
 	}
 	if state == nil {
 		return CloudUpgradeState{}, fmt.Errorf("rollback requires existing upgrade checkpoint state")
+	}
+	if !state.Snapshot.Captured {
+		return CloudUpgradeState{}, fmt.Errorf("rollback requires a captured pre-bootstrap snapshot")
 	}
 	if state.Stage == UpgradeStageBootstrapVerified {
 		return CloudUpgradeState{}, fmt.Errorf("rollback is unavailable post-bootstrap; use explicit disconnect/unenroll flows")
@@ -2329,7 +2410,8 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 			if err == nil {
 				if _, err := s.execHook(tx,
 					`UPDATE observations
-					 SET type = ?,
+					 SET session_id = ?,
+					     type = ?,
 					     title = ?,
 					     content = ?,
 					     tool_name = ?,
@@ -2339,6 +2421,7 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 					     last_seen_at = datetime('now'),
 					     updated_at = datetime('now')
 					 WHERE id = ?`,
+					p.SessionID,
 					p.Type,
 					title,
 					content,
@@ -2543,6 +2626,24 @@ func (s *Store) recentUnpinnedObservations(project, scope string, limit int) ([]
 	return s.queryObservations(query, args...)
 }
 
+func (s *Store) compactionObservations(sessionID, project string, pinned bool, limit int) ([]Observation, error) {
+	pinnedValue := 0
+	if pinned {
+		pinnedValue = 1
+	}
+	query := `
+		SELECT ` + observationSelectColumns + `
+		FROM observations o
+		WHERE o.deleted_at IS NULL AND o.session_id = ? AND LOWER(o.project) = ? AND o.pinned = ?
+		ORDER BY datetime(o.created_at) DESC, o.id DESC`
+	args := []any{sessionID, project, pinnedValue}
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
+	return s.queryObservations(query, args...)
+}
+
 // ObservationsNeedingReview returns non-deleted observations whose review_after has passed.
 // An empty project searches all projects, matching existing browse/search conventions.
 func (s *Store) ObservationsNeedingReview(project string, limit int) ([]Observation, error) {
@@ -2721,6 +2822,33 @@ func (s *Store) RecentPrompts(project string, limit int) ([]Prompt, error) {
 	args = append(args, limit)
 
 	rows, err := s.queryItHook(s.db, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []Prompt
+	for rows.Next() {
+		var p Prompt
+		if err := rows.Scan(&p.ID, &p.SyncID, &p.SessionID, &p.Content, &p.Project, &p.CreatedAt); err != nil {
+			return nil, err
+		}
+		results = append(results, p)
+	}
+	return results, rows.Err()
+}
+
+func (s *Store) compactionPrompts(sessionID, project string, limit int) ([]Prompt, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+
+	rows, err := s.queryItHook(s.db, `
+		SELECT id, ifnull(sync_id, '') as sync_id, session_id, content, ifnull(project, '') as project, created_at
+		FROM user_prompts
+		WHERE session_id = ? AND LOWER(ifnull(project, '')) = ?
+		ORDER BY created_at DESC
+		LIMIT ?`, sessionID, project, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -3163,7 +3291,19 @@ func (s *Store) Timeline(observationID int64, before, after int) (*TimelineResul
 
 // ─── Search (FTS5) ───────────────────────────────────────────────────────────
 
+// Search preserves the original non-context API for callers that do not need
+// cancellation.
 func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error) {
+	return s.SearchContext(context.Background(), query, opts)
+}
+
+// SearchContext searches observations while honoring cancellation from the
+// caller, including while materializing rows.
+func (s *Store) SearchContext(ctx context.Context, query string, opts SearchOptions) ([]SearchResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	// Validate match_mode early so invalid values always error regardless of query shape.
 	switch opts.MatchMode {
 	case "", "all", "any":
@@ -3208,21 +3348,35 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		tkSQL += " ORDER BY updated_at DESC LIMIT ?"
 		tkArgs = append(tkArgs, limit)
 
-		tkRows, err := s.queryItHook(s.db, tkSQL, tkArgs...)
+		tkRows, err := s.db.QueryContext(ctx, tkSQL, tkArgs...)
 		if err == nil {
 			defer tkRows.Close()
 			for tkRows.Next() {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
 				var sr SearchResult
 				if err := tkRows.Scan(
 					&sr.ID, &sr.SyncID, &sr.SessionID, &sr.Type, &sr.Title, &sr.Content,
 					&sr.ToolName, &sr.Project, &sr.Scope, &sr.TopicKey, &sr.RevisionCount, &sr.DuplicateCount,
 					&sr.LastSeenAt, &sr.ReviewAfter, &sr.Pinned, &sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt,
 				); err != nil {
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						return nil, ctxErr
+					}
 					break
+				}
+				if err := ctx.Err(); err != nil {
+					return nil, err
 				}
 				sr.Rank = -1000
 				directResults = append(directResults, sr)
 			}
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		} else if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
 		}
 	}
 
@@ -3234,36 +3388,12 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		ftsQuery = sanitizeFTS(query)
 	}
 
-	sqlQ := `
-		SELECT o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
-		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.review_after, o.pinned, o.created_at, o.updated_at, o.deleted_at,
-		       bm25(observations_fts, 5.0, 1.0, 0.0, 0.0, 0.0, 3.0) as rank
-		FROM observations_fts fts
-		JOIN observations o ON o.id = fts.rowid
-		WHERE observations_fts MATCH ? AND o.deleted_at IS NULL
-	`
-	args := []any{ftsQuery}
-
-	if opts.Type != "" {
-		sqlQ += " AND o.type = ?"
-		args = append(args, opts.Type)
-	}
-
-	if opts.Project != "" {
-		sqlQ += " AND LOWER(o.project) = ?"
-		args = append(args, opts.Project)
-	}
-
-	if opts.Scope != "" {
-		sqlQ += " AND o.scope = ?"
-		args = append(args, normalizeScope(opts.Scope))
-	}
-
-	sqlQ += " ORDER BY rank LIMIT ?"
-	args = append(args, limit)
-
-	rows, err := s.queryItHook(s.db, sqlQ, args...)
+	sqlQ, args := buildSearchFTSQuery(ftsQuery, opts, limit)
+	rows, err := s.queryItContextHook(ctx, sqlQ, args...)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, fmt.Errorf("search: %w", err)
 	}
 	defer rows.Close()
@@ -3276,6 +3406,9 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 	var results []SearchResult
 	results = append(results, directResults...)
 	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		var sr SearchResult
 		if err := rows.Scan(
 			&sr.ID, &sr.SyncID, &sr.SessionID, &sr.Type, &sr.Title, &sr.Content,
@@ -3283,6 +3416,12 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 			&sr.LastSeenAt, &sr.ReviewAfter, &sr.Pinned, &sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt,
 			&sr.Rank,
 		); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			return nil, err
+		}
+		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		if !seen[sr.ID] {
@@ -3290,6 +3429,12 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		}
 	}
 	if err := rows.Err(); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
@@ -3297,6 +3442,34 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		results = results[:limit]
 	}
 	return results, nil
+}
+
+func buildSearchFTSQuery(ftsQuery string, opts SearchOptions, limit int) (string, []any) {
+	sqlQ := `
+		SELECT o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
+		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.review_after, o.pinned, o.created_at, o.updated_at, o.deleted_at,
+		       bm25(observations_fts, 5.0, 1.0, 0.0, 0.0, 0.0, 3.0) as rank
+		FROM observations_fts fts
+		CROSS JOIN observations o ON o.id = fts.rowid
+		WHERE observations_fts MATCH ? AND o.deleted_at IS NULL
+	`
+	args := []any{ftsQuery}
+
+	if opts.Type != "" {
+		sqlQ += " AND o.type = ?"
+		args = append(args, opts.Type)
+	}
+	if opts.Project != "" {
+		sqlQ += " AND LOWER(o.project) = ?"
+		args = append(args, opts.Project)
+	}
+	if opts.Scope != "" {
+		sqlQ += " AND o.scope = ?"
+		args = append(args, normalizeScope(opts.Scope))
+	}
+
+	sqlQ += " ORDER BY rank LIMIT ?"
+	return sqlQ, append(args, limit)
 }
 
 // ─── Stats ───────────────────────────────────────────────────────────────────
@@ -3422,6 +3595,67 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 		for _, obs := range observations {
 			fmt.Fprintf(&b, "- [%s] **%s**: %s\n",
 				obs.Type, obs.Title, truncate(obs.Content, 300))
+		}
+		b.WriteString("\n")
+	}
+
+	return b.String(), nil
+}
+
+// FormatCompactionContext returns runtime context that is strictly limited to
+// one persisted session. The session's project is derived from the store and
+// is never supplied by the caller.
+func (s *Store) FormatCompactionContext(sessionID string) (string, error) {
+	session, err := s.GetSession(sessionID)
+	if err != nil {
+		return "", err
+	}
+
+	project, _ := NormalizeProject(session.Project)
+	var observationCount int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM observations WHERE session_id = ? AND LOWER(project) = ? AND deleted_at IS NULL`, session.ID, project).Scan(&observationCount); err != nil {
+		return "", err
+	}
+	pinned, err := s.compactionObservations(session.ID, project, true, 0)
+	if err != nil {
+		return "", err
+	}
+	observations, err := s.compactionObservations(session.ID, project, false, s.cfg.MaxContextResults)
+	if err != nil {
+		return "", err
+	}
+	prompts, err := s.compactionPrompts(session.ID, project, 10)
+	if err != nil {
+		return "", err
+	}
+
+	var b strings.Builder
+	b.WriteString("## Memory from This Session\n\n")
+	b.WriteString("### Session\n")
+	summary := ""
+	if session.Summary != nil {
+		summary = fmt.Sprintf(": %s", truncate(*session.Summary, 200))
+	}
+	fmt.Fprintf(&b, "- **%s** (%s)%s [%d observations]\n\n", session.ID, timeutil.FormatLocal(session.StartedAt), summary, observationCount)
+
+	if len(prompts) > 0 {
+		b.WriteString("### Recent User Prompts\n")
+		for _, p := range prompts {
+			fmt.Fprintf(&b, "- %s: %s\n", timeutil.FormatLocal(p.CreatedAt), truncate(p.Content, 200))
+		}
+		b.WriteString("\n")
+	}
+	if len(pinned) > 0 {
+		b.WriteString("### Pinned\n")
+		for _, obs := range pinned {
+			fmt.Fprintf(&b, "- [%s] **%s**: %s\n", obs.Type, obs.Title, truncate(obs.Content, 300))
+		}
+		b.WriteString("\n")
+	}
+	if len(observations) > 0 {
+		b.WriteString("### Recent Observations\n")
+		for _, obs := range observations {
+			fmt.Fprintf(&b, "- [%s] **%s**: %s\n", obs.Type, obs.Title, truncate(obs.Content, 300))
 		}
 		b.WriteString("\n")
 	}
@@ -4277,46 +4511,16 @@ func (s *Store) ApplyPulledMutation(targetKey string, mutation SyncMutation) err
 
 		applyErr := s.applyPulledMutationTx(tx, mutation)
 		if applyErr != nil {
-			// Phase E: per-entity skip+log policy (design §9).
-			// For relation FK misses, write to sync_apply_deferred and ACK the seq
-			// so the cursor can advance. All other errors propagate and halt the pull.
-			if mutation.Entity == SyncEntityRelation && errors.Is(applyErr, ErrRelationFKMissing) {
-				log.Printf("[store] ApplyPulledMutation: relation FK miss seq=%d entity_key=%s — deferring",
-					mutation.Seq, mutation.EntityKey)
-				if _, deferErr := s.execHook(tx, `
-					INSERT INTO sync_apply_deferred
-						(sync_id, entity, payload, apply_status, retry_count, first_seen_at)
-					VALUES (?, ?, ?, 'deferred', 0, datetime('now'))
-					ON CONFLICT(sync_id) DO UPDATE SET
-						payload            = excluded.payload,
-						last_attempted_at  = datetime('now')
-				`, mutation.EntityKey, mutation.Entity, mutation.Payload); deferErr != nil {
-					return fmt.Errorf("ApplyPulledMutation: write deferred row: %w", deferErr)
+			if handled, err := s.recordRelationApplyFailureTx(tx, targetKey, mutation, applyErr); err != nil {
+				return err
+			} else if !handled {
+				if errors.Is(applyErr, ErrPulledSessionIdentityInvalid) {
+					if err := s.deadLetterPulledSessionIdentityTx(tx, targetKey, mutation); err != nil {
+						return err
+					}
+				} else {
+					return applyErr
 				}
-				// Fall through to advance the cursor (ACK the seq).
-			} else if mutation.Entity == SyncEntityRelation && errors.Is(applyErr, ErrApplyDead) {
-				// Payload is permanently undecodable — write directly as dead and ACK.
-				// There is no point retrying; a malformed payload will never become valid.
-				log.Printf("[store] ApplyPulledMutation: relation payload dead seq=%d entity_key=%s err=%v — marking dead",
-					mutation.Seq, mutation.EntityKey, applyErr)
-				if _, deferErr := s.execHook(tx, `
-					INSERT INTO sync_apply_deferred
-						(sync_id, entity, payload, apply_status, retry_count, first_seen_at)
-					VALUES (?, ?, ?, 'dead', 0, datetime('now'))
-					ON CONFLICT(sync_id) DO UPDATE SET
-						payload           = excluded.payload,
-						apply_status      = 'dead',
-						last_attempted_at = datetime('now')
-				`, mutation.EntityKey, mutation.Entity, mutation.Payload); deferErr != nil {
-					return fmt.Errorf("ApplyPulledMutation: write dead row: %w", deferErr)
-				}
-				// Fall through to advance the cursor (ACK the seq).
-			} else if errors.Is(applyErr, ErrPulledSessionIdentityInvalid) {
-				if err := s.deadLetterPulledSessionIdentityTx(tx, targetKey, mutation); err != nil {
-					return err
-				}
-			} else {
-				return applyErr
 			}
 		}
 
@@ -4328,6 +4532,59 @@ func (s *Store) ApplyPulledMutation(targetKey string, mutation SyncMutation) err
 		)
 		return err
 	})
+}
+
+// recordRelationApplyFailureTx records relation failures that are safe to
+// acknowledge while preserving the existing fail-fast behavior for other
+// entities and errors.
+func (s *Store) recordRelationApplyFailureTx(tx *sql.Tx, targetKey string, mutation SyncMutation, applyErr error) (bool, error) {
+	if mutation.Entity != SyncEntityRelation {
+		return false, nil
+	}
+
+	status := ""
+	switch {
+	case errors.Is(applyErr, ErrRelationFKMissing):
+		status = "deferred"
+	case errors.Is(applyErr, ErrApplyDead):
+		status = "dead"
+	default:
+		return false, nil
+	}
+
+	project := strings.TrimSpace(mutation.Project)
+	if project == "" {
+		var payload syncRelationPayload
+		if err := json.Unmarshal([]byte(mutation.Payload), &payload); err == nil {
+			project = strings.TrimSpace(payload.Project)
+		}
+	}
+	project, _ = NormalizeProject(project)
+	scopeClass := "target_scoped"
+	if project != "" {
+		scopeClass = "scoped"
+	}
+
+	if _, err := s.execHook(tx, `
+		INSERT INTO sync_apply_deferred
+			(sync_id, entity, payload, target_key, project, scope_class, apply_status, retry_count, first_seen_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 0, datetime('now'))
+		ON CONFLICT(sync_id) DO UPDATE SET
+			payload           = excluded.payload,
+			target_key        = excluded.target_key,
+			project           = excluded.project,
+			scope_class       = excluded.scope_class,
+			apply_status      = CASE
+				WHEN excluded.apply_status = 'dead' THEN 'dead'
+				ELSE sync_apply_deferred.apply_status
+			END,
+			last_attempted_at = datetime('now')
+	`, mutation.EntityKey, mutation.Entity, mutation.Payload, targetKey, project, scopeClass, status); err != nil {
+		return false, fmt.Errorf("write relation apply failure: %w", err)
+	}
+
+	log.Printf("[store] relation apply seq=%d entity_key=%s err=%v - marking %s", mutation.Seq, mutation.EntityKey, applyErr, status)
+	return true, nil
 }
 
 // ApplyPulledChunk atomically applies all mutations contained in a pulled chunk
@@ -4365,12 +4622,17 @@ func (s *Store) ApplyPulledChunk(targetKey, chunkID string, mutations []SyncMuta
 			mutation.Seq = seq
 			mutation.TargetKey = targetKey
 			mutation.Source = SyncSourceRemote
-			if err := s.applyPulledMutationTx(tx, mutation); err != nil {
-				if !errors.Is(err, ErrPulledSessionIdentityInvalid) {
+			if applyErr := s.applyPulledMutationTx(tx, mutation); applyErr != nil {
+				if handled, err := s.recordRelationApplyFailureTx(tx, targetKey, mutation, applyErr); err != nil {
 					return fmt.Errorf("apply chunk mutation %d: %w", i, err)
-				}
-				if err := s.deadLetterPulledSessionIdentityTx(tx, targetKey, mutation); err != nil {
-					return fmt.Errorf("apply chunk mutation %d: %w", i, err)
+				} else if !handled {
+					if errors.Is(applyErr, ErrPulledSessionIdentityInvalid) {
+						if err := s.deadLetterPulledSessionIdentityTx(tx, targetKey, mutation); err != nil {
+							return fmt.Errorf("apply chunk mutation %d: %w", i, err)
+						}
+					} else {
+						return fmt.Errorf("apply chunk mutation %d: %w", i, applyErr)
+					}
 				}
 			}
 		}
@@ -5182,6 +5444,55 @@ func (s *Store) projectNeedsBackfill(project string) (bool, error) {
 	return false, nil
 }
 
+// EnsureEnrolledProjectSyncMutations repairs legacy enrolled-project journal
+// entries before a sync operation reads them. A successful repair is memoized
+// for this Store's lifetime; failures are returned to callers and retried by a
+// later synchronization attempt.
+func (s *Store) EnsureEnrolledProjectSyncMutations(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	s.repairMu.Lock()
+	if s.repairDone {
+		s.repairMu.Unlock()
+		return nil
+	}
+	if inFlight := s.repairInFlight; inFlight != nil {
+		s.repairMu.Unlock()
+		select {
+		case <-inFlight.done:
+			return inFlight.err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	inFlight := &enrolledProjectRepair{done: make(chan struct{})}
+	s.repairInFlight = inFlight
+	s.repairMu.Unlock()
+
+	var err error
+	if s.repairOperation != nil {
+		err = s.repairOperation()
+	} else {
+		err = s.repairEnrolledProjectSyncMutations()
+	}
+
+	s.repairMu.Lock()
+	inFlight.err = err
+	if err == nil {
+		s.repairDone = true
+	}
+	s.repairInFlight = nil
+	close(inFlight.done)
+	s.repairMu.Unlock()
+	return err
+}
+
 func (s *Store) repairEnrolledProjectSyncMutations() error {
 	// Collect enrolled projects outside a transaction so we avoid holding a read
 	// cursor open while we later write inside backfillProjectSyncMutationsTx.
@@ -5728,15 +6039,28 @@ func (s *Store) applyPulledMutationTx(tx *sql.Tx, mutation SyncMutation) error {
 func (s *Store) deadLetterPulledSessionIdentityTx(tx *sql.Tx, targetKey string, mutation SyncMutation) error {
 	keyHash := sha256.Sum256([]byte(targetKey + "\x00" + strconv.FormatInt(mutation.Seq, 10)))
 	syncID := "pulled-session-" + hex.EncodeToString(keyHash[:])
+	project := strings.TrimSpace(mutation.Project)
+	if project == "" {
+		var payload syncSessionPayload
+		if err := decodeSyncPayload([]byte(mutation.Payload), &payload); err == nil {
+			project = strings.TrimSpace(payload.Project)
+		}
+	}
+	project, _ = NormalizeProject(project)
+	scopeClass := "target_scoped"
+	if project != "" {
+		scopeClass = "scoped"
+	}
 	_, err := s.execHook(tx, `
 		INSERT INTO sync_apply_deferred
-			(sync_id, entity, payload, target_key, remote_seq, entity_key, op, reason_code, apply_status, retry_count, first_seen_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dead', 0, datetime('now'))
+			(sync_id, entity, payload, target_key, remote_seq, entity_key, op, reason_code, project, scope_class, apply_status, retry_count, first_seen_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'dead', 0, datetime('now'))
 		ON CONFLICT(sync_id) DO UPDATE SET
 			entity = excluded.entity, payload = excluded.payload, target_key = excluded.target_key,
 			remote_seq = excluded.remote_seq, entity_key = excluded.entity_key, op = excluded.op,
-			reason_code = excluded.reason_code, apply_status = 'dead', last_attempted_at = datetime('now')`,
-		syncID, mutation.Entity, mutation.Payload, targetKey, mutation.Seq, mutation.EntityKey, mutation.Op, SyncSessionIdentityInvalidReasonCode,
+			reason_code = excluded.reason_code, project = excluded.project, scope_class = excluded.scope_class,
+			apply_status = 'dead', last_attempted_at = datetime('now')`,
+		syncID, mutation.Entity, mutation.Payload, targetKey, mutation.Seq, mutation.EntityKey, mutation.Op, SyncSessionIdentityInvalidReasonCode, project, scopeClass,
 	)
 	if err != nil {
 		return fmt.Errorf("write invalid pulled session evidence: %w", err)
@@ -5757,16 +6081,54 @@ func (s *Store) deadLetterPulledSessionIdentityTx(tx *sql.Tx, targetKey string, 
 //  4. On successful apply, DELETE any pre-existing deferred row for this sync_id
 //     so it is not retried unnecessarily.
 func (s *Store) applyRelationUpsertTx(tx *sql.Tx, mutation SyncMutation) error {
+	if mutation.Op != SyncOpUpsert {
+		return fmt.Errorf("%w: unsupported relation operation %q", ErrApplyDead, mutation.Op)
+	}
+
 	// Step 1: decode payload.
 	var p syncRelationPayload
 	if err := decodeSyncPayload([]byte(mutation.Payload), &p); err != nil {
 		return fmt.Errorf("%w: decode relation payload: %v", ErrApplyDead, err)
 	}
 
-	// Step 1b: required field validation — missing source_id or target_id is not
-	// a retryable FK miss; it is a permanent payload defect (ErrApplyDead).
-	if strings.TrimSpace(p.SourceID) == "" || strings.TrimSpace(p.TargetID) == "" {
-		return fmt.Errorf("%w: relation payload missing required source_id or target_id", ErrApplyDead)
+	p.SyncID = strings.TrimSpace(p.SyncID)
+	p.SourceID = strings.TrimSpace(p.SourceID)
+	p.TargetID = strings.TrimSpace(p.TargetID)
+	p.Relation = strings.TrimSpace(p.Relation)
+	p.JudgmentStatus = strings.TrimSpace(p.JudgmentStatus)
+	p.Project = strings.TrimSpace(p.Project)
+	if p.MarkedByActor != nil {
+		actor := strings.TrimSpace(*p.MarkedByActor)
+		p.MarkedByActor = &actor
+	}
+	if p.MarkedByKind != nil {
+		kind := strings.TrimSpace(*p.MarkedByKind)
+		p.MarkedByKind = &kind
+	}
+
+	// Step 1b: validate the relation wire contract before classifying an FK miss.
+	// A malformed relation is terminal evidence, never a retryable dependency.
+	missing := make([]string, 0, 5)
+	if p.SyncID == "" {
+		missing = append(missing, "sync_id")
+	}
+	if p.SourceID == "" {
+		missing = append(missing, "source_id")
+	}
+	if p.TargetID == "" {
+		missing = append(missing, "target_id")
+	}
+	if p.Relation == "" {
+		missing = append(missing, "relation")
+	}
+	if p.JudgmentStatus == "" {
+		missing = append(missing, "judgment_status")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("%w: relation payload missing required fields: %s", ErrApplyDead, strings.Join(missing, ", "))
+	}
+	if entityKey := strings.TrimSpace(mutation.EntityKey); entityKey == "" || entityKey != p.SyncID {
+		return fmt.Errorf("%w: relation entity_key %q does not match payload sync_id %q", ErrApplyDead, mutation.EntityKey, p.SyncID)
 	}
 
 	// Step 2: FK precondition — both observations must exist locally (by sync_id).
@@ -5777,7 +6139,11 @@ func (s *Store) applyRelationUpsertTx(tx *sql.Tx, mutation SyncMutation) error {
 	).Scan(&obsCount); err != nil {
 		return fmt.Errorf("applyRelationUpsertTx: check observations: %w", err)
 	}
-	if obsCount < 2 {
+	requiredObservations := 2
+	if p.SourceID == p.TargetID {
+		requiredObservations = 1
+	}
+	if obsCount < requiredObservations {
 		return ErrRelationFKMissing
 	}
 
@@ -6931,7 +7297,47 @@ type ReplayDeferredResult struct {
 	Dead      int
 }
 
-// ReplayDeferred retries all rows in sync_apply_deferred with apply_status='deferred'
+// ReplayDeferred retries every deferred row, including legacy-unscoped rows. It is
+// reserved for deliberate administrative operations such as conflict recovery.
+func (s *Store) ReplayDeferred() (ReplayDeferredResult, error) {
+	return s.ReplayDeferredForScope("", "")
+}
+
+func (s *Store) ListDeferredProjectsForTarget(targetKey string) ([]string, error) {
+	rows, err := s.db.Query(`
+		SELECT DISTINCT project
+		FROM sync_apply_deferred
+		WHERE target_key = ?
+		  AND scope_class = 'scoped'
+		  AND apply_status = 'deferred'
+		  AND project != ''
+		ORDER BY project
+	`, normalizeSyncTargetKey(targetKey))
+	if err != nil {
+		return nil, fmt.Errorf("ListDeferredProjectsForTarget: query: %w", err)
+	}
+	defer rows.Close()
+
+	projects := make([]string, 0)
+	for rows.Next() {
+		var project string
+		if err := rows.Scan(&project); err != nil {
+			return nil, fmt.Errorf("ListDeferredProjectsForTarget: scan: %w", err)
+		}
+		projects = append(projects, project)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ListDeferredProjectsForTarget: rows: %w", err)
+	}
+	return projects, nil
+}
+
+// ReplayDeferredForScope retries deferred rows for one sync target and optional
+// project. An empty project includes all safely target-scoped rows for that target;
+// an empty target is reserved for ReplayDeferred's administrative global replay.
+// Legacy-unscoped rows are excluded whenever a target or project scope is supplied.
+//
+// It retries rows with apply_status='deferred'
 // (up to 50 per call, ordered by first_seen_at). For each row:
 //   - Calls applyPulledMutationTx inside a transaction.
 //   - On success: the apply itself deletes the deferred row (applyRelationUpsertTx
@@ -6945,17 +7351,29 @@ type ReplayDeferredResult struct {
 // in place.
 //
 // Returns counts (retried, succeeded, failed, dead) for caller logging.
-func (s *Store) ReplayDeferred() (result ReplayDeferredResult, err error) {
+func (s *Store) ReplayDeferredForScope(targetKey, project string) (result ReplayDeferredResult, err error) {
 	const limit = 50
 	const deadThreshold = 5
+	targetKey = strings.TrimSpace(targetKey)
+	project, _ = NormalizeProject(strings.TrimSpace(project))
 
-	rows, err := s.db.Query(`
+	query := `
 		SELECT sync_id, entity, payload, retry_count
 		FROM sync_apply_deferred
-		WHERE apply_status = 'deferred'
-		ORDER BY first_seen_at
-		LIMIT ?
-	`, limit)
+		WHERE apply_status = 'deferred'`
+	args := []any{}
+	if targetKey != "" {
+		query += ` AND target_key = ? AND scope_class != 'legacy_unscoped'`
+		args = append(args, normalizeSyncTargetKey(targetKey))
+	}
+	if project != "" {
+		query += ` AND project = ? AND scope_class = 'scoped'`
+		args = append(args, project)
+	}
+	query += ` ORDER BY first_seen_at LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return result, fmt.Errorf("ReplayDeferred: list deferred: %w", err)
 	}
@@ -6984,10 +7402,13 @@ func (s *Store) ReplayDeferred() (result ReplayDeferredResult, err error) {
 	for _, row := range pending {
 		result.Retried++
 		mut := SyncMutation{
-			Entity:  row.entity,
-			Op:      SyncOpUpsert,
-			Payload: row.payload,
-			Source:  SyncSourceRemote,
+			Entity:    row.entity,
+			EntityKey: row.syncID,
+			Op:        SyncOpUpsert,
+			Payload:   row.payload,
+			Source:    SyncSourceRemote,
+			TargetKey: targetKey,
+			Project:   project,
 		}
 
 		applyErr := s.withTx(func(tx *sql.Tx) error {
@@ -7028,16 +7449,33 @@ func (s *Store) ReplayDeferred() (result ReplayDeferredResult, err error) {
 	return result, nil
 }
 
-// CountDeferredAndDead returns the count of rows in sync_apply_deferred grouped
-// by apply_status. Only 'deferred' and 'dead' statuses are counted; 'applied'
-// rows (if any) are not included.
+// CountDeferredAndDead returns global administrative totals, including legacy
+// unscoped rows that normal scoped imports intentionally leave untouched.
 func (s *Store) CountDeferredAndDead() (deferred, dead int, err error) {
-	rows, err := s.db.Query(`
+	return s.CountDeferredAndDeadForScope("", "")
+}
+
+// CountDeferredAndDeadForScope returns queue totals for an optional target and
+// project. Scoped totals exclude legacy-unscoped rows; empty filters return the
+// global administrative totals.
+func (s *Store) CountDeferredAndDeadForScope(targetKey, project string) (deferred, dead int, err error) {
+	targetKey = strings.TrimSpace(targetKey)
+	project, _ = NormalizeProject(strings.TrimSpace(project))
+	query := `
 		SELECT apply_status, count(*)
 		FROM sync_apply_deferred
-		WHERE apply_status IN ('deferred', 'dead')
-		GROUP BY apply_status
-	`)
+		WHERE apply_status IN ('deferred', 'dead')`
+	args := []any{}
+	if targetKey != "" {
+		query += ` AND target_key = ? AND scope_class != 'legacy_unscoped'`
+		args = append(args, normalizeSyncTargetKey(targetKey))
+	}
+	if project != "" {
+		query += ` AND project = ? AND scope_class = 'scoped'`
+		args = append(args, project)
+	}
+	query += ` GROUP BY apply_status`
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return 0, 0, fmt.Errorf("CountDeferredAndDead: query: %w", err)
 	}
@@ -7069,7 +7507,7 @@ func (s *Store) CountDeferredAndDead() (deferred, dead int, err error) {
 // JSON, PayloadValid is false and PayloadRaw is preserved.
 func (s *Store) ListDeferred(opts ListDeferredOptions) ([]DeferredRow, error) {
 	query := `
-		SELECT sync_id, entity, payload, target_key, remote_seq, entity_key, op, reason_code, apply_status, retry_count,
+		SELECT sync_id, entity, payload, target_key, project, scope_class, remote_seq, entity_key, op, reason_code, apply_status, retry_count,
 		       last_error, last_attempted_at, first_seen_at
 		FROM sync_apply_deferred
 		WHERE 1=1`
@@ -7116,7 +7554,7 @@ func (s *Store) ListDeferred(opts ListDeferredOptions) ([]DeferredRow, error) {
 // Returns an error wrapping "not found" when no row exists (matches FindCandidates style).
 func (s *Store) GetDeferred(syncID string) (DeferredRow, error) {
 	row := s.db.QueryRow(`
-		SELECT sync_id, entity, payload, target_key, remote_seq, entity_key, op, reason_code, apply_status, retry_count,
+		SELECT sync_id, entity, payload, target_key, project, scope_class, remote_seq, entity_key, op, reason_code, apply_status, retry_count,
 		       last_error, last_attempted_at, first_seen_at
 		FROM sync_apply_deferred
 		WHERE sync_id = ?
@@ -7142,7 +7580,7 @@ func scanDeferredRow(row scannable) (DeferredRow, error) {
 	var r DeferredRow
 	var rawPayload string
 	if err := row.Scan(
-		&r.SyncID, &r.Entity, &rawPayload, &r.TargetKey, &r.RemoteSeq, &r.EntityKey, &r.Op, &r.ReasonCode, &r.ApplyStatus, &r.RetryCount,
+		&r.SyncID, &r.Entity, &rawPayload, &r.TargetKey, &r.Project, &r.ScopeClass, &r.RemoteSeq, &r.EntityKey, &r.Op, &r.ReasonCode, &r.ApplyStatus, &r.RetryCount,
 		&r.LastError, &r.LastAttemptedAt, &r.FirstSeenAt,
 	); err != nil {
 		return r, err
