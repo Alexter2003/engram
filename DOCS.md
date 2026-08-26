@@ -171,7 +171,8 @@ Engram is local-first: local SQLite is authoritative; cloud features are optiona
 
 ### Context
 
-- `GET /context` — Formatted context. Query: `?project=X&scope=project|personal|global`
+- `GET /context` — Manual formatted context scoped by project and optional scope. Query: `?project=X&scope=project|personal|global`
+- `GET /context/compaction` — Runtime compaction context scoped strictly to one persisted session. Query: `?session_id=X`. The server derives the session project; this endpoint does not accept project or scope selection.
 
 ### Passive Capture
 
@@ -847,7 +848,7 @@ Save structured observations. The tool description teaches agents the format:
 - **observation**: backward-compatible alias for `content` for older/raw MCP clients; prefer `content` for new integrations
 
 Exact duplicate saves are deduplicated in a rolling time window using a normalized content hash + project + scope + type + title.
-When `topic_key` is provided, `mem_save` upserts the latest observation in the same `project + scope + topic_key`, incrementing `revision_count`.
+When `topic_key` is provided, `mem_save` upserts the latest observation in the same `project + scope + topic_key`, incrementing `revision_count` and attributing it to the latest writer session.
 Save responses include lifecycle metadata for the saved observation: computed `state` (`active` or `needs_review`) and `review_after` when the observation type has a review cycle.
 
 ### mem_update

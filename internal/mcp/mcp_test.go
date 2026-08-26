@@ -1230,6 +1230,43 @@ func TestHandlePromptContextStatsTimelineAndSessionHandlers(t *testing.T) {
 	}
 }
 
+func TestMemContextRemainsProjectScopedAcrossSessions(t *testing.T) {
+	s := newMCPTestStore(t)
+	for _, sessionID := range []string{"manual-a", "manual-b"} {
+		if err := s.CreateSession(sessionID, "engram", "/tmp/engram"); err != nil {
+			t.Fatalf("create %s: %v", sessionID, err)
+		}
+		if _, err := s.AddObservation(store.AddObservationParams{
+			SessionID: sessionID,
+			Type:      "decision",
+			Title:     sessionID,
+			Content:   "content-" + sessionID,
+			Project:   "engram",
+			Scope:     "project",
+		}); err != nil {
+			t.Fatalf("add %s observation: %v", sessionID, err)
+		}
+	}
+
+	h := handleContext(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"project": "engram",
+		"scope":   "project",
+	}}})
+	if err != nil {
+		t.Fatalf("mem_context handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected mem_context error: %s", callResultText(t, res))
+	}
+	context := callResultText(t, res)
+	for _, value := range []string{"manual-a", "manual-b"} {
+		if !strings.Contains(context, value) {
+			t.Fatalf("manual mem_context must remain project-scoped and include %q:\n%s", value, context)
+		}
+	}
+}
+
 func TestMCPHandlersErrorBranches(t *testing.T) {
 	s := newMCPTestStore(t)
 

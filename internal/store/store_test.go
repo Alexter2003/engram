@@ -654,6 +654,100 @@ func TestPinnedObservationsAndFormatContextPriority(t *testing.T) {
 	}
 }
 
+func TestFormatCompactionContextIsSessionScoped(t *testing.T) {
+	s := newTestStore(t)
+
+	for _, sessionID := range []string{"session-a", "session-b"} {
+		if err := s.CreateSession(sessionID, "engram", "/tmp/engram"); err != nil {
+			t.Fatalf("create %s: %v", sessionID, err)
+		}
+	}
+	if err := s.EndSession("session-a", "summary-a"); err != nil {
+		t.Fatalf("end session A: %v", err)
+	}
+	if err := s.EndSession("session-b", "summary-b"); err != nil {
+		t.Fatalf("end session B: %v", err)
+	}
+
+	addObservation := func(sessionID, title, content string, pinned bool) {
+		t.Helper()
+		id, err := s.AddObservation(AddObservationParams{
+			SessionID: sessionID,
+			Type:      "decision",
+			Title:     title,
+			Content:   content,
+			Project:   "engram",
+			Scope:     "project",
+		})
+		if err != nil {
+			t.Fatalf("add %s observation: %v", sessionID, err)
+		}
+		if pinned {
+			if err := s.PinObservation(id); err != nil {
+				t.Fatalf("pin %s observation: %v", sessionID, err)
+			}
+		}
+	}
+	addObservation("session-a", "pinned-a", "pinned-content-a", true)
+	addObservation("session-a", "recent-a", "recent-content-a", false)
+	addObservation("session-b", "pinned-b", "pinned-content-b", true)
+	addObservation("session-b", "recent-b", "recent-content-b", false)
+	if _, err := s.AddObservation(AddObservationParams{
+		SessionID: "session-a",
+		Type:      "decision",
+		Title:     "foreign-project-observation",
+		Content:   "must-not-appear",
+		Project:   "foreign",
+		Scope:     "project",
+	}); err != nil {
+		t.Fatalf("add foreign-project observation: %v", err)
+	}
+
+	for _, prompt := range []struct{ sessionID, content string }{
+		{"session-a", "prompt-a"},
+		{"session-b", "prompt-b"},
+		{"session-a", "foreign-project-prompt"},
+	} {
+		project := "engram"
+		if prompt.content == "foreign-project-prompt" {
+			project = "foreign"
+		}
+		if _, err := s.AddPrompt(AddPromptParams{SessionID: prompt.sessionID, Content: prompt.content, Project: project}); err != nil {
+			t.Fatalf("add %s: %v", prompt.content, err)
+		}
+	}
+
+	for _, tc := range []struct {
+		sessionID string
+		included  []string
+		excluded  []string
+	}{
+		{"session-a", []string{"session-a", "summary-a", "pinned-a", "recent-a", "prompt-a"}, []string{"session-b", "summary-b", "pinned-b", "recent-b", "prompt-b", "foreign-project-observation", "foreign-project-prompt"}},
+		{"session-b", []string{"session-b", "summary-b", "pinned-b", "recent-b", "prompt-b"}, []string{"session-a", "summary-a", "pinned-a", "recent-a", "prompt-a"}},
+	} {
+		t.Run(tc.sessionID, func(t *testing.T) {
+			context, err := s.FormatCompactionContext(tc.sessionID)
+			if err != nil {
+				t.Fatalf("format compaction context: %v", err)
+			}
+			for _, value := range tc.included {
+				if !strings.Contains(context, value) {
+					t.Errorf("context missing %q:\n%s", value, context)
+				}
+			}
+			for _, value := range tc.excluded {
+				if strings.Contains(context, value) {
+					t.Errorf("context leaked %q:\n%s", value, context)
+				}
+			}
+		})
+	}
+
+	if _, err := s.FormatCompactionContext("missing"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("missing session error = %v, want sql.ErrNoRows", err)
+	}
+}
+
 func TestTopicKeyUpsertUpdatesSameTopicWithoutCreatingNewRow(t *testing.T) {
 	s := newTestStore(t)
 
@@ -703,6 +797,72 @@ func TestTopicKeyUpsertUpdatesSameTopicWithoutCreatingNewRow(t *testing.T) {
 	}
 	if !strings.Contains(obs.Content, "gateway") {
 		t.Fatalf("expected latest content after upsert, got %q", obs.Content)
+	}
+}
+
+func TestTopicKeyUpsertMovesObservationToLatestSession(t *testing.T) {
+	s := newTestStore(t)
+
+	for _, sessionID := range []string{"session-a", "session-b"} {
+		if err := s.CreateSession(sessionID, "engram", "/tmp/engram"); err != nil {
+			t.Fatalf("create %s: %v", sessionID, err)
+		}
+	}
+
+	firstID, err := s.AddObservation(AddObservationParams{
+		SessionID: "session-a",
+		Type:      "architecture",
+		Title:     "Auth model",
+		Content:   "content-written-by-session-a",
+		Project:   "engram",
+		Scope:     "project",
+		TopicKey:  "architecture/auth-model",
+	})
+	if err != nil {
+		t.Fatalf("add session A observation: %v", err)
+	}
+
+	secondID, err := s.AddObservation(AddObservationParams{
+		SessionID: "session-b",
+		Type:      "architecture",
+		Title:     "Auth model",
+		Content:   "content-written-by-session-b",
+		Project:   "engram",
+		Scope:     "project",
+		TopicKey:  "architecture/auth-model",
+	})
+	if err != nil {
+		t.Fatalf("upsert session B observation: %v", err)
+	}
+	if firstID != secondID {
+		t.Fatalf("expected cross-session topic upsert to reuse id, got %d and %d", firstID, secondID)
+	}
+
+	observation, err := s.GetObservation(firstID)
+	if err != nil {
+		t.Fatalf("get upserted observation: %v", err)
+	}
+	if observation.SessionID != "session-b" {
+		t.Fatalf("expected latest writer session, got %q", observation.SessionID)
+	}
+	if observation.RevisionCount != 2 {
+		t.Fatalf("expected revision_count=2, got %d", observation.RevisionCount)
+	}
+
+	context, err := s.FormatCompactionContext("session-a")
+	if err != nil {
+		t.Fatalf("format session A compaction context: %v", err)
+	}
+	if strings.Contains(context, "content-written-by-session-b") {
+		t.Fatalf("session A compaction context leaked session B content: %s", context)
+	}
+
+	observations, err := s.AllObservations("engram", "project", 10)
+	if err != nil {
+		t.Fatalf("list observations: %v", err)
+	}
+	if len(observations) != 1 {
+		t.Fatalf("expected one topic observation, got %d", len(observations))
 	}
 }
 
@@ -4598,7 +4758,7 @@ func TestStoreUncoveredBranchesPushToHundred(t *testing.T) {
 		}
 		origExec := s.hooks.exec
 		s.hooks.exec = func(db execer, query string, args ...any) (sql.Result, error) {
-			if strings.Contains(query, "SET type = ?") {
+			if strings.Contains(query, "SET session_id = ?") {
 				return nil, errors.New("forced topic update error")
 			}
 			return origExec(db, query, args...)
