@@ -312,8 +312,11 @@ func TestRecoverStrandedAdminTokenWithAuditPreservesGrants(t *testing.T) {
 
 func TestRecoverStrandedAdminTokenWithAuditRejectsUnsafeOrRepeatedState(t *testing.T) {
 	cases := []struct {
-		name  string
-		setup func(t *testing.T, cs *CloudStore, admin HumanUser)
+		name           string
+		setup          func(t *testing.T, cs *CloudStore, admin HumanUser)
+		params         RecoverStrandedAdminTokenParams
+		wantErr        string
+		wantTokenCount int
 	}{
 		{
 			name: "multiple enabled human admins",
@@ -323,6 +326,20 @@ func TestRecoverStrandedAdminTokenWithAuditRejectsUnsafeOrRepeatedState(t *testi
 					t.Fatalf("CreateHumanUser second admin: %v", err)
 				}
 			},
+			wantErr: ErrStrandedAdminRecoveryIneligible.Error(),
+		},
+		{
+			name: "zero enabled human admins",
+			setup: func(t *testing.T, cs *CloudStore, admin HumanUser) {
+				t.Helper()
+				if _, err := cs.CreatePrincipal(context.Background(), CreatePrincipalParams{Kind: PrincipalKindServiceAccount, DisplayName: "Recovery Backup", Role: PrincipalRoleAdmin}); err != nil {
+					t.Fatalf("CreatePrincipal backup admin: %v", err)
+				}
+				if err := cs.SetHumanUserEnabled(context.Background(), admin.PrincipalID, false); err != nil {
+					t.Fatalf("SetHumanUserEnabled stranded admin false: %v", err)
+				}
+			},
+			wantErr: ErrStrandedAdminRecoveryIneligible.Error(),
 		},
 		{
 			name: "existing token anywhere",
@@ -332,6 +349,33 @@ func TestRecoverStrandedAdminTokenWithAuditRejectsUnsafeOrRepeatedState(t *testi
 					t.Fatalf("CreatePrincipalToken setup: %v", err)
 				}
 			},
+			wantErr:        ErrStrandedAdminRecoveryIneligible.Error(),
+			wantTokenCount: 1,
+		},
+		{
+			name: "revoked token row",
+			setup: func(t *testing.T, cs *CloudStore, admin HumanUser) {
+				t.Helper()
+				token, err := cs.CreatePrincipalToken(context.Background(), CreatePrincipalTokenParams{PrincipalID: admin.PrincipalID, TokenPrefix: "egc_live_revoked", TokenHash: "hmac-sha256:v1:revoked", Name: "revoked", CreatedByPrincipalID: admin.PrincipalID})
+				if err != nil {
+					t.Fatalf("CreatePrincipalToken setup: %v", err)
+				}
+				if err := cs.RevokePrincipalToken(context.Background(), token.ID, admin.PrincipalID, "setup"); err != nil {
+					t.Fatalf("RevokePrincipalToken setup: %v", err)
+				}
+			},
+			wantErr:        ErrStrandedAdminRecoveryIneligible.Error(),
+			wantTokenCount: 1,
+		},
+		{
+			name:    "empty token prefix",
+			params:  RecoverStrandedAdminTokenParams{TokenHash: "hmac-sha256:v1:rejected"},
+			wantErr: "cloudstore: token prefix is required",
+		},
+		{
+			name:    "empty token hash",
+			params:  RecoverStrandedAdminTokenParams{TokenPrefix: "egc_live_rejected"},
+			wantErr: "cloudstore: token hash is required",
 		},
 	}
 	for _, tt := range cases {
@@ -342,11 +386,24 @@ func TestRecoverStrandedAdminTokenWithAuditRejectsUnsafeOrRepeatedState(t *testi
 			if err != nil {
 				t.Fatalf("CreateFirstAdminHumanUser: %v", err)
 			}
-			tt.setup(t, cs, admin)
+			if tt.setup != nil {
+				tt.setup(t, cs, admin)
+			}
 
-			_, err = cs.RecoverStrandedAdminTokenWithAudit(ctx, RecoverStrandedAdminTokenParams{TokenPrefix: "egc_live_rejected", TokenHash: "hmac-sha256:v1:rejected"}, AuthAuditEvent{ActorSource: "bootstrap_cli", Action: "bootstrap.cli", Outcome: "success", Metadata: map[string]any{"recovered": true}})
-			if !errors.Is(err, ErrStrandedAdminRecoveryIneligible) {
-				t.Fatalf("expected ineligible recovery error, got %v", err)
+			params := tt.params
+			if params.TokenPrefix == "" && params.TokenHash == "" {
+				params = RecoverStrandedAdminTokenParams{TokenPrefix: "egc_live_rejected", TokenHash: "hmac-sha256:v1:rejected"}
+			}
+			_, err = cs.RecoverStrandedAdminTokenWithAudit(ctx, params, AuthAuditEvent{ActorSource: "bootstrap_cli", Action: "bootstrap.cli", Outcome: "success", Metadata: map[string]any{"recovered": true}})
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("expected recovery rejection containing %q, got %v", tt.wantErr, err)
+			}
+			tokens, err := cs.ListPrincipalTokens(ctx, admin.PrincipalID)
+			if err != nil {
+				t.Fatalf("ListPrincipalTokens after rejected recovery: %v", err)
+			}
+			if len(tokens) != tt.wantTokenCount {
+				t.Fatalf("rejected recovery must not change token rows, got %+v want %d tokens", tokens, tt.wantTokenCount)
 			}
 			events, err := cs.ListAuthAuditEvents(ctx, AuthAuditQuery{Limit: 10})
 			if err != nil {
@@ -484,7 +541,7 @@ func TestTokenIssuanceAndLastAdminGuardLockTargetBeforeAdvisoryGuard(t *testing.
 				t.Fatalf("acquire principal-row blocker: %v", err)
 			}
 
-			operationCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			operationCtx, cancel := context.WithTimeout(ctx, lockOrderOperationTimeout)
 			defer cancel()
 			errs := make(chan error, 2)
 			go func() { errs <- tt.issue(operationCtx, cs, admin) }()
@@ -503,7 +560,7 @@ func TestTokenIssuanceAndLastAdminGuardLockTargetBeforeAdvisoryGuard(t *testing.
 					if err != nil {
 						t.Fatalf("concurrent operation must complete without a lock-order error: %v", err)
 					}
-				case <-time.After(3 * time.Second):
+				case <-time.After(lockOrderOperationTimeout):
 					t.Fatal("concurrent token issuance and admin update did not complete after the principal-row blocker released")
 				}
 			}
@@ -511,12 +568,22 @@ func TestTokenIssuanceAndLastAdminGuardLockTargetBeforeAdvisoryGuard(t *testing.
 	}
 }
 
+const (
+	lockOrderOperationTimeout = 5 * time.Second
+	activeAdminGuardLockWhere = `
+		locktype = 'advisory'
+		AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+		AND classid::bigint = ((hashtext('engram_cloud_active_admin_guard')::bigint >> 32) & 4294967295)
+		AND objid::bigint = (hashtext('engram_cloud_active_admin_guard')::bigint & 4294967295)
+		AND objsubid = 1`
+)
+
 func waitForActiveAdminGuardWaiter(t *testing.T, db *sql.DB) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		var waiters int
-		if err := db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory' AND granted = FALSE`).Scan(&waiters); err != nil {
+		if err := db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM pg_locks WHERE `+activeAdminGuardLockWhere+` AND granted = FALSE`).Scan(&waiters); err != nil {
 			t.Fatalf("count active-admin guard waiters: %v", err)
 		}
 		if waiters > 0 {
@@ -546,12 +613,26 @@ func waitForDatabaseLockWaiters(t *testing.T, db *sql.DB, wantAtLeast int) {
 func assertNoActiveAdminGuardHeld(t *testing.T, db *sql.DB) {
 	t.Helper()
 	var held int
-	if err := db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory' AND granted = TRUE`).Scan(&held); err != nil {
+	if err := db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM pg_locks WHERE `+activeAdminGuardLockWhere+` AND granted = TRUE`).Scan(&held); err != nil {
 		t.Fatalf("count held advisory locks: %v", err)
 	}
 	if held != 0 {
 		t.Fatalf("token issuance and last-admin guard must wait on the principal row before acquiring the advisory guard, found %d held advisory locks", held)
 	}
+}
+
+func TestActiveAdminGuardLockQueriesIgnoreUnrelatedAdvisoryLocks(t *testing.T) {
+	ctx := context.Background()
+	cs := openIsolatedCloudStore(t)
+	tx, err := cs.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin unrelated advisory-lock tx: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(42::bigint)`); err != nil {
+		t.Fatalf("acquire unrelated advisory lock: %v", err)
+	}
+	assertNoActiveAdminGuardHeld(t, cs.db)
 }
 
 // TestFindPrincipalTokenByHashResolvesActiveTokenAndRejectsUnknownOrRevoked

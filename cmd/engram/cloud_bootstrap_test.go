@@ -809,6 +809,41 @@ func TestCloudBootstrapRecoverTokenRequiresTokenPepperBeforeOpeningStore(t *test
 	}
 }
 
+func TestCloudBootstrapHelpDescribesAdminAndRecoverySeparately(t *testing.T) {
+	withArgs(t, "engram", "cloud", "bootstrap", "--help")
+	stdout, _, recovered := captureOutputAndRecover(t, cmdCloudBootstrap)
+	if recovered != nil {
+		t.Fatalf("expected help to return normally, got %v", recovered)
+	}
+	if !strings.Contains(stdout, "admin creates the first managed admin") || !strings.Contains(stdout, "recover-token issues one token for the eligible stranded managed admin") {
+		t.Fatalf("expected separate accurate bootstrap help descriptions, got %q", stdout)
+	}
+}
+
+func TestParseCloudBootstrapRecoverTokenArgsRejectsMissingNameValue(t *testing.T) {
+	for _, args := range [][]string{{"--name"}, {"--name", "--unknown"}} {
+		if _, err := parseCloudBootstrapRecoverTokenArgs(args); err == nil || err.Error() != "--name requires a value" {
+			t.Fatalf("parseCloudBootstrapRecoverTokenArgs(%v) = %v, want --name requires a value", args, err)
+		}
+	}
+}
+
+func TestCloudBootstrapRecoverTokenRejectsFlagAsNameBeforeOpeningStore(t *testing.T) {
+	stubExitWithPanic(t)
+	store := &fakeCloudBootstrapStore{}
+	calls := stubNewCloudBootstrapStore(t, store)
+
+	withArgs(t, "engram", "cloud", "bootstrap", "recover-token", "--name", "--unknown")
+	_, stderr, recovered := captureOutputAndRecover(t, cmdCloudBootstrap)
+	code, ok := recovered.(exitCode)
+	if !ok || int(code) != 1 {
+		t.Fatalf("expected exit code 1 for a flag-like --name value, got %v", recovered)
+	}
+	if !strings.Contains(stderr, "--name requires a value") || *calls != 0 || store.recoverTokenCalls != 0 {
+		t.Fatalf("flag-like --name value must fail before opening the store, stderr=%q calls=%d recoveryCalls=%d", stderr, *calls, store.recoverTokenCalls)
+	}
+}
+
 // TestCloudBootstrapUnknownSubcommandIsRejected proves `engram cloud
 // bootstrap <x>` for x != admin is rejected instead of silently no-op.
 func TestCloudBootstrapUnknownSubcommandIsRejected(t *testing.T) {

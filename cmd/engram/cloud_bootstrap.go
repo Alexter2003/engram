@@ -93,7 +93,8 @@ func cmdCloudBootstrap() {
 func printCloudBootstrapUsage() {
 	fmt.Println("usage: engram cloud bootstrap admin --username <name> [--email <email>] [--grant-project <project>]... [--issue-token [name]]")
 	fmt.Println("       engram cloud bootstrap recover-token [--name <name>]")
-	fmt.Println("creates the first managed admin for a self-hosted cloud deployment")
+	fmt.Println("admin creates the first managed admin for a self-hosted cloud deployment")
+	fmt.Println("recover-token issues one token for the eligible stranded managed admin")
 }
 
 func cmdCloudBootstrapAdmin() {
@@ -418,7 +419,7 @@ func parseCloudBootstrapRecoverTokenArgs(args []string) (cloudBootstrapRecoverTo
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--name":
-			if i+1 >= len(args) {
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
 				return out, fmt.Errorf("--name requires a value")
 			}
 			i++
