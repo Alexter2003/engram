@@ -984,6 +984,41 @@ func TestHandleSearchAndCRUDHandlers(t *testing.T) {
 	}
 }
 
+func TestHandleSearch_PropagatesCanceledContext(t *testing.T) {
+	s := newMCPTestStore(t)
+	if err := s.CreateSession("s-canceled-search", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s-canceled-search",
+		Type:      "decision",
+		Title:     "Canceled search must stop",
+		Content:   "Search cancellation is observable at the handler boundary.",
+		Project:   "engram",
+		Scope:     "project",
+	}); err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result, err := handleSearch(s, MCPConfig{}, NewSessionActivity(10*time.Minute))(ctx, mcppkg.CallToolRequest{
+		Params: mcppkg.CallToolParams{Arguments: map[string]any{
+			"query":   "canceled search",
+			"project": "engram",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("handle search: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("expected canceled search to be a tool error, got %s", callResultText(t, result))
+	}
+	if !strings.Contains(callResultText(t, result), context.Canceled.Error()) {
+		t.Fatalf("expected cancellation error, got %s", callResultText(t, result))
+	}
+}
+
 func TestHandleSaveReturnsLifecycleState(t *testing.T) {
 	s := newMCPTestStore(t)
 	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))

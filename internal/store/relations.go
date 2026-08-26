@@ -361,19 +361,7 @@ func (s *Store) FindCandidates(savedID int64, opts CandidateOptions) ([]Candidat
 
 	// FTS5 query: same project, same scope, exclude just-saved row, exclude soft-deleted.
 	// BM25 floor filtering is done in Go after scanning.
-	rows, err := s.db.Query(`
-		SELECT o.id, ifnull(o.sync_id,'') as sync_id, o.title, o.type, o.topic_key,
-		       fts.rank
-		FROM observations_fts fts
-		JOIN observations o ON o.id = fts.rowid
-		WHERE observations_fts MATCH ?
-		  AND o.id != ?
-		  AND o.deleted_at IS NULL
-		  AND ifnull(o.project,'') = ifnull(?,'')
-		  AND o.scope = ?
-		ORDER BY fts.rank
-		LIMIT ?
-	`, ftsQuery, savedID, project, scope, limit*3) // fetch extra rows to allow floor filtering
+	rows, err := s.db.Query(findCandidatesFTSQuery, ftsQuery, savedID, project, scope, limit*3) // fetch extra rows to allow floor filtering
 	if err != nil {
 		return nil, fmt.Errorf("FindCandidates: FTS5 query: %w", err)
 	}
@@ -944,6 +932,15 @@ func (s *Store) getRelationTx(tx *sql.Tx, syncID string) (*Relation, error) {
 // titles via LEFT JOIN, used by the MCP annotation builder (REQ-005, REQ-012).
 // Missing or soft-deleted observations set the corresponding *Missing flag to true.
 func (s *Store) GetRelationsForObservations(syncIDs []string) (map[string]ObservationRelations, error) {
+	return s.GetRelationsForObservationsContext(context.Background(), syncIDs)
+}
+
+// GetRelationsForObservationsContext enriches observations with relations while
+// honoring cancellation from the caller, including while materializing rows.
+func (s *Store) GetRelationsForObservationsContext(ctx context.Context, syncIDs []string) (map[string]ObservationRelations, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(syncIDs) == 0 {
 		return map[string]ObservationRelations{}, nil
 	}
@@ -981,8 +978,11 @@ func (s *Store) GetRelationsForObservations(syncIDs []string) (map[string]Observ
 		  AND r.judgment_status != 'orphaned'
 	`, inClause, inClause)
 
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, fmt.Errorf("GetRelationsForObservations: query: %w", err)
 	}
 	defer rows.Close()
@@ -990,6 +990,9 @@ func (s *Store) GetRelationsForObservations(syncIDs []string) (map[string]Observ
 	result := make(map[string]ObservationRelations)
 
 	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		var r Relation
 		var sourceID, targetID string
 		// SQLite BOOLEAN → int; use int for missing flags.
@@ -1003,7 +1006,13 @@ func (s *Store) GetRelationsForObservations(syncIDs []string) (map[string]Observ
 			&r.SourceIntID, &r.SourceTitle, &sourceMissingInt,
 			&r.TargetIntID, &r.TargetTitle, &targetMissingInt,
 		); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
 			return nil, fmt.Errorf("GetRelationsForObservations: scan: %w", err)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
 		r.SourceID = sourceID
 		r.TargetID = targetID
@@ -1012,6 +1021,9 @@ func (s *Store) GetRelationsForObservations(syncIDs []string) (map[string]Observ
 
 		// Index by source_id.
 		for _, id := range syncIDs {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if r.SourceID == id {
 				entry := result[id]
 				entry.AsSource = append(entry.AsSource, r)
@@ -1025,11 +1037,31 @@ func (s *Store) GetRelationsForObservations(syncIDs []string) (map[string]Observ
 		}
 	}
 	if err := rows.Err(); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, fmt.Errorf("GetRelationsForObservations: rows error: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	return result, nil
 }
+
+const findCandidatesFTSQuery = `
+	SELECT o.id, ifnull(o.sync_id,'') as sync_id, o.title, o.type, o.topic_key,
+	       fts.rank
+	FROM observations_fts fts
+	CROSS JOIN observations o ON o.id = fts.rowid
+	WHERE observations_fts MATCH ?
+	  AND o.id != ?
+	  AND o.deleted_at IS NULL
+	  AND ifnull(o.project,'') = ifnull(?,'')
+	  AND o.scope = ?
+	ORDER BY fts.rank
+	LIMIT ?
+`
 
 // sanitizeFTSCandidates builds an OR-based FTS5 query from a title so that
 // FindCandidates returns documents with ANY term overlap (not all terms).

@@ -6,6 +6,7 @@
 package store
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -536,11 +537,12 @@ func closeRowsWithError(rows rowScanner, err error) error {
 }
 
 type storeHooks struct {
-	exec    func(db execer, query string, args ...any) (sql.Result, error)
-	query   func(db queryer, query string, args ...any) (*sql.Rows, error)
-	queryIt func(db queryer, query string, args ...any) (rowScanner, error)
-	beginTx func(db *sql.DB) (*sql.Tx, error)
-	commit  func(tx *sql.Tx) error
+	exec           func(db execer, query string, args ...any) (sql.Result, error)
+	query          func(db queryer, query string, args ...any) (*sql.Rows, error)
+	queryIt        func(db queryer, query string, args ...any) (rowScanner, error)
+	queryItContext func(ctx context.Context, db *sql.DB, query string, args ...any) (rowScanner, error)
+	beginTx        func(db *sql.DB) (*sql.Tx, error)
+	commit         func(tx *sql.Tx) error
 }
 
 func defaultStoreHooks() storeHooks {
@@ -553,6 +555,13 @@ func defaultStoreHooks() storeHooks {
 		},
 		queryIt: func(db queryer, query string, args ...any) (rowScanner, error) {
 			rows, err := db.Query(query, args...)
+			if err != nil {
+				return nil, err
+			}
+			return sqlRowScanner{rows: rows}, nil
+		},
+		queryItContext: func(ctx context.Context, db *sql.DB, query string, args ...any) (rowScanner, error) {
+			rows, err := db.QueryContext(ctx, query, args...)
 			if err != nil {
 				return nil, err
 			}
@@ -591,6 +600,17 @@ func (s *Store) queryItHook(db queryer, query string, args ...any) (rowScanner, 
 		return s.hooks.queryIt(db, query, args...)
 	}
 	rows, err := s.queryHook(db, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return sqlRowScanner{rows: rows}, nil
+}
+
+func (s *Store) queryItContextHook(ctx context.Context, query string, args ...any) (rowScanner, error) {
+	if s.hooks.queryItContext != nil {
+		return s.hooks.queryItContext(ctx, s.db, query, args...)
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -3207,7 +3227,19 @@ func (s *Store) Timeline(observationID int64, before, after int) (*TimelineResul
 
 // ─── Search (FTS5) ───────────────────────────────────────────────────────────
 
+// Search preserves the original non-context API for callers that do not need
+// cancellation.
 func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error) {
+	return s.SearchContext(context.Background(), query, opts)
+}
+
+// SearchContext searches observations while honoring cancellation from the
+// caller, including while materializing rows.
+func (s *Store) SearchContext(ctx context.Context, query string, opts SearchOptions) ([]SearchResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	// Validate match_mode early so invalid values always error regardless of query shape.
 	switch opts.MatchMode {
 	case "", "all", "any":
@@ -3252,21 +3284,35 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		tkSQL += " ORDER BY updated_at DESC LIMIT ?"
 		tkArgs = append(tkArgs, limit)
 
-		tkRows, err := s.queryItHook(s.db, tkSQL, tkArgs...)
+		tkRows, err := s.db.QueryContext(ctx, tkSQL, tkArgs...)
 		if err == nil {
 			defer tkRows.Close()
 			for tkRows.Next() {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
 				var sr SearchResult
 				if err := tkRows.Scan(
 					&sr.ID, &sr.SyncID, &sr.SessionID, &sr.Type, &sr.Title, &sr.Content,
 					&sr.ToolName, &sr.Project, &sr.Scope, &sr.TopicKey, &sr.RevisionCount, &sr.DuplicateCount,
 					&sr.LastSeenAt, &sr.ReviewAfter, &sr.Pinned, &sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt,
 				); err != nil {
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						return nil, ctxErr
+					}
 					break
+				}
+				if err := ctx.Err(); err != nil {
+					return nil, err
 				}
 				sr.Rank = -1000
 				directResults = append(directResults, sr)
 			}
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		} else if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
 		}
 	}
 
@@ -3278,36 +3324,12 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		ftsQuery = sanitizeFTS(query)
 	}
 
-	sqlQ := `
-		SELECT o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
-		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.review_after, o.pinned, o.created_at, o.updated_at, o.deleted_at,
-		       bm25(observations_fts, 5.0, 1.0, 0.0, 0.0, 0.0, 3.0) as rank
-		FROM observations_fts fts
-		JOIN observations o ON o.id = fts.rowid
-		WHERE observations_fts MATCH ? AND o.deleted_at IS NULL
-	`
-	args := []any{ftsQuery}
-
-	if opts.Type != "" {
-		sqlQ += " AND o.type = ?"
-		args = append(args, opts.Type)
-	}
-
-	if opts.Project != "" {
-		sqlQ += " AND LOWER(o.project) = ?"
-		args = append(args, opts.Project)
-	}
-
-	if opts.Scope != "" {
-		sqlQ += " AND o.scope = ?"
-		args = append(args, normalizeScope(opts.Scope))
-	}
-
-	sqlQ += " ORDER BY rank LIMIT ?"
-	args = append(args, limit)
-
-	rows, err := s.queryItHook(s.db, sqlQ, args...)
+	sqlQ, args := buildSearchFTSQuery(ftsQuery, opts, limit)
+	rows, err := s.queryItContextHook(ctx, sqlQ, args...)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, fmt.Errorf("search: %w", err)
 	}
 	defer rows.Close()
@@ -3320,6 +3342,9 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 	var results []SearchResult
 	results = append(results, directResults...)
 	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		var sr SearchResult
 		if err := rows.Scan(
 			&sr.ID, &sr.SyncID, &sr.SessionID, &sr.Type, &sr.Title, &sr.Content,
@@ -3327,6 +3352,12 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 			&sr.LastSeenAt, &sr.ReviewAfter, &sr.Pinned, &sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt,
 			&sr.Rank,
 		); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			return nil, err
+		}
+		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		if !seen[sr.ID] {
@@ -3334,6 +3365,12 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		}
 	}
 	if err := rows.Err(); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
@@ -3341,6 +3378,34 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		results = results[:limit]
 	}
 	return results, nil
+}
+
+func buildSearchFTSQuery(ftsQuery string, opts SearchOptions, limit int) (string, []any) {
+	sqlQ := `
+		SELECT o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
+		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.review_after, o.pinned, o.created_at, o.updated_at, o.deleted_at,
+		       bm25(observations_fts, 5.0, 1.0, 0.0, 0.0, 0.0, 3.0) as rank
+		FROM observations_fts fts
+		CROSS JOIN observations o ON o.id = fts.rowid
+		WHERE observations_fts MATCH ? AND o.deleted_at IS NULL
+	`
+	args := []any{ftsQuery}
+
+	if opts.Type != "" {
+		sqlQ += " AND o.type = ?"
+		args = append(args, opts.Type)
+	}
+	if opts.Project != "" {
+		sqlQ += " AND LOWER(o.project) = ?"
+		args = append(args, opts.Project)
+	}
+	if opts.Scope != "" {
+		sqlQ += " AND o.scope = ?"
+		args = append(args, normalizeScope(opts.Scope))
+	}
+
+	sqlQ += " ORDER BY rank LIMIT ?"
+	return sqlQ, append(args, limit)
 }
 
 // ─── Stats ───────────────────────────────────────────────────────────────────
