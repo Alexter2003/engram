@@ -399,12 +399,12 @@ func TestJudgeRelation_HappyPath(t *testing.T) {
 
 	confidence := 0.9
 	judged, err := s.JudgeRelation(JudgeRelationParams{
-		JudgmentID:     relSyncID,
-		Relation:       "not_conflict",
-		Confidence:     &confidence,
-		MarkedByActor:  "agent:claude-sonnet-4-6",
-		MarkedByKind:   "agent",
-		MarkedByModel:  "claude-sonnet-4-6",
+		JudgmentID:    relSyncID,
+		Relation:      "not_conflict",
+		Confidence:    &confidence,
+		MarkedByActor: "agent:claude-sonnet-4-6",
+		MarkedByKind:  "agent",
+		MarkedByModel: "claude-sonnet-4-6",
 	})
 	if err != nil {
 		t.Fatalf("JudgeRelation: %v", err)
@@ -611,14 +611,14 @@ func TestProvenance_FullRowPersisted(t *testing.T) {
 	evidence := `{"basis":"title overlap"}`
 	reason := "titles are nearly identical"
 	judged, err := s.JudgeRelation(JudgeRelationParams{
-		JudgmentID:     relSyncID,
-		Relation:       "compatible",
-		Confidence:     &confidence,
-		Evidence:       &evidence,
-		Reason:         &reason,
-		MarkedByActor:  "agent:claude-sonnet-4-6",
-		MarkedByKind:   "agent",
-		MarkedByModel:  "claude-sonnet-4-6",
+		JudgmentID:    relSyncID,
+		Relation:      "compatible",
+		Confidence:    &confidence,
+		Evidence:      &evidence,
+		Reason:        &reason,
+		MarkedByActor: "agent:claude-sonnet-4-6",
+		MarkedByKind:  "agent",
+		MarkedByModel: "claude-sonnet-4-6",
 	})
 	if err != nil {
 		t.Fatalf("JudgeRelation: %v", err)
@@ -1396,6 +1396,34 @@ func TestGetRelationStats_EmptyProject(t *testing.T) {
 	}
 	if stats.DeferredCount != 0 || stats.DeadCount != 0 {
 		t.Errorf("expected DeferredCount=0 DeadCount=0; got %d %d", stats.DeferredCount, stats.DeadCount)
+	}
+}
+
+func TestGetRelationStats_ScopesDeferredCountsByProject(t *testing.T) {
+	s := newTestStore(t)
+	for _, row := range []struct {
+		syncID  string
+		project string
+		status  string
+	}{
+		{syncID: "deferred-alpha", project: "alpha", status: "deferred"},
+		{syncID: "dead-beta", project: "beta", status: "dead"},
+	} {
+		if _, err := s.db.Exec(`
+			INSERT INTO sync_apply_deferred
+				(sync_id, entity, payload, target_key, project, scope_class, apply_status, first_seen_at)
+			VALUES (?, 'relation', '{}', 'cloud', ?, 'scoped', ?, datetime('now'))
+		`, row.syncID, row.project, row.status); err != nil {
+			t.Fatalf("seed %s deferred row: %v", row.project, err)
+		}
+	}
+
+	stats, err := s.GetRelationStats("alpha")
+	if err != nil {
+		t.Fatalf("GetRelationStats alpha: %v", err)
+	}
+	if stats.DeferredCount != 1 || stats.DeadCount != 0 {
+		t.Fatalf("alpha deferred stats = deferred=%d dead=%d, want 1/0", stats.DeferredCount, stats.DeadCount)
 	}
 }
 
