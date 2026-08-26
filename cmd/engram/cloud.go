@@ -497,7 +497,8 @@ func cmdCloudUpgradeBootstrap(cfg store.Config) {
 		return
 	}
 	cc.ServerURL = validatedURL
-	if err := captureUpgradeSnapshotBeforeBootstrap(s, project); err != nil {
+	project, _, err = engramsync.CaptureUpgradeSnapshotBeforeBootstrap(s, project)
+	if err != nil {
 		fatal(err)
 		return
 	}
@@ -525,41 +526,6 @@ func cmdCloudUpgradeBootstrap(cfg store.Config) {
 	fmt.Printf("stage: %s\n", result.Stage)
 	fmt.Printf("resumed: %t\n", result.Resumed)
 	fmt.Printf("noop: %t\n", result.NoOp)
-}
-
-func captureUpgradeSnapshotBeforeBootstrap(s *store.Store, project string) error {
-	state, err := s.GetCloudUpgradeState(project)
-	if err != nil {
-		return fmt.Errorf("load cloud upgrade state before bootstrap snapshot: %w", err)
-	}
-	if state != nil {
-		if (state.Stage == store.UpgradeStageBootstrapEnrolled ||
-			state.Stage == store.UpgradeStageBootstrapPushed ||
-			state.Stage == store.UpgradeStageBootstrapVerified) &&
-			!state.Snapshot.Captured {
-			return fmt.Errorf("bootstrap checkpoint requires a captured pre-bootstrap snapshot")
-		}
-		if state.Snapshot.Captured {
-			return nil
-		}
-	}
-
-	enrolled, err := s.IsProjectEnrolled(project)
-	if err != nil {
-		return fmt.Errorf("load project enrollment before bootstrap snapshot: %w", err)
-	}
-
-	snapshot := store.CloudUpgradeSnapshot{Captured: true, ProjectEnrolled: enrolled}
-
-	next := store.CloudUpgradeState{Project: project, Stage: store.UpgradeStagePlanned, RepairClass: store.UpgradeRepairClassNone, Snapshot: snapshot}
-	if state != nil {
-		next = *state
-		next.Snapshot = snapshot
-	}
-	if err := s.SaveCloudUpgradeState(next); err != nil {
-		return fmt.Errorf("persist pre-bootstrap rollback snapshot: %w", err)
-	}
-	return nil
 }
 
 func cmdCloudUpgradeStatus(cfg store.Config) {

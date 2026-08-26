@@ -227,52 +227,17 @@ func NewCloudWithTransport(s *store.Store, transport Transport, project string) 
 }
 
 func BootstrapProject(s *store.Store, transport Transport, opts UpgradeBootstrapOptions) (*UpgradeBootstrapResult, error) {
-	if s == nil {
-		return nil, fmt.Errorf("cloud upgrade bootstrap requires store")
-	}
-	project, _ := store.NormalizeProject(opts.Project)
-	project = strings.TrimSpace(project)
-	if project == "" {
-		return nil, fmt.Errorf("cloud upgrade bootstrap requires project")
+	project, state, err := CaptureUpgradeSnapshotBeforeBootstrap(s, opts.Project)
+	if err != nil {
+		return nil, err
 	}
 	createdBy := strings.TrimSpace(opts.CreatedBy)
 	if createdBy == "" {
 		createdBy = "upgrade-bootstrap"
 	}
 
-	state, err := s.GetCloudUpgradeState(project)
-	if err != nil {
-		return nil, fmt.Errorf("read cloud upgrade checkpoint: %w", err)
-	}
 	currentStage := store.UpgradeStagePlanned
 	if state != nil {
-		currentStage = state.Stage
-	}
-	if state != nil &&
-		(currentStage == store.UpgradeStageBootstrapEnrolled ||
-			currentStage == store.UpgradeStageBootstrapPushed ||
-			currentStage == store.UpgradeStageBootstrapVerified) &&
-		!state.Snapshot.Captured {
-		return nil, fmt.Errorf("bootstrap checkpoint requires a captured pre-bootstrap snapshot")
-	}
-	if state == nil || !state.Snapshot.Captured {
-		enrolled, err := s.IsProjectEnrolled(project)
-		if err != nil {
-			return nil, fmt.Errorf("load project enrollment before bootstrap snapshot: %w", err)
-		}
-		next := store.CloudUpgradeState{
-			Project:     project,
-			Stage:       store.UpgradeStagePlanned,
-			RepairClass: store.UpgradeRepairClassNone,
-		}
-		if state != nil {
-			next = *state
-		}
-		next.Snapshot = store.CloudUpgradeSnapshot{Captured: true, ProjectEnrolled: enrolled}
-		if err := s.SaveCloudUpgradeState(next); err != nil {
-			return nil, fmt.Errorf("persist pre-bootstrap rollback snapshot: %w", err)
-		}
-		state = &next
 		currentStage = state.Stage
 	}
 	if currentStage == store.UpgradeStageBootstrapVerified {
@@ -342,6 +307,56 @@ func BootstrapProject(s *store.Store, transport Transport, opts UpgradeBootstrap
 		Resumed: resumed,
 		NoOp:    false,
 	}, nil
+}
+
+// CaptureUpgradeSnapshotBeforeBootstrap persists the enrollment state needed to
+// roll back a bootstrap attempt and rejects unsafe post-effect checkpoints.
+func CaptureUpgradeSnapshotBeforeBootstrap(s *store.Store, project string) (string, *store.CloudUpgradeState, error) {
+	if s == nil {
+		return "", nil, fmt.Errorf("cloud upgrade bootstrap requires store")
+	}
+	project, _ = store.NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return "", nil, fmt.Errorf("cloud upgrade bootstrap requires project")
+	}
+
+	state, err := s.GetCloudUpgradeState(project)
+	if err != nil {
+		return "", nil, fmt.Errorf("read cloud upgrade checkpoint: %w", err)
+	}
+	currentStage := store.UpgradeStagePlanned
+	if state != nil {
+		currentStage = state.Stage
+	}
+	if state != nil &&
+		(currentStage == store.UpgradeStageBootstrapEnrolled ||
+			currentStage == store.UpgradeStageBootstrapPushed ||
+			currentStage == store.UpgradeStageBootstrapVerified) &&
+		!state.Snapshot.Captured {
+		return "", nil, fmt.Errorf("bootstrap checkpoint requires a captured pre-bootstrap snapshot")
+	}
+	if state != nil && state.Snapshot.Captured {
+		return project, state, nil
+	}
+
+	enrolled, err := s.IsProjectEnrolled(project)
+	if err != nil {
+		return "", nil, fmt.Errorf("load project enrollment before bootstrap snapshot: %w", err)
+	}
+	next := store.CloudUpgradeState{
+		Project:     project,
+		Stage:       store.UpgradeStagePlanned,
+		RepairClass: store.UpgradeRepairClassNone,
+	}
+	if state != nil {
+		next = *state
+	}
+	next.Snapshot = store.CloudUpgradeSnapshot{Captured: true, ProjectEnrolled: enrolled}
+	if err := s.SaveCloudUpgradeState(next); err != nil {
+		return "", nil, fmt.Errorf("persist pre-bootstrap rollback snapshot: %w", err)
+	}
+	return project, &next, nil
 }
 
 func upgradeStageOrder(stage string) int {

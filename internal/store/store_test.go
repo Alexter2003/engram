@@ -2800,8 +2800,8 @@ func TestRollbackCloudUpgradeSafetyBoundary(t *testing.T) {
 			t.Fatalf("seed uncaptured checkpoint: %v", err)
 		}
 
-		if _, err := s.RollbackCloudUpgrade("rb-uncaptured"); err == nil {
-			t.Fatal("expected rollback with an uncaptured snapshot to fail")
+		if _, err := s.RollbackCloudUpgrade("rb-uncaptured"); err == nil || !strings.Contains(err.Error(), "rollback requires a captured pre-bootstrap snapshot") {
+			t.Fatalf("expected snapshot-specific rollback failure, got %v", err)
 		}
 		enrolled, err := s.IsProjectEnrolled("rb-uncaptured")
 		if err != nil {

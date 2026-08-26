@@ -980,6 +980,15 @@ func TestCmdCloudUpgradeDoctorRequiresProjectAndIsDeterministic(t *testing.T) {
 		if !strings.Contains(bootstrapStderr, "legacy mutation payloads require repair") {
 			t.Fatalf("expected actionable legacy-repair guidance, got %q", bootstrapStderr)
 		}
+		capturedState, err := store.New(cfg)
+		if err != nil {
+			t.Fatalf("reopen store after bootstrap preflight: %v", err)
+		}
+		defer capturedState.Close()
+		state, err := capturedState.GetCloudUpgradeState("proj-legacy")
+		if err != nil || state == nil || !state.Snapshot.Captured || !state.Snapshot.ProjectEnrolled {
+			t.Fatalf("bootstrap must capture enrollment before legacy diagnosis: state=%+v err=%v", state, err)
+		}
 	})
 }
 

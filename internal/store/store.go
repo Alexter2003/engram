@@ -1232,7 +1232,10 @@ func (s *Store) RollbackCloudUpgrade(project string) (CloudUpgradeState, error) 
 	if state == nil {
 		return CloudUpgradeState{}, fmt.Errorf("rollback requires existing upgrade checkpoint state")
 	}
-	if !state.Snapshot.Captured || state.Stage == UpgradeStageBootstrapVerified {
+	if !state.Snapshot.Captured {
+		return CloudUpgradeState{}, fmt.Errorf("rollback requires a captured pre-bootstrap snapshot")
+	}
+	if state.Stage == UpgradeStageBootstrapVerified {
 		return CloudUpgradeState{}, fmt.Errorf("rollback is unavailable post-bootstrap; use explicit disconnect/unenroll flows")
 	}
 
