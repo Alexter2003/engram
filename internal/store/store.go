@@ -4055,6 +4055,8 @@ func (s *Store) QuarantineIrreparableSyncMutations(project string, apply bool) (
 	project = strings.TrimSpace(project)
 	report := SyncMutationQuarantineReport{Project: project, Applied: apply, Actions: []SyncMutationQuarantineAction{}}
 	err := s.withTx(func(tx *sql.Tx) error {
+		affectedProjects := map[string]struct{}{}
+		quarantinedAny := false
 		query := `SELECT seq, target_key, entity, entity_key, op, payload, source, project, occurred_at, acked_at
 			FROM sync_mutations WHERE target_key = ? AND acked_at IS NULL AND disposition = 'pending'`
 		args := []any{DefaultSyncTargetKey}
@@ -4089,11 +4091,41 @@ func (s *Store) QuarantineIrreparableSyncMutations(project string, apply bool) (
 			if !apply {
 				continue
 			}
-			if _, err := s.execHook(tx, `UPDATE sync_mutations SET disposition = 'quarantined', disposition_reason = ?, disposition_evidence = ?, disposition_at = datetime('now') WHERE target_key = ? AND seq = ? AND acked_at IS NULL AND disposition = 'pending'`, action.ReasonCode, action.Evidence, DefaultSyncTargetKey, action.Seq); err != nil {
+			result, err := s.execHook(tx, `UPDATE sync_mutations SET disposition = 'quarantined', disposition_reason = ?, disposition_evidence = ?, disposition_at = datetime('now') WHERE target_key = ? AND seq = ? AND acked_at IS NULL AND disposition = 'pending'`, action.ReasonCode, action.Evidence, DefaultSyncTargetKey, action.Seq)
+			if err != nil {
+				return err
+			}
+			updated, err := result.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if updated == 0 {
+				continue
+			}
+			quarantinedAny = true
+			mutation.Project, _ = NormalizeProject(mutation.Project)
+			if mutation.Project = strings.TrimSpace(mutation.Project); mutation.Project != "" {
+				affectedProjects[mutation.Project] = struct{}{}
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if !apply || !quarantinedAny {
+			return nil
+		}
+		if err := s.refreshSyncLifecycleTx(tx, DefaultSyncTargetKey); err != nil {
+			return err
+		}
+		for affectedProject := range affectedProjects {
+			if err := s.refreshSyncLifecycleTx(tx, syncTargetKeyForProject(affectedProject)); err != nil {
 				return err
 			}
 		}
-		return rows.Err()
+		return nil
 	})
 	if err != nil {
 		return SyncMutationQuarantineReport{}, fmt.Errorf("quarantine irreparable sync mutations: %w", err)
@@ -4419,6 +4451,31 @@ func (s *Store) refreshProjectSyncStateTx(tx *sql.Tx, project string) error {
 			maxEnqueuedSeq, maxAckedSeq, lifecycle, projectTargetKey,
 		)
 	}
+	return err
+}
+
+// refreshSyncLifecycleTx derives a target lifecycle from its remaining transportable mutations.
+func (s *Store) refreshSyncLifecycleTx(tx *sql.Tx, targetKey string) error {
+	targetKey = normalizeSyncTargetKey(targetKey)
+	state, err := s.getSyncStateTx(tx, targetKey)
+	if err != nil {
+		return err
+	}
+	var pendingCount int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE target_key = ? AND acked_at IS NULL AND disposition = 'pending'`, targetKey).Scan(&pendingCount); err != nil {
+		return err
+	}
+	lifecycle := SyncLifecycleHealthy
+	if pendingCount > 0 {
+		lifecycle = SyncLifecyclePending
+	}
+	if isActivelyDegradedState(state, time.Now().UTC()) {
+		lifecycle = SyncLifecycleDegraded
+	}
+	if lifecycle == state.Lifecycle {
+		return nil
+	}
+	_, err = s.execHook(tx, `UPDATE sync_state SET lifecycle = ?, updated_at = datetime('now') WHERE target_key = ?`, lifecycle, targetKey)
 	return err
 }
 

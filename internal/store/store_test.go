@@ -7615,6 +7615,86 @@ func TestQuarantineIrreparableSyncMutationsPreservesJournalAndUnblocksTransport(
 	}
 }
 
+func TestQuarantineIrreparableSyncMutationsRefreshesAffectedLifecycles(t *testing.T) {
+	t.Run("clears stale default and project lifecycle", func(t *testing.T) {
+		s := newTestStore(t)
+		const payload = `{"id":"poison"}`
+		if _, err := s.db.Exec(`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES ('cloud', 'session', 'poison', 'upsert', ?, 'local', 'project-a')`, payload); err != nil {
+			t.Fatalf("seed poison mutation: %v", err)
+		}
+		var seq int64
+		if err := s.db.QueryRow(`SELECT seq FROM sync_mutations WHERE entity_key = 'poison'`).Scan(&seq); err != nil {
+			t.Fatalf("read poison sequence: %v", err)
+		}
+		if err := s.MarkSyncPending(DefaultSyncTargetKey); err != nil {
+			t.Fatalf("mark default pending: %v", err)
+		}
+		if err := s.MarkSyncPending(syncTargetKeyForProject("project-a")); err != nil {
+			t.Fatalf("mark project pending: %v", err)
+		}
+
+		report, err := s.QuarantineIrreparableSyncMutations("project-a", true)
+		if err != nil || len(report.Actions) != 1 {
+			t.Fatalf("apply report=%+v err=%v", report, err)
+		}
+		var gotSeq int64
+		var gotPayload, evidence string
+		var ackedAt sql.NullString
+		if err := s.db.QueryRow(`SELECT seq, payload, disposition_evidence, acked_at FROM sync_mutations WHERE entity_key = 'poison'`).Scan(&gotSeq, &gotPayload, &evidence, &ackedAt); err != nil {
+			t.Fatalf("read quarantined mutation: %v", err)
+		}
+		if gotSeq != seq || gotPayload != payload || evidence == "" || ackedAt.Valid {
+			t.Fatalf("quarantine changed mutation audit data: seq=%d payload=%q evidence=%q acked=%v", gotSeq, gotPayload, evidence, ackedAt)
+		}
+		for _, targetKey := range []string{DefaultSyncTargetKey, syncTargetKeyForProject("project-a")} {
+			state, err := s.GetSyncState(targetKey)
+			if err != nil || state.Lifecycle != SyncLifecycleHealthy || state.LastAckedSeq != 0 {
+				t.Fatalf("state for %q = %+v, err=%v", targetKey, state, err)
+			}
+		}
+
+		again, err := s.QuarantineIrreparableSyncMutations("project-a", true)
+		if err != nil || len(again.Actions) != 0 {
+			t.Fatalf("repeat report=%+v err=%v", again, err)
+		}
+		var repeatedEvidence string
+		if err := s.db.QueryRow(`SELECT disposition_evidence FROM sync_mutations WHERE entity_key = 'poison'`).Scan(&repeatedEvidence); err != nil || repeatedEvidence != evidence {
+			t.Fatalf("repeat changed evidence=%q err=%v", repeatedEvidence, err)
+		}
+	})
+
+	t.Run("preserves pending lifecycle and refreshes only quarantined project", func(t *testing.T) {
+		s := newTestStore(t)
+		for _, mutation := range []struct{ key, project, payload string }{
+			{key: "poison", project: "project-a", payload: `{"id":"poison"}`},
+			{key: "pending", project: "project-b", payload: `{"id":"pending","project":"project-b"}`},
+		} {
+			if _, err := s.db.Exec(`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES ('cloud', 'session', ?, 'upsert', ?, 'local', ?)`, mutation.key, mutation.payload, mutation.project); err != nil {
+				t.Fatalf("seed %s mutation: %v", mutation.key, err)
+			}
+		}
+		for _, targetKey := range []string{DefaultSyncTargetKey, syncTargetKeyForProject("project-a"), syncTargetKeyForProject("project-b")} {
+			if err := s.MarkSyncPending(targetKey); err != nil {
+				t.Fatalf("mark %q pending: %v", targetKey, err)
+			}
+		}
+
+		if _, err := s.QuarantineIrreparableSyncMutations("project-a", true); err != nil {
+			t.Fatalf("quarantine project-a: %v", err)
+		}
+		for _, targetKey := range []string{DefaultSyncTargetKey, syncTargetKeyForProject("project-b")} {
+			state, err := s.GetSyncState(targetKey)
+			if err != nil || state.Lifecycle != SyncLifecyclePending {
+				t.Fatalf("state for %q = %+v, err=%v", targetKey, state, err)
+			}
+		}
+		state, err := s.GetSyncState(syncTargetKeyForProject("project-a"))
+		if err != nil || state.Lifecycle != SyncLifecycleHealthy {
+			t.Fatalf("affected project state=%+v err=%v", state, err)
+		}
+	})
+}
+
 func TestQuarantineIrreparableSyncMutationsFailsClosed(t *testing.T) {
 	s := newTestStore(t)
 	if _, err := s.db.Exec(`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES ('cloud', 'session', 'poison', 'upsert', '{"id":"poison"}', 'local', '')`); err != nil {
@@ -7633,6 +7713,34 @@ func TestQuarantineIrreparableSyncMutationsFailsClosed(t *testing.T) {
 	pending, err := s.ListPendingSyncMutations(DefaultSyncTargetKey, 10)
 	if err != nil || len(pending) != 1 || pending[0].EntityKey != "poison" {
 		t.Fatalf("failed quarantine transport pending=%+v err=%v", pending, err)
+	}
+}
+
+func TestQuarantineIrreparableSyncMutationsRollsBackWhenLifecycleRefreshFails(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.db.Exec(`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES ('cloud', 'session', 'poison', 'upsert', '{"id":"poison"}', 'local', 'project-a')`); err != nil {
+		t.Fatalf("seed mutation: %v", err)
+	}
+	if err := s.MarkSyncPending(DefaultSyncTargetKey); err != nil {
+		t.Fatalf("mark default pending: %v", err)
+	}
+	if err := s.MarkSyncPending(syncTargetKeyForProject("project-a")); err != nil {
+		t.Fatalf("mark project pending: %v", err)
+	}
+	if _, err := s.db.Exec(`CREATE TRIGGER reject_lifecycle_refresh BEFORE UPDATE OF lifecycle ON sync_state BEGIN SELECT RAISE(ABORT, 'lifecycle refresh blocked'); END`); err != nil {
+		t.Fatalf("create lifecycle refresh trigger: %v", err)
+	}
+
+	if _, err := s.QuarantineIrreparableSyncMutations("project-a", true); err == nil {
+		t.Fatal("expected lifecycle refresh error")
+	}
+	var disposition string
+	var evidence sql.NullString
+	if err := s.db.QueryRow(`SELECT disposition, disposition_evidence FROM sync_mutations WHERE entity_key = 'poison'`).Scan(&disposition, &evidence); err != nil {
+		t.Fatalf("read mutation after rollback: %v", err)
+	}
+	if disposition != SyncMutationDispositionPending || evidence.Valid {
+		t.Fatalf("refresh failure did not roll back quarantine: disposition=%q evidence=%v", disposition, evidence)
 	}
 }
 
