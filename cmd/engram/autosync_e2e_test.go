@@ -342,6 +342,10 @@ func (s *autosyncFakeStore) MarkSyncBlocked(_, _, _ string) error { return nil }
 
 func (s *autosyncFakeStore) MarkSyncHealthy(_ string) error { return nil }
 
+func (s *autosyncFakeStore) ListDeferredProjectsForTarget(_ string) ([]string, error) {
+	return nil, nil
+}
+
 // Phase E: deferred replay stubs — no-ops for the E2E fake store.
 func (s *autosyncFakeStore) ReplayDeferredForScope(_, _ string) (store.ReplayDeferredResult, error) {
 	return store.ReplayDeferredResult{}, nil

@@ -20,6 +20,7 @@ import (
 	"math"
 	"math/rand"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -89,6 +90,7 @@ type LocalStore interface {
 	MarkSyncFailure(targetKey, message string, backoffUntil time.Time) error
 	MarkSyncBlocked(targetKey, reasonCode, message string) error
 	MarkSyncHealthy(targetKey string) error
+	ListDeferredProjectsForTarget(targetKey string) ([]string, error)
 	ReplayDeferredForScope(targetKey, project string) (store.ReplayDeferredResult, error)
 	CountDeferredAndDeadForScope(targetKey, project string) (deferred, dead int, err error)
 }
@@ -620,6 +622,24 @@ func (m *Manager) pull(ctx context.Context) error {
 			break
 		}
 	}
+
+	pendingProjects, err := m.store.ListDeferredProjectsForTarget(m.cfg.TargetKey)
+	if err != nil {
+		log.Printf("[autosync] list deferred projects target=%q error: %v", m.cfg.TargetKey, err)
+	} else {
+		for _, project := range pendingProjects {
+			project = strings.TrimSpace(project)
+			if project == "" {
+				continue
+			}
+			if _, seen := touchedProjects[project]; seen {
+				continue
+			}
+			touchedProjects[project] = struct{}{}
+			projectOrder = append(projectOrder, project)
+		}
+	}
+	sort.Strings(projectOrder)
 
 	for _, project := range projectOrder {
 		if res, err := m.store.ReplayDeferredForScope(m.cfg.TargetKey, project); err != nil {

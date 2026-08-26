@@ -6925,6 +6925,35 @@ func (s *Store) ReplayDeferred() (ReplayDeferredResult, error) {
 	return s.ReplayDeferredForScope("", "")
 }
 
+func (s *Store) ListDeferredProjectsForTarget(targetKey string) ([]string, error) {
+	rows, err := s.db.Query(`
+		SELECT DISTINCT project
+		FROM sync_apply_deferred
+		WHERE target_key = ?
+		  AND scope_class = 'scoped'
+		  AND apply_status = 'deferred'
+		  AND project != ''
+		ORDER BY project
+	`, normalizeSyncTargetKey(targetKey))
+	if err != nil {
+		return nil, fmt.Errorf("ListDeferredProjectsForTarget: query: %w", err)
+	}
+	defer rows.Close()
+
+	projects := make([]string, 0)
+	for rows.Next() {
+		var project string
+		if err := rows.Scan(&project); err != nil {
+			return nil, fmt.Errorf("ListDeferredProjectsForTarget: scan: %w", err)
+		}
+		projects = append(projects, project)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ListDeferredProjectsForTarget: rows: %w", err)
+	}
+	return projects, nil
+}
+
 // ReplayDeferredForScope retries deferred rows for one sync target and optional
 // project. An empty project includes all safely target-scoped rows for that target;
 // an empty target is reserved for ReplayDeferred's administrative global replay.

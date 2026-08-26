@@ -721,6 +721,40 @@ func TestReplayDeferredForScope_IsolatesTargetAndProject(t *testing.T) {
 	}
 }
 
+func TestListDeferredProjectsForTargetScopesAndOrders(t *testing.T) {
+	s, syncA, _ := setupSyncApplyStore(t)
+	payload := func(syncID, project string) string {
+		encoded, err := json.Marshal(syncRelationPayload{
+			SyncID: syncID, SourceID: syncA, TargetID: "obs-missing-" + syncID,
+			Relation: RelationRelated, JudgmentStatus: JudgmentStatusJudged, Project: project,
+		})
+		if err != nil {
+			t.Fatalf("marshal payload: %v", err)
+		}
+		return string(encoded)
+	}
+	insertScopedDeferredRow(t, s, "rel-project-b-1", payload("rel-project-b-1", "project-b"), "cloud", "project-b", 0)
+	insertScopedDeferredRow(t, s, "rel-project-a", payload("rel-project-a", "project-a"), "cloud", "project-a", 0)
+	insertScopedDeferredRow(t, s, "rel-project-b-2", payload("rel-project-b-2", "project-b"), "cloud", "project-b", 1)
+	insertScopedDeferredRow(t, s, "rel-other-target", payload("rel-other-target", "project-c"), "cloud:project-c", "project-c", 0)
+	if _, err := s.db.Exec(`
+		INSERT INTO sync_apply_deferred
+			(sync_id, entity, payload, target_key, project, scope_class, apply_status, first_seen_at)
+		VALUES ('rel-dead', 'relation', '{}', 'cloud', 'project-dead', 'scoped', 'dead', datetime('now'))
+	`); err != nil {
+		t.Fatalf("insert dead scoped deferred: %v", err)
+	}
+	insertDeferredRow(t, s, "rel-legacy", SyncEntityRelation, "{}", 0, "deferred")
+
+	projects, err := s.ListDeferredProjectsForTarget("CLOUD")
+	if err != nil {
+		t.Fatalf("ListDeferredProjectsForTarget: %v", err)
+	}
+	if got, want := fmt.Sprint(projects), "[project-a project-b]"; got != want {
+		t.Fatalf("projects = %s, want %s", got, want)
+	}
+}
+
 // TestApplyPulledMutation_DeferredOnFKMiss: ApplyPulledMutation for relation FK miss
 // writes to sync_apply_deferred and returns nil (cursor can advance).
 func TestApplyPulledMutation_DeferredOnFKMiss(t *testing.T) {
