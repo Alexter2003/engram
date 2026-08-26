@@ -206,3 +206,31 @@ func TestInvalidSessionIdentityCheckReportsSourceReferencesAndJournal(t *testing
 		t.Fatalf("repair plan=%+v", plan)
 	}
 }
+
+func TestInvalidSessionIdentityEvidenceAttributesOnlyMatchingJournalMutations(t *testing.T) {
+	s := newDiagnosticTestStore(t)
+	if _, err := s.DB().Exec(`
+		INSERT INTO sessions (id, project, directory) VALUES ('', 'engram', '/tmp/empty');
+		INSERT INTO sessions (id, project, directory) VALUES (' ', 'engram', '/tmp/space');
+		INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES
+			('cloud', 'session', '', 'upsert', 'not json', 'local', 'engram'),
+			('cloud', 'session', 'valid-key', 'upsert', '{"id":"","directory":"/tmp"}', 'local', 'engram'),
+			('cloud', 'session', ' ', 'upsert', '{"id":"other","directory":"/tmp"}', 'local', 'engram'),
+			('cloud', 'session', 'other', 'upsert', '{"id":" ","directory":"/tmp"}', 'local', 'engram'),
+			('cloud', 'session', 'unrelated', 'upsert', '{"id":"different","directory":"/tmp"}', 'local', 'engram');
+	`); err != nil {
+		t.Fatalf("seed invalid session journal: %v", err)
+	}
+
+	evidence, err := s.ListInvalidSessionIdentityEvidence("engram")
+	if err != nil {
+		t.Fatalf("ListInvalidSessionIdentityEvidence: %v", err)
+	}
+	counts := make(map[string]int64, len(evidence))
+	for _, item := range evidence {
+		counts[item.SessionID] = item.InvalidJournalCount
+	}
+	if counts[""] != 2 || counts[" "] != 2 {
+		t.Fatalf("invalid journal counts=%v, want empty=2 whitespace=2", counts)
+	}
+}

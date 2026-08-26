@@ -3384,6 +3384,9 @@ func TestSessionStartRejectsEmptyID(t *testing.T) {
 	if !res.IsError || !strings.Contains(callResultText(t, res), "session id is required") {
 		t.Fatalf("result isError=%v text=%q, want clear required-id error", res.IsError, callResultText(t, res))
 	}
+	if _, err := s.GetSession(" \t"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("whitespace session was persisted: %v", err)
+	}
 	if _, err := s.GetSession(""); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("empty session was persisted: %v", err)
 	}

@@ -139,33 +139,75 @@ func (s *Store) ListInvalidSessionIdentityEvidence(project string) ([]InvalidSes
 		return nil, err
 	}
 
+	type sessionMutationIdentity struct {
+		entityKey string
+		payloadID string
+		invalid   bool
+	}
+	mutationQuery := `SELECT entity_key, payload FROM sync_mutations WHERE entity = ?`
+	mutationArgs := []any{SyncEntitySession}
+	if project != "" {
+		mutationQuery += ` AND project = ?`
+		mutationArgs = append(mutationArgs, project)
+	}
+	mutationRows, err := s.queryItHook(s.db, mutationQuery, mutationArgs...)
+	if err != nil {
+		return nil, err
+	}
+	mutations := make([]sessionMutationIdentity, 0)
+	for mutationRows.Next() {
+		var mutation sessionMutationIdentity
+		var payloadRaw string
+		if err := mutationRows.Scan(&mutation.entityKey, &payloadRaw); err != nil {
+			return nil, closeRowsWithError(mutationRows, err)
+		}
+		var payload syncSessionPayload
+		if err := decodeSyncPayload([]byte(payloadRaw), &payload); err != nil {
+			mutation.invalid = true
+		} else {
+			mutation.payloadID = payload.ID
+			mutation.invalid = validateSessionMutationIdentity(payload.ID, mutation.entityKey) != nil
+		}
+		mutations = append(mutations, mutation)
+	}
+	if err := mutationRows.Close(); err != nil {
+		return nil, err
+	}
+	if err := mutationRows.Err(); err != nil {
+		return nil, err
+	}
+
+	evidenceBySessionID := make(map[string]int, len(evidence))
+	for i := range evidence {
+		evidenceBySessionID[evidence[i].SessionID] = i
+	}
+	for _, mutation := range mutations {
+		if !mutation.invalid {
+			continue
+		}
+		matched := make(map[int]struct{}, 2)
+		if i, ok := evidenceBySessionID[mutation.entityKey]; ok {
+			matched[i] = struct{}{}
+		}
+		if i, ok := evidenceBySessionID[mutation.payloadID]; ok {
+			matched[i] = struct{}{}
+		}
+		if len(matched) == 0 && strings.TrimSpace(mutation.entityKey) == "" && strings.TrimSpace(mutation.payloadID) == "" {
+			if i, ok := evidenceBySessionID[""]; ok {
+				matched[i] = struct{}{}
+			}
+		}
+		for i := range matched {
+			evidence[i].InvalidJournalCount++
+		}
+	}
+
 	for i := range evidence {
 		item := &evidence[i]
 		if err := s.db.QueryRow(`SELECT COUNT(*) FROM observations WHERE session_id = ?`, item.SessionID).Scan(&item.ObservationCount); err != nil {
 			return nil, err
 		}
 		if err := s.db.QueryRow(`SELECT COUNT(*) FROM user_prompts WHERE session_id = ?`, item.SessionID).Scan(&item.PromptCount); err != nil {
-			return nil, err
-		}
-		mutationRows, err := s.queryItHook(s.db, `SELECT entity_key, payload FROM sync_mutations WHERE entity = ? AND project = ?`, SyncEntitySession, item.Project)
-		if err != nil {
-			return nil, err
-		}
-		for mutationRows.Next() {
-			var entityKey, payloadRaw string
-			if err := mutationRows.Scan(&entityKey, &payloadRaw); err != nil {
-				_ = mutationRows.Close()
-				return nil, err
-			}
-			var payload syncSessionPayload
-			if err := decodeSyncPayload([]byte(payloadRaw), &payload); err != nil || validateSessionMutationIdentity(payload.ID, entityKey) != nil {
-				item.InvalidJournalCount++
-			}
-		}
-		if err := mutationRows.Close(); err != nil {
-			return nil, err
-		}
-		if err := mutationRows.Err(); err != nil {
 			return nil, err
 		}
 	}

@@ -176,7 +176,7 @@ func (c InvalidSessionIdentityCheck) Run(ctx context.Context, scope Scope) (Chec
 		findings = append(findings, Finding{
 			CheckID:              c.Code(),
 			Severity:             SeverityBlocking,
-			ReasonCode:           "invalid_session_identity",
+			ReasonCode:           CheckInvalidSessionIdentity,
 			Message:              "Session source ID is empty; affected references and journal entries cannot be repaired without an explicit canonical session ID.",
 			Why:                  "An empty session ID is not accepted by cloud replication and re-emitting it would preserve corrupt identity data.",
 			Evidence:             mustJSON(item),

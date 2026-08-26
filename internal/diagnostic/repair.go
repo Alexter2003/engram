@@ -90,7 +90,7 @@ func BuildRepairPlan(ctx context.Context, scope Scope, report Report, check stri
 func planInvalidSessionIdentityRepair(plan *RepairPlan, report Report) {
 	for _, check := range report.Checks {
 		for _, finding := range check.Findings {
-			if finding.ReasonCode != "invalid_session_identity" {
+			if finding.ReasonCode != CheckInvalidSessionIdentity {
 				continue
 			}
 			plan.Skipped = append(plan.Skipped, RepairSkip{
