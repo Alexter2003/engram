@@ -164,6 +164,15 @@ func (s *fakeLocalStore) CountDeferredAndDeadForScope(_, _ string) (int, int, er
 	return 0, 0, nil
 }
 
+type fakeLocalStoreWithRepairError struct {
+	*fakeLocalStore
+	repairErr error
+}
+
+func (s *fakeLocalStoreWithRepairError) EnsureEnrolledProjectSyncMutations(context.Context) error {
+	return s.repairErr
+}
+
 // ─── Fake Transport ───────────────────────────────────────────────────────────
 
 type fakeCloudTransport struct {
@@ -606,6 +615,55 @@ func TestManagerPushPersistsProjectIsolationAcrossStoreRestart(t *testing.T) {
 	}
 	if len(pending) != 0 {
 		t.Fatalf("expected retry to ack remaining alpha mutation, got %+v", pending)
+	}
+}
+
+func TestManagerPushRepairsEnrolledJournalBeforeListingMutations(t *testing.T) {
+	cfg, err := store.DefaultConfig()
+	if err != nil {
+		t.Fatalf("store default config: %v", err)
+	}
+	cfg.DataDir = t.TempDir()
+	local, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer local.Close() //nolint:errcheck
+
+	if err := local.CreateSession("legacy-session", "legacy-project", "/tmp/legacy-project"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := local.EnrollProject("legacy-project"); err != nil {
+		t.Fatalf("enroll project: %v", err)
+	}
+	if _, err := local.DB().Exec(`DELETE FROM sync_mutations WHERE project = ?`, "legacy-project"); err != nil {
+		t.Fatalf("remove journal entries to simulate legacy store: %v", err)
+	}
+
+	transport := newFakeTransport()
+	transport.pushResult = &PushMutationsResult{AcceptedSeqs: []int64{1}}
+	if err := New(local, transport, DefaultConfig()).push(context.Background()); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if len(transport.pushed) != 1 || len(transport.pushed[0]) != 1 || transport.pushed[0][0].Entity != store.SyncEntitySession {
+		t.Fatalf("pushed mutations = %+v, want repaired session mutation", transport.pushed)
+	}
+}
+
+func TestManagerPushReturnsRepairErrorBeforeTransport(t *testing.T) {
+	local := &fakeLocalStoreWithRepairError{
+		fakeLocalStore: newFakeLocalStore(),
+		repairErr:      errors.New("repair failed"),
+	}
+	local.mutations = []store.SyncMutation{{Seq: 1, Project: "project"}}
+	transport := newFakeTransport()
+
+	err := New(local, transport, DefaultConfig()).push(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "repair enrolled sync journal") {
+		t.Fatalf("push error = %v, want repair enrolled sync journal", err)
+	}
+	if calls := atomic.LoadInt32(&transport.pushCalls); calls != 0 {
+		t.Fatalf("transport push calls = %d, want 0", calls)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -5773,7 +5774,7 @@ func TestEnrollProjectBackfillsPromptDeleteTombstonesWithDerivedProject(t *testi
 	}
 }
 
-func TestNewRepairsSoftDeletedObservationDeleteMutationsForEnrolledProjects(t *testing.T) {
+func TestEnsureRepairsSoftDeletedObservationDeleteMutationsForEnrolledProjects(t *testing.T) {
 	dataDir := t.TempDir()
 	dbPath := filepath.Join(dataDir, "engram.db")
 
@@ -5872,6 +5873,9 @@ func TestNewRepairsSoftDeletedObservationDeleteMutationsForEnrolledProjects(t *t
 		t.Fatalf("new store: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
+	if err := s.EnsureEnrolledProjectSyncMutations(context.Background()); err != nil {
+		t.Fatalf("ensure enrolled sync journal: %v", err)
+	}
 
 	var op string
 	if err := s.db.QueryRow(
@@ -5886,7 +5890,7 @@ func TestNewRepairsSoftDeletedObservationDeleteMutationsForEnrolledProjects(t *t
 	}
 }
 
-func TestNewRepairsAlreadyEnrolledProjectsMissingHistoricalSyncMutations(t *testing.T) {
+func TestStoreNewDefersRepairUntilSynchronization(t *testing.T) {
 	dataDir := t.TempDir()
 	dbPath := filepath.Join(dataDir, "engram.db")
 
@@ -5987,6 +5991,20 @@ func TestNewRepairsAlreadyEnrolledProjectsMissingHistoricalSyncMutations(t *test
 		t.Fatalf("new store after enrolled legacy state: %v", err)
 	}
 
+	var beforeRepair int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_mutations`).Scan(&beforeRepair); err != nil {
+		_ = s.Close()
+		t.Fatalf("count mutations before deferred repair: %v", err)
+	}
+	if beforeRepair != 0 {
+		_ = s.Close()
+		t.Fatalf("Store.New repaired journal before synchronization: got %d mutations", beforeRepair)
+	}
+	if err := s.EnsureEnrolledProjectSyncMutations(context.Background()); err != nil {
+		_ = s.Close()
+		t.Fatalf("ensure enrolled sync journal: %v", err)
+	}
+
 	mutations, err := s.ListPendingSyncMutations(DefaultSyncTargetKey, 10)
 	if err != nil {
 		_ = s.Close()
@@ -6004,7 +6022,7 @@ func TestNewRepairsAlreadyEnrolledProjectsMissingHistoricalSyncMutations(t *test
 	}
 	if state.LastEnqueuedSeq != 3 {
 		_ = s.Close()
-		t.Fatalf("expected last_enqueued_seq 3 after automatic repair, got %d", state.LastEnqueuedSeq)
+		t.Fatalf("expected last_enqueued_seq 3 after deferred repair, got %d", state.LastEnqueuedSeq)
 	}
 
 	if err := s.Close(); err != nil {
@@ -7957,6 +7975,135 @@ func newTestStoreRaw(t *testing.T) *Store {
 		_ = s.Close()
 	})
 	return s
+}
+
+func TestEnsureEnrolledProjectSyncMutationsRetriesAfterFailure(t *testing.T) {
+	s := newTestStore(t)
+
+	calls := 0
+	s.repairOperation = func() error {
+		calls++
+		if calls == 1 {
+			return errors.New("repair failed")
+		}
+		return nil
+	}
+
+	if err := s.EnsureEnrolledProjectSyncMutations(context.Background()); err == nil || !strings.Contains(err.Error(), "repair failed") {
+		t.Fatalf("first ensure error = %v, want repair failure", err)
+	}
+	if err := s.EnsureEnrolledProjectSyncMutations(context.Background()); err != nil {
+		t.Fatalf("second ensure: %v", err)
+	}
+	if err := s.EnsureEnrolledProjectSyncMutations(context.Background()); err != nil {
+		t.Fatalf("memoized ensure: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("repair calls = %d, want 2 (failed attempt plus successful retry)", calls)
+	}
+}
+
+func TestEnsureEnrolledProjectSyncMutationsCanceledLeaderSkipsRepair(t *testing.T) {
+	s := newTestStore(t)
+
+	calls := 0
+	s.repairOperation = func() error {
+		calls++
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := s.EnsureEnrolledProjectSyncMutations(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled leader error = %v, want context.Canceled", err)
+	}
+	if calls != 0 {
+		t.Fatalf("repair calls = %d, want 0", calls)
+	}
+}
+
+func TestEnsureEnrolledProjectSyncMutationsSharesConcurrentFirstRepair(t *testing.T) {
+	s := newTestStore(t)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	calls := 0
+	s.repairOperation = func() error {
+		calls++
+		close(started)
+		<-release
+		return nil
+	}
+
+	const callers = 8
+	start := make(chan struct{})
+	errs := make(chan error, callers)
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errs <- s.EnsureEnrolledProjectSyncMutations(context.Background())
+		}()
+	}
+	close(start)
+	<-started
+	close(release)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent ensure: %v", err)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("repair calls = %d, want exactly one", calls)
+	}
+}
+
+func TestEnsureEnrolledProjectSyncMutationsWaiterReceivesSuccessfulInFlightResult(t *testing.T) {
+	s := newTestStore(t)
+	inFlight := &enrolledProjectRepair{done: make(chan struct{})}
+
+	s.repairMu.Lock()
+	s.repairInFlight = inFlight
+	s.repairMu.Unlock()
+
+	result := make(chan error, 1)
+	go func() { result <- s.EnsureEnrolledProjectSyncMutations(context.Background()) }()
+
+	s.repairMu.Lock()
+	close(inFlight.done)
+	s.repairMu.Unlock()
+	if err := <-result; err != nil {
+		t.Fatalf("successful waiter error = %v, want nil", err)
+	}
+}
+
+func TestEnsureEnrolledProjectSyncMutationsWaiterCanCancel(t *testing.T) {
+	s := newTestStore(t)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	s.repairOperation = func() error {
+		close(started)
+		<-release
+		return nil
+	}
+	leaderDone := make(chan error, 1)
+	go func() { leaderDone <- s.EnsureEnrolledProjectSyncMutations(context.Background()) }()
+	<-started
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := s.EnsureEnrolledProjectSyncMutations(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled waiter error = %v, want context.Canceled", err)
+	}
+	close(release)
+	if err := <-leaderDone; err != nil {
+		t.Fatalf("leader ensure: %v", err)
+	}
 }
 
 // countSyncMutations returns the total number of rows in sync_mutations for a project.

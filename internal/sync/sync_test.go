@@ -2109,6 +2109,29 @@ func TestCloudSyncEnrolledExportImportAndIdempotentPull(t *testing.T) {
 	}
 }
 
+func TestCloudExportRepairsEnrolledJournalBeforeListingMutations(t *testing.T) {
+	s := newTestStore(t)
+	seedStoreForSync(t, s)
+	if err := s.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll project: %v", err)
+	}
+	if _, err := s.DB().Exec(`DELETE FROM sync_mutations WHERE project = ?`, "proj-a"); err != nil {
+		t.Fatalf("remove journal entries to simulate legacy store: %v", err)
+	}
+
+	transport := newFakeCloudTransport()
+	result, err := NewCloudWithTransport(s, transport, "proj-a").Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("cloud export: %v", err)
+	}
+	if result.IsEmpty || result.MutationsExported != 3 {
+		t.Fatalf("export result = %+v, want three repaired mutations", result)
+	}
+	if transport.writeChunkCalls != 1 {
+		t.Fatalf("write chunk calls = %d, want 1", transport.writeChunkCalls)
+	}
+}
+
 func TestCloudExportUsesMutationJournalForUpdatesAndDeletes(t *testing.T) {
 	s := newTestStore(t)
 	transport := newFakeCloudTransport()

@@ -95,6 +95,10 @@ type LocalStore interface {
 	CountDeferredAndDeadForScope(targetKey, project string) (deferred, dead int, err error)
 }
 
+type enrolledProjectRepairEnsurer interface {
+	EnsureEnrolledProjectSyncMutations(ctx context.Context) error
+}
+
 type nonEnrolledPendingError struct {
 	counts []store.PendingSyncMutationProjectCount
 }
@@ -490,6 +494,11 @@ func (m *Manager) push(ctx context.Context) error {
 	}
 
 	m.setPhase(PhasePushing)
+	if repairer, ok := m.store.(enrolledProjectRepairEnsurer); ok {
+		if err := repairer.EnsureEnrolledProjectSyncMutations(ctx); err != nil {
+			return fmt.Errorf("repair enrolled sync journal: %w", err)
+		}
+	}
 
 	pending, err := m.store.ListPendingSyncMutations(m.cfg.TargetKey, m.cfg.PushBatchSize)
 	if err != nil {
