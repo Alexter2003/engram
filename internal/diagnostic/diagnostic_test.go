@@ -234,3 +234,41 @@ func TestInvalidSessionIdentityEvidenceAttributesOnlyMatchingJournalMutations(t 
 		t.Fatalf("invalid journal counts=%v, want empty=2 whitespace=2", counts)
 	}
 }
+
+func TestInvalidSessionIdentityEvidenceDoesNotAttributeUnmatchedWhitespaceIdentities(t *testing.T) {
+	s := newDiagnosticTestStore(t)
+	if _, err := s.DB().Exec(`
+		INSERT INTO sessions (id, project, directory) VALUES ('', 'engram', '/tmp/empty');
+		INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project)
+		VALUES ('cloud', 'session', char(9), 'upsert', '{"id":"\n","directory":"/tmp"}', 'local', 'engram');
+	`); err != nil {
+		t.Fatalf("seed unmatched whitespace journal: %v", err)
+	}
+
+	evidence, err := s.ListInvalidSessionIdentityEvidence("engram")
+	if err != nil {
+		t.Fatalf("ListInvalidSessionIdentityEvidence: %v", err)
+	}
+	if len(evidence) != 1 || evidence[0].InvalidJournalCount != 0 {
+		t.Fatalf("evidence=%+v, want one unassigned empty-session mutation", evidence)
+	}
+}
+
+func TestInvalidSessionIdentityEvidenceDoesNotAttributeMalformedPayloadWithoutExactKey(t *testing.T) {
+	s := newDiagnosticTestStore(t)
+	if _, err := s.DB().Exec(`
+		INSERT INTO sessions (id, project, directory) VALUES ('', 'engram', '/tmp/empty');
+		INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project)
+		VALUES ('cloud', 'session', 'nonmatching-key', 'upsert', 'not json', 'local', 'engram');
+	`); err != nil {
+		t.Fatalf("seed malformed session journal: %v", err)
+	}
+
+	evidence, err := s.ListInvalidSessionIdentityEvidence("engram")
+	if err != nil {
+		t.Fatalf("ListInvalidSessionIdentityEvidence: %v", err)
+	}
+	if len(evidence) != 1 || evidence[0].InvalidJournalCount != 0 {
+		t.Fatalf("evidence=%+v, want one unassigned malformed mutation", evidence)
+	}
+}

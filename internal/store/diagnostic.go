@@ -140,9 +140,10 @@ func (s *Store) ListInvalidSessionIdentityEvidence(project string) ([]InvalidSes
 	}
 
 	type sessionMutationIdentity struct {
-		entityKey string
-		payloadID string
-		invalid   bool
+		entityKey      string
+		payloadID      string
+		payloadDecoded bool
+		invalid        bool
 	}
 	mutationQuery := `SELECT entity_key, payload FROM sync_mutations WHERE entity = ?`
 	mutationArgs := []any{SyncEntitySession}
@@ -166,6 +167,7 @@ func (s *Store) ListInvalidSessionIdentityEvidence(project string) ([]InvalidSes
 			mutation.invalid = true
 		} else {
 			mutation.payloadID = payload.ID
+			mutation.payloadDecoded = true
 			mutation.invalid = validateSessionMutationIdentity(payload.ID, mutation.entityKey) != nil
 		}
 		mutations = append(mutations, mutation)
@@ -189,11 +191,8 @@ func (s *Store) ListInvalidSessionIdentityEvidence(project string) ([]InvalidSes
 		if i, ok := evidenceBySessionID[mutation.entityKey]; ok {
 			matched[i] = struct{}{}
 		}
-		if i, ok := evidenceBySessionID[mutation.payloadID]; ok {
-			matched[i] = struct{}{}
-		}
-		if len(matched) == 0 && strings.TrimSpace(mutation.entityKey) == "" && strings.TrimSpace(mutation.payloadID) == "" {
-			if i, ok := evidenceBySessionID[""]; ok {
+		if mutation.payloadDecoded {
+			if i, ok := evidenceBySessionID[mutation.payloadID]; ok {
 				matched[i] = struct{}{}
 			}
 		}
