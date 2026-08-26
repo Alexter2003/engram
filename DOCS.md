@@ -550,6 +550,7 @@ Inspect or replay the `sync_apply_deferred` queue.
 - `engram cloud upgrade rollback --project <project>` — restore pre-upgrade local snapshot before `bootstrap_verified`; blocked afterwards
 - `engram cloud repair materialize-mutations --project <project> (--dry-run|--apply)` — explicit server-side Postgres repair that backfills existing `cloud_mutations` into compatible `cloud_chunks` without deleting remote data
 - `engram cloud bootstrap admin --username <name> [--email <email>] [--grant-project <project>]... [--issue-token [name]]` — create the first managed admin (see [Managed users, tokens, and CLI bootstrap](#managed-users-tokens-and-cli-bootstrap))
+- `engram cloud bootstrap recover-token [--name <name>]` — recover the one stranded managed admin token state described below
 
 Cloud auth token is provided at runtime via `ENGRAM_CLOUD_TOKEN` (not by a dedicated CLI subcommand).
 Cloud server startup fails closed when the token is missing unless `ENGRAM_CLOUD_INSECURE_NO_AUTH=1` is explicitly set for local insecure development.
@@ -602,6 +603,14 @@ engram cloud bootstrap admin --username alice \
 - Running the command again once a managed admin already exists is rejected (no silent duplicate first-admin creation); the attempt is still recorded as a denied `bootstrap.cli` audit event.
 - Every bootstrap attempt (accepted or denied) writes a `bootstrap.cli` audit event to `cloud_auth_audit_log`, with the same non-secret metadata rules (no raw tokens, hashes, or bearer headers) as every other cloud auth audit event.
 - Grant/role/duplicate-admin validation reuses the exact same `cloudstore` methods and last-admin guard used by the dashboard's own first-admin bootstrap flow — there is no parallel/looser bootstrap path.
+
+If a historical failed bootstrap left exactly one enabled managed human admin, retained its grants, and created no principal token anywhere in the deployment, run the explicit recovery command:
+
+```bash
+engram cloud bootstrap recover-token --name replacement
+```
+
+It requires `ENGRAM_CLOUD_TOKEN_PEPPER`, preserves existing grants, and prints the recovered raw token exactly once only after the token and its `bootstrap.cli` recovery audit event commit together. It refuses all other states, including multiple enabled managed human admins or any existing principal token; it does not create users, grants, or partial tokens.
 
 **Runtime authentication:** `engram cloud serve` resolves managed tokens first, then falls back to the legacy env-token credentials (`ENGRAM_CLOUD_TOKEN` for sync, `ENGRAM_CLOUD_ADMIN` for dashboard bootstrap/admin), on every `/sync/*`, `/admin/*`, and dashboard-login request:
 
