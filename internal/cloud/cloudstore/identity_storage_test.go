@@ -416,6 +416,49 @@ func TestRecoverStrandedAdminTokenWithAuditRejectsUnsafeOrRepeatedState(t *testi
 	}
 }
 
+func TestRecoverStrandedAdminTokenWithAuditRejectsTokenOwnedByNonAdmin(t *testing.T) {
+	ctx := context.Background()
+	cs := openIsolatedCloudStore(t)
+	admin, err := cs.CreateFirstAdminHumanUser(ctx, CreateHumanUserParams{Username: "recovery-target", DisplayName: "Recovery Target"})
+	if err != nil {
+		t.Fatalf("CreateFirstAdminHumanUser: %v", err)
+	}
+	other, err := cs.CreatePrincipal(ctx, CreatePrincipalParams{Kind: PrincipalKindServiceAccount, DisplayName: "Recovery Member", Role: PrincipalRoleMember})
+	if err != nil {
+		t.Fatalf("CreatePrincipal non-admin token owner: %v", err)
+	}
+	existing, err := cs.CreatePrincipalToken(ctx, CreatePrincipalTokenParams{PrincipalID: other.ID, TokenPrefix: "egc_live_other", TokenHash: "hmac-sha256:v1:other", Name: "other", CreatedByPrincipalID: admin.PrincipalID})
+	if err != nil {
+		t.Fatalf("CreatePrincipalToken non-admin token owner: %v", err)
+	}
+
+	_, err = cs.RecoverStrandedAdminTokenWithAudit(ctx, RecoverStrandedAdminTokenParams{TokenPrefix: "egc_live_rejected", TokenHash: "hmac-sha256:v1:rejected"}, AuthAuditEvent{ActorSource: "bootstrap_cli", Action: "bootstrap.cli", Outcome: "success", Metadata: map[string]any{"recovered": true}})
+	if !errors.Is(err, ErrStrandedAdminRecoveryIneligible) {
+		t.Fatalf("expected ErrStrandedAdminRecoveryIneligible, got %v", err)
+	}
+	targetTokens, err := cs.ListPrincipalTokens(ctx, admin.PrincipalID)
+	if err != nil {
+		t.Fatalf("ListPrincipalTokens recovery target: %v", err)
+	}
+	if len(targetTokens) != 0 {
+		t.Fatalf("ineligible recovery must not create a target token, got %+v", targetTokens)
+	}
+	otherTokens, err := cs.ListPrincipalTokens(ctx, other.ID)
+	if err != nil {
+		t.Fatalf("ListPrincipalTokens non-admin token owner: %v", err)
+	}
+	if len(otherTokens) != 1 || otherTokens[0].ID != existing.ID || otherTokens[0].PrincipalID != other.ID || otherTokens[0].TokenPrefix != existing.TokenPrefix || otherTokens[0].Name != existing.Name || otherTokens[0].CreatedByPrincipalID != admin.PrincipalID || otherTokens[0].RevokedAt != nil {
+		t.Fatalf("ineligible recovery must preserve the non-admin token, got %+v want %+v", otherTokens, existing)
+	}
+	events, err := cs.ListAuthAuditEvents(ctx, AuthAuditQuery{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListAuthAuditEvents: %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("ineligible recovery must not write an audit event, got %+v", events)
+	}
+}
+
 func TestRecoverStrandedAdminTokenWithAuditRollsBackTokenWhenAuditFails(t *testing.T) {
 	ctx := context.Background()
 	cs := openIsolatedCloudStore(t)
