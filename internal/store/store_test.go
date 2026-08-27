@@ -8964,6 +8964,287 @@ func TestDeleteSession_EnrolledProjectEnqueuesSyncDeleteMutation(t *testing.T) {
 	}
 }
 
+func TestQuarantineIrreparableSyncMutationsPreservesJournalAndUnblocksTransport(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("repairable", "project", "/tmp/repairable"); err != nil {
+		t.Fatalf("create repairable session: %v", err)
+	}
+	for _, mutation := range []struct {
+		entity, key, op, payload, project string
+	}{
+		{SyncEntitySession, "poison", SyncOpUpsert, `{"id":"poison"}`, ""},
+		{SyncEntitySession, "later", SyncOpDelete, `{"id":"later"}`, ""},
+		{SyncEntitySession, "repairable", SyncOpUpsert, `{"id":"repairable"}`, "project"},
+	} {
+		if _, err := s.db.Exec(`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES (?, ?, ?, ?, ?, ?, ?)`, DefaultSyncTargetKey, mutation.entity, mutation.key, mutation.op, mutation.payload, SyncSourceLocal, mutation.project); err != nil {
+			t.Fatalf("seed mutation %s: %v", mutation.key, err)
+		}
+	}
+	var laterSeq int64
+	if err := s.db.QueryRow(`SELECT seq FROM sync_mutations WHERE entity_key = 'later'`).Scan(&laterSeq); err != nil {
+		t.Fatalf("read later sequence: %v", err)
+	}
+
+	dryRun, err := s.QuarantineIrreparableSyncMutations("", false)
+	if err != nil || len(dryRun.Actions) != 1 {
+		t.Fatalf("dry-run report=%+v err=%v", dryRun, err)
+	}
+	var disposition string
+	if err := s.db.QueryRow(`SELECT disposition FROM sync_mutations WHERE entity_key = 'poison'`).Scan(&disposition); err != nil || disposition != SyncMutationDispositionPending {
+		t.Fatalf("dry-run disposition=%q err=%v", disposition, err)
+	}
+
+	report, err := s.QuarantineIrreparableSyncMutations("", true)
+	if err != nil || len(report.Actions) != 1 {
+		t.Fatalf("apply report=%+v err=%v", report, err)
+	}
+	var payload, reason, evidence string
+	var ackedAt, dispositionAt sql.NullString
+	if err := s.db.QueryRow(`SELECT payload, disposition, disposition_reason, disposition_evidence, disposition_at, acked_at FROM sync_mutations WHERE entity_key = 'poison'`).Scan(&payload, &disposition, &reason, &evidence, &dispositionAt, &ackedAt); err != nil {
+		t.Fatalf("read quarantined mutation: %v", err)
+	}
+	if payload != `{"id":"poison"}` || disposition != SyncMutationDispositionQuarantined || reason == "" || evidence == "" || !dispositionAt.Valid || ackedAt.Valid {
+		t.Fatalf("quarantine did not preserve audit state: payload=%q disposition=%q reason=%q evidence=%q at=%v acked=%v", payload, disposition, reason, evidence, dispositionAt, ackedAt)
+	}
+	pending, err := s.ListPendingSyncMutations(DefaultSyncTargetKey, 10)
+	if err != nil || len(pending) != 1 || pending[0].EntityKey != "later" || pending[0].Seq != laterSeq {
+		t.Fatalf("transport pending=%+v err=%v", pending, err)
+	}
+	state, err := s.GetSyncState(DefaultSyncTargetKey)
+	if err != nil || state.LastAckedSeq != 0 {
+		t.Fatalf("state=%+v err=%v", state, err)
+	}
+	again, err := s.QuarantineIrreparableSyncMutations("", true)
+	if err != nil || len(again.Actions) != 0 {
+		t.Fatalf("repeat report=%+v err=%v", again, err)
+	}
+	var repeatedEvidence string
+	if err := s.db.QueryRow(`SELECT disposition_evidence FROM sync_mutations WHERE entity_key = 'poison'`).Scan(&repeatedEvidence); err != nil || repeatedEvidence != evidence {
+		t.Fatalf("repeat changed evidence=%q err=%v", repeatedEvidence, err)
+	}
+}
+
+func TestQuarantineIrreparableSyncMutationsRefreshesAffectedLifecycles(t *testing.T) {
+	t.Run("clears stale default and project lifecycle", func(t *testing.T) {
+		s := newTestStore(t)
+		const payload = `{"id":"poison"}`
+		if _, err := s.db.Exec(`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES ('cloud', 'session', 'poison', 'upsert', ?, 'local', 'project-a')`, payload); err != nil {
+			t.Fatalf("seed poison mutation: %v", err)
+		}
+		var seq int64
+		if err := s.db.QueryRow(`SELECT seq FROM sync_mutations WHERE entity_key = 'poison'`).Scan(&seq); err != nil {
+			t.Fatalf("read poison sequence: %v", err)
+		}
+		if err := s.MarkSyncPending(DefaultSyncTargetKey); err != nil {
+			t.Fatalf("mark default pending: %v", err)
+		}
+		if err := s.MarkSyncPending(syncTargetKeyForProject("project-a")); err != nil {
+			t.Fatalf("mark project pending: %v", err)
+		}
+
+		report, err := s.QuarantineIrreparableSyncMutations("project-a", true)
+		if err != nil || len(report.Actions) != 1 {
+			t.Fatalf("apply report=%+v err=%v", report, err)
+		}
+		var gotSeq int64
+		var gotPayload, evidence string
+		var ackedAt sql.NullString
+		if err := s.db.QueryRow(`SELECT seq, payload, disposition_evidence, acked_at FROM sync_mutations WHERE entity_key = 'poison'`).Scan(&gotSeq, &gotPayload, &evidence, &ackedAt); err != nil {
+			t.Fatalf("read quarantined mutation: %v", err)
+		}
+		if gotSeq != seq || gotPayload != payload || evidence == "" || ackedAt.Valid {
+			t.Fatalf("quarantine changed mutation audit data: seq=%d payload=%q evidence=%q acked=%v", gotSeq, gotPayload, evidence, ackedAt)
+		}
+		for _, targetKey := range []string{DefaultSyncTargetKey, syncTargetKeyForProject("project-a")} {
+			state, err := s.GetSyncState(targetKey)
+			if err != nil || state.Lifecycle != SyncLifecycleHealthy || state.LastAckedSeq != 0 {
+				t.Fatalf("state for %q = %+v, err=%v", targetKey, state, err)
+			}
+		}
+
+		again, err := s.QuarantineIrreparableSyncMutations("project-a", true)
+		if err != nil || len(again.Actions) != 0 {
+			t.Fatalf("repeat report=%+v err=%v", again, err)
+		}
+		var repeatedEvidence string
+		if err := s.db.QueryRow(`SELECT disposition_evidence FROM sync_mutations WHERE entity_key = 'poison'`).Scan(&repeatedEvidence); err != nil || repeatedEvidence != evidence {
+			t.Fatalf("repeat changed evidence=%q err=%v", repeatedEvidence, err)
+		}
+	})
+
+	t.Run("preserves pending lifecycle and refreshes only quarantined project", func(t *testing.T) {
+		s := newTestStore(t)
+		for _, mutation := range []struct{ key, project, payload string }{
+			{key: "poison", project: "project-a", payload: `{"id":"poison"}`},
+			{key: "pending", project: "project-b", payload: `{"id":"pending","project":"project-b"}`},
+		} {
+			if _, err := s.db.Exec(`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES ('cloud', 'session', ?, 'upsert', ?, 'local', ?)`, mutation.key, mutation.payload, mutation.project); err != nil {
+				t.Fatalf("seed %s mutation: %v", mutation.key, err)
+			}
+		}
+		for _, targetKey := range []string{DefaultSyncTargetKey, syncTargetKeyForProject("project-a"), syncTargetKeyForProject("project-b")} {
+			if err := s.MarkSyncPending(targetKey); err != nil {
+				t.Fatalf("mark %q pending: %v", targetKey, err)
+			}
+		}
+
+		if _, err := s.QuarantineIrreparableSyncMutations("project-a", true); err != nil {
+			t.Fatalf("quarantine project-a: %v", err)
+		}
+		for _, targetKey := range []string{DefaultSyncTargetKey, syncTargetKeyForProject("project-b")} {
+			state, err := s.GetSyncState(targetKey)
+			if err != nil || state.Lifecycle != SyncLifecyclePending {
+				t.Fatalf("state for %q = %+v, err=%v", targetKey, state, err)
+			}
+		}
+		state, err := s.GetSyncState(syncTargetKeyForProject("project-a"))
+		if err != nil || state.Lifecycle != SyncLifecycleHealthy {
+			t.Fatalf("affected project state=%+v err=%v", state, err)
+		}
+	})
+}
+
+func TestQuarantineIrreparableSyncMutationsKeepsProjectPendingWhenWorkRemains(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("keep", "project-a", "/work/project-a"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	for _, mutation := range []struct{ key, payload string }{
+		{key: "poison", payload: `{"id":"poison"}`},
+		{key: "keep", payload: `{"id":"keep","directory":"/work/project-a"}`},
+	} {
+		if _, err := s.db.Exec(`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES (?, 'session', ?, 'upsert', ?, 'local', 'project-a')`, DefaultSyncTargetKey, mutation.key, mutation.payload); err != nil {
+			t.Fatalf("seed %s mutation: %v", mutation.key, err)
+		}
+	}
+	for _, targetKey := range []string{DefaultSyncTargetKey, syncTargetKeyForProject("project-a")} {
+		if err := s.MarkSyncPending(targetKey); err != nil {
+			t.Fatalf("mark %q pending: %v", targetKey, err)
+		}
+	}
+
+	report, err := s.QuarantineIrreparableSyncMutations("project-a", true)
+	if err != nil || len(report.Actions) != 1 || report.Actions[0].EntityKey != "poison" {
+		t.Fatalf("apply report=%+v err=%v", report, err)
+	}
+
+	// The local journal writes every row under the default `cloud` target key and
+	// carries the project in its own column, so the per-project lifecycle refresh
+	// must count that key instead of the `cloud:<project>` bookkeeping key.
+	for _, targetKey := range []string{DefaultSyncTargetKey, syncTargetKeyForProject("project-a")} {
+		state, err := s.GetSyncState(targetKey)
+		if err != nil {
+			t.Fatalf("state for %q: %v", targetKey, err)
+		}
+		if state.Lifecycle != SyncLifecyclePending {
+			t.Fatalf("quarantine masked pending work for %q: lifecycle=%q", targetKey, state.Lifecycle)
+		}
+	}
+	pendingForProject, err := s.HasPendingSyncMutationsForProject("project-a")
+	if err != nil || !pendingForProject {
+		t.Fatalf("HasPendingSyncMutationsForProject=%v err=%v", pendingForProject, err)
+	}
+
+	// Once the transportable work is acked, quarantining a newly poisoned row must
+	// clear the project lifecycle through that same key.
+	if _, err := s.db.Exec(`UPDATE sync_mutations SET acked_at = datetime('now') WHERE entity_key = 'keep'`); err != nil {
+		t.Fatalf("ack keep mutation: %v", err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES (?, 'session', 'poison-2', 'upsert', '{"id":"poison-2"}', 'local', 'project-a')`, DefaultSyncTargetKey); err != nil {
+		t.Fatalf("seed second poison mutation: %v", err)
+	}
+	second, err := s.QuarantineIrreparableSyncMutations("project-a", true)
+	if err != nil || len(second.Actions) != 1 || second.Actions[0].EntityKey != "poison-2" {
+		t.Fatalf("second quarantine report=%+v err=%v", second, err)
+	}
+	state, err := s.GetSyncState(syncTargetKeyForProject("project-a"))
+	if err != nil || state.Lifecycle != SyncLifecycleHealthy {
+		t.Fatalf("project lifecycle should clear once no transportable work remains: %+v err=%v", state, err)
+	}
+}
+
+func TestQuarantineIrreparableSyncMutationsClearsCloudUpgradeBlockers(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.db.Exec(`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES (?, 'session', 'poison', 'upsert', '{"id":"poison"}', 'local', 'project-a')`, DefaultSyncTargetKey); err != nil {
+		t.Fatalf("seed poison mutation: %v", err)
+	}
+
+	before, err := s.DiagnoseCloudUpgradeLegacyMutations("project-a")
+	if err != nil || before.BlockedCount != 1 {
+		t.Fatalf("legacy report before quarantine=%+v err=%v", before, err)
+	}
+
+	if _, err := s.QuarantineIrreparableSyncMutations("project-a", true); err != nil {
+		t.Fatalf("quarantine: %v", err)
+	}
+
+	after, err := s.DiagnoseCloudUpgradeLegacyMutations("project-a")
+	if err != nil {
+		t.Fatalf("legacy report after quarantine: %v", err)
+	}
+	if after.BlockedCount != 0 || after.RepairableCount != 0 || len(after.Findings) != 0 {
+		t.Fatalf("quarantined mutation still blocks the cloud upgrade: %+v", after)
+	}
+
+	// A genuinely irreparable row enqueued afterwards must still block.
+	if _, err := s.db.Exec(`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES (?, 'session', 'poison-2', 'upsert', '{"id":"poison-2"}', 'local', 'project-a')`, DefaultSyncTargetKey); err != nil {
+		t.Fatalf("seed second poison mutation: %v", err)
+	}
+	residual, err := s.DiagnoseCloudUpgradeLegacyMutations("project-a")
+	if err != nil || residual.BlockedCount != 1 || len(residual.Findings) != 1 || residual.Findings[0].EntityKey != "poison-2" {
+		t.Fatalf("new irreparable work must still block: %+v err=%v", residual, err)
+	}
+}
+
+func TestQuarantineIrreparableSyncMutationsFailsClosed(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.db.Exec(`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES ('cloud', 'session', 'poison', 'upsert', '{"id":"poison"}', 'local', '')`); err != nil {
+		t.Fatalf("seed mutation: %v", err)
+	}
+	if _, err := s.db.Exec(`CREATE TRIGGER reject_quarantine BEFORE UPDATE OF disposition ON sync_mutations BEGIN SELECT RAISE(ABORT, 'quarantine blocked'); END`); err != nil {
+		t.Fatalf("create reject trigger: %v", err)
+	}
+	if _, err := s.QuarantineIrreparableSyncMutations("", true); err == nil {
+		t.Fatal("expected quarantine persistence error")
+	}
+	var disposition string
+	if err := s.db.QueryRow(`SELECT disposition FROM sync_mutations WHERE entity_key = 'poison'`).Scan(&disposition); err != nil || disposition != SyncMutationDispositionPending {
+		t.Fatalf("failed quarantine disposition=%q err=%v", disposition, err)
+	}
+	pending, err := s.ListPendingSyncMutations(DefaultSyncTargetKey, 10)
+	if err != nil || len(pending) != 1 || pending[0].EntityKey != "poison" {
+		t.Fatalf("failed quarantine transport pending=%+v err=%v", pending, err)
+	}
+}
+
+func TestQuarantineIrreparableSyncMutationsRollsBackWhenLifecycleRefreshFails(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.db.Exec(`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES ('cloud', 'session', 'poison', 'upsert', '{"id":"poison"}', 'local', 'project-a')`); err != nil {
+		t.Fatalf("seed mutation: %v", err)
+	}
+	if err := s.MarkSyncPending(DefaultSyncTargetKey); err != nil {
+		t.Fatalf("mark default pending: %v", err)
+	}
+	if err := s.MarkSyncPending(syncTargetKeyForProject("project-a")); err != nil {
+		t.Fatalf("mark project pending: %v", err)
+	}
+	if _, err := s.db.Exec(`CREATE TRIGGER reject_lifecycle_refresh BEFORE UPDATE OF lifecycle ON sync_state BEGIN SELECT RAISE(ABORT, 'lifecycle refresh blocked'); END`); err != nil {
+		t.Fatalf("create lifecycle refresh trigger: %v", err)
+	}
+
+	if _, err := s.QuarantineIrreparableSyncMutations("project-a", true); err == nil {
+		t.Fatal("expected lifecycle refresh error")
+	}
+	var disposition string
+	var evidence sql.NullString
+	if err := s.db.QueryRow(`SELECT disposition, disposition_evidence FROM sync_mutations WHERE entity_key = 'poison'`).Scan(&disposition, &evidence); err != nil {
+		t.Fatalf("read mutation after rollback: %v", err)
+	}
+	if disposition != SyncMutationDispositionPending || evidence.Valid {
+		t.Fatalf("refresh failure did not roll back quarantine: disposition=%q evidence=%v", disposition, evidence)
+	}
+}
+
 func TestDeleteSession_NotFound(t *testing.T) {
 	s := newTestStore(t)
 

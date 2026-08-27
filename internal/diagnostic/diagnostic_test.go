@@ -36,6 +36,21 @@ func newDiagnosticTestStoreWithConfig(t *testing.T) (*store.Store, store.Config)
 	return s, cfg
 }
 
+func seedDiagnosticPendingMutation(t *testing.T, dataDir, project, entity, entityKey, op, payload string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", filepath.Join(dataDir, "engram.db"))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(
+		`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		store.DefaultSyncTargetKey, entity, entityKey, op, payload, store.SyncSourceLocal, project,
+	); err != nil {
+		t.Fatalf("insert sync mutation %q: %v", entityKey, err)
+	}
+}
+
 func TestSQLiteLockContentionBranches(t *testing.T) {
 	s := newDiagnosticTestStore(t)
 	tests := []struct {
@@ -490,5 +505,123 @@ func TestRepairPlanReportsQuarantinedPulledSessionsAsSkipped(t *testing.T) {
 	}
 	if plan.Skipped[0].ReasonCode != ReasonQuarantinedPulledSessionIdentity {
 		t.Fatalf("skip reason=%q", plan.Skipped[0].ReasonCode)
+	}
+}
+
+// TestSyncMutationRequiredFieldsSeparatesQuarantinedEvidenceFromBlockingWork
+// exercises the cloud-enrolled case on purpose: `engram` is enrolled so the
+// check runs past the cloud-sync gate, proving quarantined rows are reported as
+// non-blocking evidence on the very path that still evaluates delivery faults.
+func TestSyncMutationRequiredFieldsSeparatesQuarantinedEvidenceFromBlockingWork(t *testing.T) {
+	s, cfg := newDiagnosticTestStoreWithConfig(t)
+	dataDir := cfg.DataDir
+	if err := s.EnrollProject("engram"); err != nil {
+		t.Fatalf("EnrollProject: %v", err)
+	}
+	seedDiagnosticPendingMutation(t, dataDir, "engram", store.SyncEntitySession, "poison", store.SyncOpUpsert, `{"id":"poison"}`)
+
+	runCheck := func(stage string) Report {
+		t.Helper()
+		report, err := NewRunner().RunOne(context.Background(), Scope{Store: s, Project: "engram"}, CheckSyncMutationRequiredFields)
+		if err != nil {
+			t.Fatalf("RunOne %s: %v", stage, err)
+		}
+		return report
+	}
+
+	if report := runCheck("before quarantine"); report.Status != StatusBlocked {
+		t.Fatalf("expected blocked report before quarantine, got %+v", report)
+	}
+
+	quarantine, err := s.QuarantineIrreparableSyncMutations("engram", true)
+	if err != nil || len(quarantine.Actions) != 1 {
+		t.Fatalf("quarantine report=%+v err=%v", quarantine, err)
+	}
+
+	report := runCheck("after quarantine")
+	if report.Status == StatusBlocked || report.Summary.Blocked != 0 {
+		t.Fatalf("quarantined mutation still blocks doctor: %+v", report)
+	}
+	check := report.Checks[0]
+	if check.Result == StatusBlocked || check.Severity == SeverityBlocking {
+		t.Fatalf("quarantined mutation still blocks the check: %+v", check)
+	}
+	if len(check.Findings) != 1 {
+		t.Fatalf("expected the quarantined row to stay visible as evidence, got %+v", check.Findings)
+	}
+	finding := check.Findings[0]
+	if finding.Severity != SeverityInfo || finding.ReasonCode != "sync_mutation_quarantined" || finding.RequiresConfirmation {
+		t.Fatalf("unexpected quarantined finding: %+v", finding)
+	}
+	var evidence map[string]any
+	if err := json.Unmarshal(finding.Evidence, &evidence); err != nil {
+		t.Fatalf("finding evidence invalid: %v", err)
+	}
+	if evidence["entity_key"] != "poison" || evidence["disposition"] != store.SyncMutationDispositionQuarantined {
+		t.Fatalf("quarantined evidence lost mutation identity: %v", evidence)
+	}
+	if reason, _ := evidence["disposition_reason"].(string); strings.TrimSpace(reason) == "" {
+		t.Fatalf("quarantined evidence lost the disposition reason: %v", evidence)
+	}
+
+	seedDiagnosticPendingMutation(t, dataDir, "engram", store.SyncEntityObservation, "obs-missing", store.SyncOpUpsert, `{"sync_id":"obs-missing"}`)
+	report = runCheck("with new blocking work")
+	if report.Status != StatusBlocked {
+		t.Fatalf("quarantined evidence masked genuinely blocking work: %+v", report)
+	}
+	check = report.Checks[0]
+	if len(check.Findings) != 2 {
+		t.Fatalf("expected blocking and quarantined findings, got %+v", check.Findings)
+	}
+	if check.Findings[0].Severity != SeverityBlocking || check.Findings[0].ReasonCode != "sync_mutation_payload_missing_required_fields" {
+		t.Fatalf("blocking finding must lead the roll-up: %+v", check.Findings[0])
+	}
+	if check.ReasonCode != "sync_mutation_payload_missing_required_fields" {
+		t.Fatalf("check reason code should describe the blocking finding, got %q", check.ReasonCode)
+	}
+	if check.Findings[1].ReasonCode != "sync_mutation_quarantined" {
+		t.Fatalf("quarantined evidence dropped: %+v", check.Findings[1])
+	}
+}
+
+// TestSyncMutationRequiredFieldsReportsQuarantinedEvidenceWithoutCloudEnrollment
+// pins the seam between the quarantine reporting and the cloud-sync gate: the
+// early return taken by a local-only install must still carry the quarantined
+// evidence, because quarantine is a local disposition that has nothing to do
+// with whether the operator opted into cloud sync.
+func TestSyncMutationRequiredFieldsReportsQuarantinedEvidenceWithoutCloudEnrollment(t *testing.T) {
+	s, cfg := newDiagnosticTestStoreWithConfig(t)
+	seedDiagnosticPendingMutation(t, cfg.DataDir, "engram", store.SyncEntitySession, "poison", store.SyncOpUpsert, `{"id":"poison"}`)
+
+	quarantine, err := s.QuarantineIrreparableSyncMutations("engram", true)
+	if err != nil || len(quarantine.Actions) != 1 {
+		t.Fatalf("quarantine report=%+v err=%v", quarantine, err)
+	}
+
+	report, err := NewRunner().RunOne(context.Background(), Scope{Store: s, Project: "engram"}, CheckSyncMutationRequiredFields)
+	if err != nil {
+		t.Fatalf("RunOne: %v", err)
+	}
+	if report.Status == StatusBlocked {
+		t.Fatalf("local-only install must not be blocked by a quarantined row: %+v", report)
+	}
+	check := report.Checks[0]
+	if len(check.Findings) != 1 || check.Findings[0].ReasonCode != "sync_mutation_quarantined" {
+		t.Fatalf("cloud sync gate swallowed the quarantined evidence: %+v", check.Findings)
+	}
+	if check.Findings[0].Severity != SeverityInfo || check.Findings[0].RequiresConfirmation {
+		t.Fatalf("quarantined finding must stay non-blocking: %+v", check.Findings[0])
+	}
+	var evidence map[string]any
+	if err := json.Unmarshal(check.Findings[0].Evidence, &evidence); err != nil {
+		t.Fatalf("finding evidence invalid: %v", err)
+	}
+	if evidence["entity_key"] != "poison" || evidence["disposition"] != store.SyncMutationDispositionQuarantined {
+		t.Fatalf("quarantined evidence lost mutation identity: %v", evidence)
+	}
+	// The local-only gate must not answer a quarantined row with cloud
+	// enrollment guidance: there is nothing to enroll for.
+	if strings.Contains(check.Findings[0].SafeNextStep, "engram cloud enroll") {
+		t.Fatalf("local-only quarantine must not suggest cloud enrollment: %+v", check.Findings[0])
 	}
 }
