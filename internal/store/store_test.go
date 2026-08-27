@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite"
 )
@@ -39,6 +40,150 @@ func newTestStore(t *testing.T) *Store {
 		_ = s.Close()
 	})
 	return s
+}
+
+func TestContentTruncationMeasuresRedactedBytes(t *testing.T) {
+	s := newTestStore(t)
+	s.cfg.MaxObservationLength = len("ok[REDACTED]")
+
+	metadata := s.ContentTruncation("ok<private>" + strings.Repeat("secret", 10) + "</private>")
+	if metadata.OriginalBytes != len("ok[REDACTED]") {
+		t.Fatalf("original bytes = %d, want %d", metadata.OriginalBytes, len("ok[REDACTED]"))
+	}
+	if metadata.LimitBytes != s.cfg.MaxObservationLength {
+		t.Fatalf("limit bytes = %d, want %d", metadata.LimitBytes, s.cfg.MaxObservationLength)
+	}
+	if metadata.Truncated {
+		t.Fatal("redacted content at the byte limit must not report truncation")
+	}
+}
+
+func TestTruncateContentPreservesUTF8BytePrefix(t *testing.T) {
+	const marker = "... [truncated]"
+
+	for _, tc := range []struct {
+		name    string
+		content string
+		max     int
+		want    string
+	}{
+		{name: "under limit", content: "hello", max: 6, want: "hello"},
+		{name: "exact limit", content: "hello", max: 5, want: "hello"},
+		{name: "oversized ASCII", content: "abcdef", max: 4, want: "abcd" + marker},
+		{name: "two-byte rune before boundary", content: "a¢z", max: 1, want: "a" + marker},
+		{name: "two-byte rune inside boundary", content: "a¢z", max: 2, want: "a" + marker},
+		{name: "two-byte rune after boundary", content: "a¢z", max: 3, want: "a¢" + marker},
+		{name: "three-byte rune before boundary", content: "a€z", max: 1, want: "a" + marker},
+		{name: "three-byte rune inside boundary", content: "a€z", max: 2, want: "a" + marker},
+		{name: "three-byte rune after boundary", content: "a€z", max: 4, want: "a€" + marker},
+		{name: "four-byte rune before boundary", content: "a😀z", max: 1, want: "a" + marker},
+		{name: "four-byte rune inside boundary", content: "a😀z", max: 3, want: "a" + marker},
+		{name: "four-byte rune after boundary", content: "a😀z", max: 5, want: "a😀" + marker},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := truncateContent(tc.content, tc.max)
+			if got != tc.want {
+				t.Fatalf("truncateContent(%q, %d) = %q, want %q", tc.content, tc.max, got, tc.want)
+			}
+			if !utf8.ValidString(got) {
+				t.Fatalf("truncateContent(%q, %d) returned invalid UTF-8: %q", tc.content, tc.max, got)
+			}
+			if len(tc.content) > tc.max && !strings.HasSuffix(got, marker) {
+				t.Fatalf("truncated content does not preserve marker: %q", got)
+			}
+			if len(tc.content) > tc.max && len(strings.TrimSuffix(got, marker)) > tc.max {
+				t.Fatalf("truncated prefix exceeds byte cap %d: %q", tc.max, got)
+			}
+		})
+	}
+}
+
+func TestPersistenceRoutesTruncateContentAtUTF8Boundary(t *testing.T) {
+	const (
+		content = "a😀z"
+		marker  = "... [truncated]"
+		want    = "a" + marker
+	)
+
+	for _, tc := range []struct {
+		name  string
+		write func(*Store) (string, error)
+	}{
+		{
+			name: "add observation",
+			write: func(s *Store) (string, error) {
+				id, err := s.AddObservation(AddObservationParams{SessionID: "s1", Type: "bugfix", Title: "title", Content: content, Project: "engram", Scope: "project"})
+				if err != nil {
+					return "", err
+				}
+				obs, err := s.GetObservation(id)
+				if err != nil {
+					return "", err
+				}
+				return obs.Content, nil
+			},
+		},
+		{
+			name: "add prompt",
+			write: func(s *Store) (string, error) {
+				if _, err := s.AddPrompt(AddPromptParams{SessionID: "s1", Content: content, Project: "engram"}); err != nil {
+					return "", err
+				}
+				prompts, err := s.RecentPrompts("engram", 1)
+				if err != nil {
+					return "", err
+				}
+				return prompts[0].Content, nil
+			},
+		},
+		{
+			name: "add prompt if missing",
+			write: func(s *Store) (string, error) {
+				if _, _, err := s.AddPromptIfMissing(AddPromptParams{SessionID: "s1", Content: content, Project: "engram"}); err != nil {
+					return "", err
+				}
+				prompts, err := s.RecentPrompts("engram", 1)
+				if err != nil {
+					return "", err
+				}
+				return prompts[0].Content, nil
+			},
+		},
+		{
+			name: "update observation",
+			write: func(s *Store) (string, error) {
+				id, err := s.AddObservation(AddObservationParams{SessionID: "s1", Type: "bugfix", Title: "title", Content: "original", Project: "engram", Scope: "project"})
+				if err != nil {
+					return "", err
+				}
+				updatedContent := content
+				obs, err := s.UpdateObservation(id, UpdateObservationParams{Content: &updatedContent})
+				if err != nil {
+					return "", err
+				}
+				return obs.Content, nil
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStore(t)
+			s.cfg.MaxObservationLength = 3
+			if err := s.CreateSession("s1", "engram", "/tmp/engram"); err != nil {
+				t.Fatalf("create session: %v", err)
+			}
+
+			got, err := tc.write(s)
+			if err != nil {
+				t.Fatalf("persist content: %v", err)
+			}
+			if got != want {
+				t.Fatalf("persisted content = %q, want %q", got, want)
+			}
+			if !utf8.ValidString(got) {
+				t.Fatalf("persisted invalid UTF-8: %q", got)
+			}
+		})
+	}
 }
 
 type fakeRows struct {
@@ -9393,6 +9538,35 @@ func TestSearchMatchMode_Any(t *testing.T) {
 	}
 	if len(results) != 3 {
 		t.Fatalf("expected 3 results for match_mode=any, got %d", len(results))
+	}
+}
+
+func TestSearchMatchMode_AnyEscapesInteriorQuotes(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s-matchmode-quotes", "engram", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-matchmode-quotes",
+		Type:      "decision",
+		Title:     `hello"world`,
+		Content:   "quoted search target",
+		Project:   "engram",
+		Scope:     "project",
+	}); err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	for _, query := range []string{`hello"world`, `"hello""world"`} {
+		t.Run(query, func(t *testing.T) {
+			results, err := s.SearchContext(context.Background(), query, SearchOptions{Project: "engram", Limit: 10, MatchMode: "any"})
+			if err != nil {
+				t.Fatalf("SearchContext(%q): %v", query, err)
+			}
+			if len(results) != 1 {
+				t.Fatalf("expected 1 result for %q, got %d", query, len(results))
+			}
+		})
 	}
 }
 
