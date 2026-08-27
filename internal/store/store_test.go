@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite"
 )
@@ -39,6 +40,150 @@ func newTestStore(t *testing.T) *Store {
 		_ = s.Close()
 	})
 	return s
+}
+
+func TestContentTruncationMeasuresRedactedBytes(t *testing.T) {
+	s := newTestStore(t)
+	s.cfg.MaxObservationLength = len("ok[REDACTED]")
+
+	metadata := s.ContentTruncation("ok<private>" + strings.Repeat("secret", 10) + "</private>")
+	if metadata.OriginalBytes != len("ok[REDACTED]") {
+		t.Fatalf("original bytes = %d, want %d", metadata.OriginalBytes, len("ok[REDACTED]"))
+	}
+	if metadata.LimitBytes != s.cfg.MaxObservationLength {
+		t.Fatalf("limit bytes = %d, want %d", metadata.LimitBytes, s.cfg.MaxObservationLength)
+	}
+	if metadata.Truncated {
+		t.Fatal("redacted content at the byte limit must not report truncation")
+	}
+}
+
+func TestTruncateContentPreservesUTF8BytePrefix(t *testing.T) {
+	const marker = "... [truncated]"
+
+	for _, tc := range []struct {
+		name    string
+		content string
+		max     int
+		want    string
+	}{
+		{name: "under limit", content: "hello", max: 6, want: "hello"},
+		{name: "exact limit", content: "hello", max: 5, want: "hello"},
+		{name: "oversized ASCII", content: "abcdef", max: 4, want: "abcd" + marker},
+		{name: "two-byte rune before boundary", content: "a¢z", max: 1, want: "a" + marker},
+		{name: "two-byte rune inside boundary", content: "a¢z", max: 2, want: "a" + marker},
+		{name: "two-byte rune after boundary", content: "a¢z", max: 3, want: "a¢" + marker},
+		{name: "three-byte rune before boundary", content: "a€z", max: 1, want: "a" + marker},
+		{name: "three-byte rune inside boundary", content: "a€z", max: 2, want: "a" + marker},
+		{name: "three-byte rune after boundary", content: "a€z", max: 4, want: "a€" + marker},
+		{name: "four-byte rune before boundary", content: "a😀z", max: 1, want: "a" + marker},
+		{name: "four-byte rune inside boundary", content: "a😀z", max: 3, want: "a" + marker},
+		{name: "four-byte rune after boundary", content: "a😀z", max: 5, want: "a😀" + marker},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := truncateContent(tc.content, tc.max)
+			if got != tc.want {
+				t.Fatalf("truncateContent(%q, %d) = %q, want %q", tc.content, tc.max, got, tc.want)
+			}
+			if !utf8.ValidString(got) {
+				t.Fatalf("truncateContent(%q, %d) returned invalid UTF-8: %q", tc.content, tc.max, got)
+			}
+			if len(tc.content) > tc.max && !strings.HasSuffix(got, marker) {
+				t.Fatalf("truncated content does not preserve marker: %q", got)
+			}
+			if len(tc.content) > tc.max && len(strings.TrimSuffix(got, marker)) > tc.max {
+				t.Fatalf("truncated prefix exceeds byte cap %d: %q", tc.max, got)
+			}
+		})
+	}
+}
+
+func TestPersistenceRoutesTruncateContentAtUTF8Boundary(t *testing.T) {
+	const (
+		content = "a😀z"
+		marker  = "... [truncated]"
+		want    = "a" + marker
+	)
+
+	for _, tc := range []struct {
+		name  string
+		write func(*Store) (string, error)
+	}{
+		{
+			name: "add observation",
+			write: func(s *Store) (string, error) {
+				id, err := s.AddObservation(AddObservationParams{SessionID: "s1", Type: "bugfix", Title: "title", Content: content, Project: "engram", Scope: "project"})
+				if err != nil {
+					return "", err
+				}
+				obs, err := s.GetObservation(id)
+				if err != nil {
+					return "", err
+				}
+				return obs.Content, nil
+			},
+		},
+		{
+			name: "add prompt",
+			write: func(s *Store) (string, error) {
+				if _, err := s.AddPrompt(AddPromptParams{SessionID: "s1", Content: content, Project: "engram"}); err != nil {
+					return "", err
+				}
+				prompts, err := s.RecentPrompts("engram", 1)
+				if err != nil {
+					return "", err
+				}
+				return prompts[0].Content, nil
+			},
+		},
+		{
+			name: "add prompt if missing",
+			write: func(s *Store) (string, error) {
+				if _, _, err := s.AddPromptIfMissing(AddPromptParams{SessionID: "s1", Content: content, Project: "engram"}); err != nil {
+					return "", err
+				}
+				prompts, err := s.RecentPrompts("engram", 1)
+				if err != nil {
+					return "", err
+				}
+				return prompts[0].Content, nil
+			},
+		},
+		{
+			name: "update observation",
+			write: func(s *Store) (string, error) {
+				id, err := s.AddObservation(AddObservationParams{SessionID: "s1", Type: "bugfix", Title: "title", Content: "original", Project: "engram", Scope: "project"})
+				if err != nil {
+					return "", err
+				}
+				updatedContent := content
+				obs, err := s.UpdateObservation(id, UpdateObservationParams{Content: &updatedContent})
+				if err != nil {
+					return "", err
+				}
+				return obs.Content, nil
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStore(t)
+			s.cfg.MaxObservationLength = 3
+			if err := s.CreateSession("s1", "engram", "/tmp/engram"); err != nil {
+				t.Fatalf("create session: %v", err)
+			}
+
+			got, err := tc.write(s)
+			if err != nil {
+				t.Fatalf("persist content: %v", err)
+			}
+			if got != want {
+				t.Fatalf("persisted content = %q, want %q", got, want)
+			}
+			if !utf8.ValidString(got) {
+				t.Fatalf("persisted invalid UTF-8: %q", got)
+			}
+		})
+	}
 }
 
 type fakeRows struct {
@@ -7116,8 +7261,8 @@ func TestListProjectsWithStats(t *testing.T) {
 func TestMergeProjects(t *testing.T) {
 	s := newTestStore(t)
 
-	// Set up three source projects
-	sources := []string{"engram", "Engram", "engram-memory"}
+	// Set up normalization-equivalent source projects.
+	sources := []string{"engram", "Engram"}
 	canonical := "engram"
 
 	if err := s.CreateSession("s1", "engram", "/work"); err != nil {
@@ -7125,7 +7270,7 @@ func TestMergeProjects(t *testing.T) {
 	}
 
 	// Add observations to each source
-	for _, src := range []string{"engram", "engram-memory"} {
+	for _, src := range []string{"engram"} {
 		for i := 0; i < 2; i++ {
 			_, err := s.AddObservation(AddObservationParams{
 				SessionID: "s1",
@@ -7150,26 +7295,23 @@ func TestMergeProjects(t *testing.T) {
 		t.Errorf("canonical = %q, want \"engram\"", result.Canonical)
 	}
 
-	// "Engram" normalizes to "engram" (same as canonical) → skipped
-	// "engram-memory" is different → merged
-	// Only "engram-memory" should appear in SourcesMerged (and possibly "engram" if it had records,
-	// but it equals canonical after normalization → skipped)
+	// Equivalent sources are allowed, while the exact canonical source is skipped.
 	for _, merged := range result.SourcesMerged {
 		if merged == "engram" {
 			t.Error("canonical 'engram' should not appear in SourcesMerged")
 		}
 	}
 
-	// All records from engram-memory should now be under "engram"
+	// All records remain under "engram".
 	obs, err := s.RecentObservations("engram", "", 20)
 	if err != nil {
 		t.Fatalf("RecentObservations: %v", err)
 	}
-	if len(obs) < 4 {
-		t.Errorf("expected ≥4 observations under 'engram' after merge, got %d", len(obs))
+	if len(obs) != 2 {
+		t.Errorf("expected 2 observations under 'engram', got %d", len(obs))
 	}
 
-	// engram-memory should have 0 observations
+	// An unrelated project name is untouched.
 	obsMerged, err := s.RecentObservations("engram-memory", "", 10)
 	if err != nil {
 		t.Fatalf("RecentObservations engram-memory: %v", err)
@@ -7182,8 +7324,8 @@ func TestMergeProjects(t *testing.T) {
 func TestMergeProjectsIdempotent(t *testing.T) {
 	s := newTestStore(t)
 
-	// Merge a nonexistent source — should not error
-	result, err := s.MergeProjects([]string{"ghost-project"}, "engram")
+	// Merge an equivalent nonexistent source — should not error.
+	result, err := s.MergeProjects([]string{"Engram"}, "engram")
 	if err != nil {
 		t.Fatalf("MergeProjects with nonexistent source: %v", err)
 	}
@@ -7227,7 +7369,7 @@ func TestMergeProjectsCanonicalInSources(t *testing.T) {
 	}
 }
 
-func TestMergeProjectsNormalizesAliasSourcesWithoutLosingLegacyRows(t *testing.T) {
+func TestMergeProjectsReportsTrimmedLegacySourceWithoutLosingRows(t *testing.T) {
 	s := newTestStore(t)
 
 	if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)`, "legacy-session", "Engram Memory", "/work/engram"); err != nil {
@@ -7240,15 +7382,15 @@ func TestMergeProjectsNormalizesAliasSourcesWithoutLosingLegacyRows(t *testing.T
 		t.Fatalf("seed legacy prompt: %v", err)
 	}
 
-	result, err := s.MergeProjects([]string{"Engram Memory"}, "engram")
+	result, err := s.MergeProjects([]string{" Engram Memory "}, "engram memory")
 	if err != nil {
 		t.Fatalf("MergeProjects: %v", err)
 	}
 	if result.ObservationsUpdated != 1 || result.SessionsUpdated != 1 || result.PromptsUpdated != 1 {
 		t.Fatalf("unexpected merge result: %+v", result)
 	}
-	if len(result.SourcesMerged) != 1 || result.SourcesMerged[0] != "engram memory" {
-		t.Fatalf("SourcesMerged = %v, want [engram memory]", result.SourcesMerged)
+	if len(result.SourcesMerged) != 1 || result.SourcesMerged[0] != "Engram Memory" {
+		t.Fatalf("SourcesMerged = %v, want [Engram Memory]", result.SourcesMerged)
 	}
 
 	for _, table := range []string{"sessions", "observations", "user_prompts"} {
@@ -7265,7 +7407,7 @@ func TestMergeProjectsNormalizesAliasSourcesWithoutLosingLegacyRows(t *testing.T
 func TestMergeProjectsConsolidatesDeterministicAliasSpellings(t *testing.T) {
 	s := newTestStore(t)
 
-	for i, project := range []string{"Engram Memory", "engram memory", "engram-memory", "engram_memory"} {
+	for i, project := range []string{"Engram Memory", "engram memory"} {
 		sessionID := fmt.Sprintf("alias-session-%d", i)
 		if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)`, sessionID, project, "/work/engram"); err != nil {
 			t.Fatalf("seed alias session %q: %v", project, err)
@@ -7278,11 +7420,11 @@ func TestMergeProjectsConsolidatesDeterministicAliasSpellings(t *testing.T) {
 		}
 	}
 
-	result, err := s.MergeProjects([]string{"Engram Memory"}, "engram")
+	result, err := s.MergeProjects([]string{"Engram Memory"}, "engram memory")
 	if err != nil {
 		t.Fatalf("MergeProjects: %v", err)
 	}
-	if result.ObservationsUpdated != 4 || result.SessionsUpdated != 4 || result.PromptsUpdated != 4 {
+	if result.ObservationsUpdated != 1 || result.SessionsUpdated != 1 || result.PromptsUpdated != 1 {
 		t.Fatalf("unexpected merge result: %+v", result)
 	}
 }
@@ -7290,14 +7432,14 @@ func TestMergeProjectsConsolidatesDeterministicAliasSpellings(t *testing.T) {
 func TestMergeProjectsAliasVariantsDoNotRewriteCanonicalProject(t *testing.T) {
 	s := newTestStore(t)
 
-	if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)`, "canonical-session", "engram-memory", "/work/engram"); err != nil {
+	if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)`, "canonical-session", "engram memory", "/work/engram"); err != nil {
 		t.Fatalf("seed canonical session: %v", err)
 	}
 	if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)`, "source-session", "Engram Memory", "/work/engram"); err != nil {
 		t.Fatalf("seed source session: %v", err)
 	}
 
-	result, err := s.MergeProjects([]string{"Engram Memory"}, "engram-memory")
+	result, err := s.MergeProjects([]string{"Engram Memory"}, "engram memory")
 	if err != nil {
 		t.Fatalf("MergeProjects: %v", err)
 	}
@@ -7305,11 +7447,532 @@ func TestMergeProjectsAliasVariantsDoNotRewriteCanonicalProject(t *testing.T) {
 		t.Fatalf("SessionsUpdated = %d, want 1", result.SessionsUpdated)
 	}
 	var canonicalRows int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sessions WHERE project = ?`, "engram-memory").Scan(&canonicalRows); err != nil {
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sessions WHERE project = ?`, "engram memory").Scan(&canonicalRows); err != nil {
 		t.Fatalf("count canonical rows: %v", err)
 	}
 	if canonicalRows != 2 {
 		t.Fatalf("canonical rows = %d, want 2", canonicalRows)
+	}
+}
+
+func TestMergeProjectsRejectsNonEquivalentSources(t *testing.T) {
+	tests := []struct {
+		name      string
+		source    string
+		errorPart string
+	}{
+		{name: "empty", source: "", errorPart: "must not be empty"},
+		{name: "substring", source: "engram-memory", errorPart: "must normalize"},
+		{name: "levenshtein", source: "engramm", errorPart: "must normalize"},
+		{name: "shared directory", source: "other-project", errorPart: "must normalize"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestStore(t)
+			if tt.name == "shared directory" {
+				if err := s.CreateSession("shared-directory", tt.source, "/shared"); err != nil {
+					t.Fatalf("create source session: %v", err)
+				}
+			}
+			if _, err := s.MergeProjects([]string{tt.source}, "engram"); err == nil || !strings.Contains(err.Error(), tt.errorPart) {
+				t.Fatalf("MergeProjects error = %v, want normalization rejection", err)
+			}
+		})
+	}
+}
+
+func TestMergeProjectsRejectsSeparatorVariants(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.MergeProjects([]string{"foo-bar"}, "foo_bar"); err == nil || !strings.Contains(err.Error(), "must normalize") {
+		t.Fatalf("MergeProjects error = %v, want separator variant rejection", err)
+	}
+}
+
+func TestMergeProjectsRejectsMixedSourcesWithoutMutation(t *testing.T) {
+	s := newTestStore(t)
+	for _, statement := range []string{
+		`INSERT INTO sessions (id, project, directory) VALUES ('legacy-session', 'Engram', '/work/engram')`,
+		`INSERT INTO observations (sync_id, session_id, type, title, content, project, scope, normalized_hash) VALUES ('legacy-obs', 'legacy-session', 'decision', 'legacy', 'content', 'Engram', 'project', 'legacy-hash')`,
+		`INSERT INTO user_prompts (sync_id, session_id, content, project) VALUES ('legacy-prompt', 'legacy-session', 'prompt', 'Engram')`,
+	} {
+		if _, err := s.db.Exec(statement); err != nil {
+			t.Fatalf("seed legacy record: %v", err)
+		}
+	}
+
+	var beforeMutations int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_mutations`).Scan(&beforeMutations); err != nil {
+		t.Fatalf("count sync mutations before merge: %v", err)
+	}
+	_, err := s.MergeProjects([]string{"Engram", "engram-memory"}, "engram")
+	if err == nil || !strings.Contains(err.Error(), "must normalize") {
+		t.Fatalf("MergeProjects error = %v, want normalization rejection", err)
+	}
+
+	for _, table := range []string{"sessions", "observations", "user_prompts"} {
+		var count int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM ` + table + ` WHERE project = 'Engram'`).Scan(&count); err != nil {
+			t.Fatalf("count %s legacy records: %v", table, err)
+		}
+		if count != 1 {
+			t.Fatalf("%s legacy records = %d, want 1", table, count)
+		}
+	}
+	var afterMutations int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_mutations`).Scan(&afterMutations); err != nil {
+		t.Fatalf("count sync mutations after merge: %v", err)
+	}
+	if afterMutations != beforeMutations {
+		t.Fatalf("sync mutations = %d, want %d", afterMutations, beforeMutations)
+	}
+}
+
+func TestProjectMergeSourceVariantsStayNormalizationEquivalent(t *testing.T) {
+	tests := []struct {
+		name             string
+		rawSource        string
+		normalizedSource string
+		canonical        string
+		want             []string
+	}{
+		{name: "legacy case spelling", rawSource: "Engram", normalizedSource: "engram", canonical: "engram", want: []string{"Engram"}},
+		{name: "whitespace input uses trimmed SQL target", rawSource: " ENGRAM ", normalizedSource: "engram", canonical: "engram", want: []string{"ENGRAM"}},
+		{name: "canonical is excluded", rawSource: "engram", normalizedSource: "engram", canonical: "engram", want: nil},
+		{name: "non-equivalent source is excluded", rawSource: "foo-bar", normalizedSource: "foo-bar", canonical: "foo_bar", want: nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := projectMergeSourceVariants(tt.rawSource, tt.normalizedSource, tt.canonical)
+			if len(got) != len(tt.want) {
+				t.Fatalf("variant count = %d, want %d; variants = %v", len(got), len(tt.want), got)
+			}
+			for i, want := range tt.want {
+				if got[i] != want {
+					t.Fatalf("variant[%d] = %q, want %q", i, got[i], want)
+				}
+			}
+		})
+	}
+}
+
+func seedLegacyMergeRecords(t *testing.T, s *Store, project string) {
+	t.Helper()
+	for _, statement := range []struct {
+		query string
+		args  []any
+	}{
+		{`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)`, []any{"legacy-session", project, "/work/engram"}},
+		{`INSERT INTO observations (sync_id, session_id, type, title, content, project, scope, normalized_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, []any{"legacy-obs", "legacy-session", "decision", "legacy", "content", project, "project", "legacy-hash"}},
+	} {
+		if _, err := s.db.Exec(statement.query, statement.args...); err != nil {
+			t.Fatalf("seed legacy record: %v", err)
+		}
+	}
+}
+
+func seedPendingLegacyMutations(t *testing.T, s *Store, project string) {
+	t.Helper()
+	sessionPayload := fmt.Sprintf(`{"id":"legacy-session","project":%q,"directory":"/work/engram"}`, project)
+	obsPayload := fmt.Sprintf(`{"sync_id":"legacy-obs","session_id":"legacy-session","type":"decision","title":"legacy","content":"content","project":%q,"scope":"project"}`, project)
+	for _, row := range []struct {
+		entity, entityKey, payload string
+	}{
+		{SyncEntitySession, "legacy-session", sessionPayload},
+		{SyncEntityObservation, "legacy-obs", obsPayload},
+	} {
+		if _, err := s.db.Exec(
+			`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			DefaultSyncTargetKey, row.entity, row.entityKey, SyncOpUpsert, row.payload, SyncSourceLocal, project,
+		); err != nil {
+			t.Fatalf("seed pending legacy mutation: %v", err)
+		}
+	}
+}
+
+func pendingMutationsByEntityKey(t *testing.T, s *Store) map[string]SyncMutation {
+	t.Helper()
+	mutations, err := s.ListPendingSyncMutations(DefaultSyncTargetKey, 100)
+	if err != nil {
+		t.Fatalf("list pending sync mutations: %v", err)
+	}
+	byKey := make(map[string]SyncMutation, len(mutations))
+	for _, mutation := range mutations {
+		byKey[mutation.EntityKey] = mutation
+	}
+	return byKey
+}
+
+func payloadProject(t *testing.T, payload string) string {
+	t.Helper()
+	var decoded struct {
+		Project string `json:"project"`
+	}
+	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+		t.Fatalf("decode mutation payload %q: %v", payload, err)
+	}
+	return decoded.Project
+}
+
+func TestMergeProjectsMigratesPendingSyncMutationsToCanonicalIdentity(t *testing.T) {
+	s := newTestStore(t)
+	seedLegacyMergeRecords(t, s, "Engram")
+	seedPendingLegacyMutations(t, s, "Engram")
+	if err := s.EnrollProject("engram"); err != nil {
+		t.Fatalf("enroll canonical: %v", err)
+	}
+
+	if _, err := s.MergeProjects([]string{"Engram"}, "engram"); err != nil {
+		t.Fatalf("MergeProjects: %v", err)
+	}
+
+	var legacyPending int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE project = 'Engram' AND acked_at IS NULL`).Scan(&legacyPending); err != nil {
+		t.Fatalf("count legacy pending mutations: %v", err)
+	}
+	if legacyPending != 0 {
+		t.Fatalf("legacy pending mutations = %d, want 0", legacyPending)
+	}
+
+	pending := pendingMutationsByEntityKey(t, s)
+	for _, entityKey := range []string{"legacy-session", "legacy-obs"} {
+		mutation, ok := pending[entityKey]
+		if !ok {
+			t.Fatalf("pending mutation for %q not deliverable after merge; got %v", entityKey, pending)
+		}
+		if mutation.Project != "engram" {
+			t.Fatalf("mutation %q project = %q, want %q", entityKey, mutation.Project, "engram")
+		}
+		if got := payloadProject(t, mutation.Payload); got != "engram" {
+			t.Fatalf("mutation %q payload project = %q, want %q", entityKey, got, "engram")
+		}
+	}
+
+	skipped, err := s.SkipAckNonEnrolledMutations(DefaultSyncTargetKey)
+	if err != nil {
+		t.Fatalf("SkipAckNonEnrolledMutations: %v", err)
+	}
+	if skipped != 0 {
+		t.Fatalf("skip-acked mutations = %d, want 0 — merged mutations must not vanish from sync", skipped)
+	}
+}
+
+func TestMergeProjectsDoesNotLetLegacyMutationsSuppressCanonicalBackfill(t *testing.T) {
+	s := newTestStore(t)
+	seedLegacyMergeRecords(t, s, "Engram")
+	seedPendingLegacyMutations(t, s, "Engram")
+	// A second legacy record with no journal coverage at all.
+	if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)`, "legacy-session-2", "Engram", "/work/engram"); err != nil {
+		t.Fatalf("seed uncovered legacy session: %v", err)
+	}
+	if err := s.EnrollProject("engram"); err != nil {
+		t.Fatalf("enroll canonical: %v", err)
+	}
+
+	if _, err := s.MergeProjects([]string{"Engram"}, "engram"); err != nil {
+		t.Fatalf("MergeProjects: %v", err)
+	}
+
+	pending := pendingMutationsByEntityKey(t, s)
+	for _, entityKey := range []string{"legacy-session", "legacy-obs", "legacy-session-2"} {
+		mutation, ok := pending[entityKey]
+		if !ok {
+			t.Fatalf("no deliverable canonical mutation for %q after merge", entityKey)
+		}
+		if mutation.Project != "engram" {
+			t.Fatalf("mutation %q project = %q, want %q", entityKey, mutation.Project, "engram")
+		}
+	}
+
+	needs, err := s.projectNeedsBackfill("engram")
+	if err != nil {
+		t.Fatalf("projectNeedsBackfill: %v", err)
+	}
+	if needs {
+		t.Fatal("canonical project still needs backfill after merge")
+	}
+}
+
+func TestMergeProjectsCarriesLegacyEnrollmentToCanonical(t *testing.T) {
+	s := newTestStore(t)
+	seedLegacyMergeRecords(t, s, "Engram")
+	// Legacy enrollment row under the raw spelling, before normalization existed.
+	if _, err := s.db.Exec(`INSERT INTO sync_enrolled_projects (project) VALUES ('Engram')`); err != nil {
+		t.Fatalf("seed legacy enrollment: %v", err)
+	}
+
+	if _, err := s.MergeProjects([]string{"Engram"}, "engram"); err != nil {
+		t.Fatalf("MergeProjects: %v", err)
+	}
+
+	enrolled, err := s.IsProjectEnrolled("engram")
+	if err != nil {
+		t.Fatalf("IsProjectEnrolled: %v", err)
+	}
+	if !enrolled {
+		t.Fatal("canonical project not enrolled after merge carried legacy enrollment")
+	}
+	var legacyEnrollment int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_enrolled_projects WHERE project = 'Engram'`).Scan(&legacyEnrollment); err != nil {
+		t.Fatalf("count legacy enrollment: %v", err)
+	}
+	if legacyEnrollment != 0 {
+		t.Fatalf("legacy enrollment rows = %d, want 0", legacyEnrollment)
+	}
+}
+
+func TestMergeProjectsSupersedesLegacyEnrollmentWhenCanonicalEnrolled(t *testing.T) {
+	s := newTestStore(t)
+	seedLegacyMergeRecords(t, s, "Engram")
+	if err := s.EnrollProject("engram"); err != nil {
+		t.Fatalf("enroll canonical: %v", err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO sync_enrolled_projects (project) VALUES ('Engram')`); err != nil {
+		t.Fatalf("seed legacy enrollment: %v", err)
+	}
+
+	if _, err := s.MergeProjects([]string{"Engram"}, "engram"); err != nil {
+		t.Fatalf("MergeProjects: %v", err)
+	}
+
+	var rows int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_enrolled_projects`).Scan(&rows); err != nil {
+		t.Fatalf("count enrollment rows: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("enrollment rows = %d, want 1 (canonical only)", rows)
+	}
+	enrolled, err := s.IsProjectEnrolled("engram")
+	if err != nil {
+		t.Fatalf("IsProjectEnrolled: %v", err)
+	}
+	if !enrolled {
+		t.Fatal("canonical project must stay enrolled after merge")
+	}
+}
+
+func TestMergeProjectsLeavesUnrelatedEnrollmentAndMutationsUntouched(t *testing.T) {
+	s := newTestStore(t)
+	seedLegacyMergeRecords(t, s, "Engram")
+	if err := s.EnrollProject("other-project"); err != nil {
+		t.Fatalf("enroll unrelated project: %v", err)
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		DefaultSyncTargetKey, SyncEntitySession, "other-session", SyncOpUpsert, `{"id":"other-session","project":"other-project"}`, SyncSourceLocal, "other-project",
+	); err != nil {
+		t.Fatalf("seed unrelated mutation: %v", err)
+	}
+
+	if _, err := s.MergeProjects([]string{"Engram"}, "engram"); err != nil {
+		t.Fatalf("MergeProjects: %v", err)
+	}
+
+	var project, payload string
+	if err := s.db.QueryRow(`SELECT project, payload FROM sync_mutations WHERE entity_key = 'other-session'`).Scan(&project, &payload); err != nil {
+		t.Fatalf("read unrelated mutation: %v", err)
+	}
+	if project != "other-project" || payloadProject(t, payload) != "other-project" {
+		t.Fatalf("unrelated mutation rewritten: project=%q payload=%q", project, payload)
+	}
+	enrolled, err := s.IsProjectEnrolled("other-project")
+	if err != nil {
+		t.Fatalf("IsProjectEnrolled: %v", err)
+	}
+	if !enrolled {
+		t.Fatal("unrelated enrollment must survive the merge")
+	}
+}
+
+func TestMigrateProjectMigratesSyncIdentityForRename(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.EnrollProject("engram"); err != nil {
+		t.Fatalf("enroll: %v", err)
+	}
+	if err := s.CreateSession("rename-session", "engram", "/work/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := s.AddObservation(AddObservationParams{
+		SessionID: "rename-session",
+		Type:      "decision",
+		Title:     "Renamed identity",
+		Content:   "Rename must keep sync identity.",
+		Project:   "engram",
+		Scope:     "project",
+	}); err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	result, err := s.MigrateProject("engram", "engram-v2")
+	if err != nil {
+		t.Fatalf("MigrateProject: %v", err)
+	}
+	if !result.Migrated {
+		t.Fatal("expected migration to happen")
+	}
+
+	var stalePending int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE project = 'engram' AND acked_at IS NULL`).Scan(&stalePending); err != nil {
+		t.Fatalf("count stale pending mutations: %v", err)
+	}
+	if stalePending != 0 {
+		t.Fatalf("stale pending mutations under old name = %d, want 0", stalePending)
+	}
+
+	pending := pendingMutationsByEntityKey(t, s)
+	mutation, ok := pending["rename-session"]
+	if !ok {
+		t.Fatalf("session mutation not deliverable after rename; got %v", pending)
+	}
+	if mutation.Project != "engram-v2" {
+		t.Fatalf("session mutation project = %q, want %q", mutation.Project, "engram-v2")
+	}
+	if got := payloadProject(t, mutation.Payload); got != "engram-v2" {
+		t.Fatalf("session mutation payload project = %q, want %q", got, "engram-v2")
+	}
+
+	oldEnrolled, err := s.IsProjectEnrolled("engram")
+	if err != nil {
+		t.Fatalf("IsProjectEnrolled old: %v", err)
+	}
+	newEnrolled, err := s.IsProjectEnrolled("engram-v2")
+	if err != nil {
+		t.Fatalf("IsProjectEnrolled new: %v", err)
+	}
+	if oldEnrolled || !newEnrolled {
+		t.Fatalf("enrollment after rename: old=%v new=%v, want old=false new=true", oldEnrolled, newEnrolled)
+	}
+
+	skipped, err := s.SkipAckNonEnrolledMutations(DefaultSyncTargetKey)
+	if err != nil {
+		t.Fatalf("SkipAckNonEnrolledMutations: %v", err)
+	}
+	if skipped != 0 {
+		t.Fatalf("skip-acked mutations = %d, want 0 after rename", skipped)
+	}
+}
+
+func TestMigrateProjectLeavesCoexistingNormalizedProjectUntouched(t *testing.T) {
+	s := newTestStore(t)
+	// A legacy row can carry a non-normalized spelling that no current write
+	// path produces. Renaming it moves only its own records, so it must not
+	// seize the sync identity of the live project stored under the normalized
+	// spelling either.
+	if err := s.CreateSession("live-session", "engram", "/work/live"); err != nil {
+		t.Fatalf("create live session: %v", err)
+	}
+	if err := s.EnrollProject("engram"); err != nil {
+		t.Fatalf("enroll live: %v", err)
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO sessions (id, project, directory, started_at) VALUES (?, ?, ?, datetime('now'))`,
+		"legacy-session", "Engram", "/work/legacy",
+	); err != nil {
+		t.Fatalf("seed legacy session: %v", err)
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO sync_enrolled_projects (project) VALUES (?)`, "Engram",
+	); err != nil {
+		t.Fatalf("seed legacy enrollment: %v", err)
+	}
+
+	if _, err := s.MigrateProject("Engram", "engram-v2"); err != nil {
+		t.Fatalf("MigrateProject: %v", err)
+	}
+
+	pending := pendingMutationsByEntityKey(t, s)
+	live, ok := pending["live-session"]
+	if !ok {
+		t.Fatalf("coexisting project mutation missing after rename; got %v", pending)
+	}
+	if live.Project != "engram" {
+		t.Fatalf("coexisting mutation project = %q, want %q", live.Project, "engram")
+	}
+	if got := payloadProject(t, live.Payload); got != "engram" {
+		t.Fatalf("coexisting mutation payload project = %q, want %q", got, "engram")
+	}
+
+	stillEnrolled, err := s.IsProjectEnrolled("engram")
+	if err != nil {
+		t.Fatalf("IsProjectEnrolled coexisting: %v", err)
+	}
+	if !stillEnrolled {
+		t.Fatal("coexisting project lost its enrollment to the rename")
+	}
+
+	skipped, err := s.SkipAckNonEnrolledMutations(DefaultSyncTargetKey)
+	if err != nil {
+		t.Fatalf("SkipAckNonEnrolledMutations: %v", err)
+	}
+	if skipped != 0 {
+		t.Fatalf("skip-acked mutations = %d, want 0", skipped)
+	}
+}
+
+func TestMigrateProjectNormalizesNewName(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s1", "old-name", "/tmp/old"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	result, err := s.MigrateProject("old-name", " New--Name ")
+	if err != nil {
+		t.Fatalf("MigrateProject: %v", err)
+	}
+	if !result.Migrated || result.SessionsUpdated != 1 {
+		t.Fatalf("unexpected migrate result: %+v", result)
+	}
+
+	var project string
+	if err := s.db.QueryRow(`SELECT project FROM sessions WHERE id = 's1'`).Scan(&project); err != nil {
+		t.Fatalf("read migrated session: %v", err)
+	}
+	if project != "new-name" {
+		t.Fatalf("migrated project = %q, want normalized %q", project, "new-name")
+	}
+}
+
+func TestMergeThenRenameKeepsSyncLifecycle(t *testing.T) {
+	s := newTestStore(t)
+	seedLegacyMergeRecords(t, s, "Engram")
+	seedPendingLegacyMutations(t, s, "Engram")
+	if err := s.EnrollProject("engram"); err != nil {
+		t.Fatalf("enroll canonical: %v", err)
+	}
+
+	if _, err := s.MergeProjects([]string{"Engram"}, "engram"); err != nil {
+		t.Fatalf("MergeProjects: %v", err)
+	}
+	if _, err := s.MigrateProject("engram", "engram-core"); err != nil {
+		t.Fatalf("MigrateProject after merge: %v", err)
+	}
+
+	pending := pendingMutationsByEntityKey(t, s)
+	for _, entityKey := range []string{"legacy-session", "legacy-obs"} {
+		mutation, ok := pending[entityKey]
+		if !ok {
+			t.Fatalf("no deliverable mutation for %q after merge+rename; got %v", entityKey, pending)
+		}
+		if mutation.Project != "engram-core" {
+			t.Fatalf("mutation %q project = %q, want %q", entityKey, mutation.Project, "engram-core")
+		}
+		if got := payloadProject(t, mutation.Payload); got != "engram-core" {
+			t.Fatalf("mutation %q payload project = %q, want %q", entityKey, got, "engram-core")
+		}
+	}
+
+	enrolled, err := s.IsProjectEnrolled("engram-core")
+	if err != nil {
+		t.Fatalf("IsProjectEnrolled: %v", err)
+	}
+	if !enrolled {
+		t.Fatal("renamed project must be enrolled after merge+rename")
+	}
+	skipped, err := s.SkipAckNonEnrolledMutations(DefaultSyncTargetKey)
+	if err != nil {
+		t.Fatalf("SkipAckNonEnrolledMutations: %v", err)
+	}
+	if skipped != 0 {
+		t.Fatalf("skip-acked mutations = %d, want 0 after merge+rename", skipped)
 	}
 }
 
@@ -9462,6 +10125,35 @@ func TestSearchMatchMode_Any(t *testing.T) {
 	}
 	if len(results) != 3 {
 		t.Fatalf("expected 3 results for match_mode=any, got %d", len(results))
+	}
+}
+
+func TestSearchMatchMode_AnyEscapesInteriorQuotes(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s-matchmode-quotes", "engram", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-matchmode-quotes",
+		Type:      "decision",
+		Title:     `hello"world`,
+		Content:   "quoted search target",
+		Project:   "engram",
+		Scope:     "project",
+	}); err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	for _, query := range []string{`hello"world`, `"hello""world"`} {
+		t.Run(query, func(t *testing.T) {
+			results, err := s.SearchContext(context.Background(), query, SearchOptions{Project: "engram", Limit: 10, MatchMode: "any"})
+			if err != nil {
+				t.Fatalf("SearchContext(%q): %v", query, err)
+			}
+			if len(results) != 1 {
+				t.Fatalf("expected 1 result for %q, got %d", query, len(results))
+			}
+		})
 	}
 }
 
