@@ -101,7 +101,7 @@ func TestSQLiteLockContentionBranches(t *testing.T) {
 
 func TestRegistryLookupAndOrdering(t *testing.T) {
 	codes := RegisteredCodes()
-	want := []string{CheckManualSessionNameProjectMismatch, CheckSessionProjectDirectoryMismatch, CheckSQLiteLockContention, CheckSyncMutationRequiredFields}
+	want := []string{CheckInvalidSessionIdentity, CheckManualSessionNameProjectMismatch, CheckSessionProjectDirectoryMismatch, CheckSQLiteLockContention, CheckSyncMutationRequiredFields}
 	if strings.Join(codes, ",") != strings.Join(want, ",") {
 		t.Fatalf("RegisteredCodes = %v, want %v", codes, want)
 	}
@@ -269,13 +269,242 @@ func TestRunnerRunAllHealthyEvaluatesEveryMVPCheck(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunAll: %v", err)
 	}
-	if report.Status != StatusOK || report.Summary.OK != 4 || len(report.Checks) != 4 {
+	if report.Status != StatusOK || report.Summary.OK != 5 || len(report.Checks) != 5 {
 		t.Fatalf("report=%+v", report)
 	}
 	for _, check := range report.Checks {
 		if check.Result != StatusOK || len(check.Evidence) == 0 {
 			t.Fatalf("expected ok check with evidence, got %+v", check)
 		}
+	}
+}
+
+func TestInvalidSessionIdentityCheckReportsSourceReferencesAndJournal(t *testing.T) {
+	cfg, err := store.DefaultConfig()
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.DataDir = t.TempDir()
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	db, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
+	if err != nil {
+		t.Fatalf("open raw database: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.Exec(`INSERT INTO sessions (id, project, directory) VALUES ('', 'engram', '/tmp/engram');
+		INSERT INTO observations (sync_id, session_id, type, title, content, project, scope, normalized_hash, revision_count, duplicate_count, created_at, updated_at)
+		VALUES ('obs-empty-session', '', 'bugfix', 'title', 'content', 'engram', 'project', 'hash', 1, 1, datetime('now'), datetime('now'));
+		INSERT INTO user_prompts (sync_id, session_id, content, project, created_at) VALUES ('prompt-empty-session', '', 'prompt', 'engram', datetime('now'));
+		INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES ('cloud', 'session', '', 'upsert', '{"id":"","project":"engram","directory":"/tmp/engram"}', 'local', 'engram');`); err != nil {
+		t.Fatalf("seed corrupt identity: %v", err)
+	}
+
+	report, err := NewRunner().RunOne(context.Background(), Scope{Store: s, Project: "engram"}, CheckInvalidSessionIdentity)
+	if err != nil {
+		t.Fatalf("RunOne: %v", err)
+	}
+	if report.Status != StatusBlocked || len(report.Checks[0].Findings) != 1 {
+		t.Fatalf("report=%+v", report)
+	}
+	var evidence store.InvalidSessionIdentityEvidence
+	if err := json.Unmarshal(report.Checks[0].Findings[0].Evidence, &evidence); err != nil {
+		t.Fatalf("decode evidence: %v", err)
+	}
+	if evidence.ObservationCount != 1 || evidence.PromptCount != 1 || evidence.InvalidJournalCount != 1 {
+		t.Fatalf("evidence=%+v", evidence)
+	}
+
+	plan, err := BuildRepairPlan(context.Background(), Scope{Store: s, Project: "engram"}, report, CheckInvalidSessionIdentity, RepairModeApply)
+	if err != nil {
+		t.Fatalf("BuildRepairPlan: %v", err)
+	}
+	if plan.Status != "noop" || len(plan.Actions) != 0 || len(plan.Skipped) != 1 || plan.Skipped[0].ReasonCode != "cannot_repair_without_explicit_canonical_session_id" {
+		t.Fatalf("repair plan=%+v", plan)
+	}
+}
+
+func TestInvalidSessionIdentityEvidenceAttributesOnlyMatchingJournalMutations(t *testing.T) {
+	s := newDiagnosticTestStore(t)
+	if _, err := s.DB().Exec(`
+		INSERT INTO sessions (id, project, directory) VALUES ('', 'engram', '/tmp/empty');
+		INSERT INTO sessions (id, project, directory) VALUES (' ', 'engram', '/tmp/space');
+		INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES
+			('cloud', 'session', '', 'upsert', 'not json', 'local', 'engram'),
+			('cloud', 'session', 'valid-key', 'upsert', '{"id":"","directory":"/tmp"}', 'local', 'engram'),
+			('cloud', 'session', ' ', 'upsert', '{"id":"other","directory":"/tmp"}', 'local', 'engram'),
+			('cloud', 'session', 'other', 'upsert', '{"id":" ","directory":"/tmp"}', 'local', 'engram'),
+			('cloud', 'session', 'unrelated', 'upsert', '{"id":"different","directory":"/tmp"}', 'local', 'engram');
+	`); err != nil {
+		t.Fatalf("seed invalid session journal: %v", err)
+	}
+
+	evidence, err := s.ListInvalidSessionIdentityEvidence("engram")
+	if err != nil {
+		t.Fatalf("ListInvalidSessionIdentityEvidence: %v", err)
+	}
+	counts := make(map[string]int64, len(evidence))
+	for _, item := range evidence {
+		counts[item.SessionID] = item.InvalidJournalCount
+	}
+	if counts[""] != 2 || counts[" "] != 2 {
+		t.Fatalf("invalid journal counts=%v, want empty=2 whitespace=2", counts)
+	}
+}
+
+func TestInvalidSessionIdentityEvidenceDoesNotAttributeUnmatchedWhitespaceIdentities(t *testing.T) {
+	s := newDiagnosticTestStore(t)
+	if _, err := s.DB().Exec(`
+		INSERT INTO sessions (id, project, directory) VALUES ('', 'engram', '/tmp/empty');
+		INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project)
+		VALUES ('cloud', 'session', char(9), 'upsert', '{"id":"\n","directory":"/tmp"}', 'local', 'engram');
+	`); err != nil {
+		t.Fatalf("seed unmatched whitespace journal: %v", err)
+	}
+
+	evidence, err := s.ListInvalidSessionIdentityEvidence("engram")
+	if err != nil {
+		t.Fatalf("ListInvalidSessionIdentityEvidence: %v", err)
+	}
+	if len(evidence) != 1 || evidence[0].InvalidJournalCount != 0 {
+		t.Fatalf("evidence=%+v, want one unassigned empty-session mutation", evidence)
+	}
+}
+
+func TestInvalidSessionIdentityEvidenceDoesNotAttributeMalformedPayloadWithoutExactKey(t *testing.T) {
+	s := newDiagnosticTestStore(t)
+	if _, err := s.DB().Exec(`
+		INSERT INTO sessions (id, project, directory) VALUES ('', 'engram', '/tmp/empty');
+		INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project)
+		VALUES ('cloud', 'session', 'nonmatching-key', 'upsert', 'not json', 'local', 'engram');
+	`); err != nil {
+		t.Fatalf("seed malformed session journal: %v", err)
+	}
+
+	evidence, err := s.ListInvalidSessionIdentityEvidence("engram")
+	if err != nil {
+		t.Fatalf("ListInvalidSessionIdentityEvidence: %v", err)
+	}
+	if len(evidence) != 1 || evidence[0].InvalidJournalCount != 0 {
+		t.Fatalf("evidence=%+v, want one unassigned malformed mutation", evidence)
+	}
+}
+
+// TestInvalidSessionIdentityCheckReportsQuarantinedPulledSessions proves the
+// pull-side skip is not silent: a historical chunk carrying a blank session
+// identity is skipped so the cursor can advance, and doctor must still report
+// the quarantined mutation as evidence.
+func TestInvalidSessionIdentityCheckReportsQuarantinedPulledSessions(t *testing.T) {
+	s := newDiagnosticTestStore(t)
+	mutation := store.SyncMutation{
+		Seq:       7,
+		Entity:    store.SyncEntitySession,
+		EntityKey: "\t",
+		Op:        store.SyncOpUpsert,
+		Payload:   `{"id":"","project":"engram","directory":"/remote"}`,
+	}
+	if err := s.ApplyPulledMutation(store.DefaultSyncTargetKey, mutation); err != nil {
+		t.Fatalf("ApplyPulledMutation: %v", err)
+	}
+
+	report, err := NewRunner().RunOne(context.Background(), Scope{Store: s, Project: "engram"}, CheckInvalidSessionIdentity)
+	if err != nil {
+		t.Fatalf("RunOne: %v", err)
+	}
+	if len(report.Checks) != 1 || len(report.Checks[0].Findings) != 1 {
+		t.Fatalf("report=%+v, want one quarantined finding", report)
+	}
+	finding := report.Checks[0].Findings[0]
+	if finding.ReasonCode != "quarantined_pulled_session_identity" {
+		t.Fatalf("finding reason code=%q", finding.ReasonCode)
+	}
+	var evidence store.QuarantinedPulledSessionEvidence
+	if err := json.Unmarshal(finding.Evidence, &evidence); err != nil {
+		t.Fatalf("decode evidence: %v", err)
+	}
+	if evidence.RemoteSeq != 7 || evidence.EntityKey != "\t" || evidence.TargetKey != store.DefaultSyncTargetKey || evidence.Project != "engram" {
+		t.Fatalf("evidence=%+v", evidence)
+	}
+
+	var details map[string]any
+	if err := json.Unmarshal(report.Checks[0].Evidence, &details); err != nil {
+		t.Fatalf("decode check evidence: %v", err)
+	}
+	if details["finding_count"] != float64(1) {
+		t.Fatalf("check evidence=%v", details)
+	}
+}
+
+// TestInvalidSessionIdentityCheckReportsEveryQuarantinedPulledSession proves the
+// doctor surface scales with the number of dropped mutations. A chunk carrying
+// several blank identities must produce one finding per dropped mutation: the
+// quarantine rows are the only record that remote data was discarded, so a
+// report that collapses them would hide part of the loss it exists to expose.
+func TestInvalidSessionIdentityCheckReportsEveryQuarantinedPulledSession(t *testing.T) {
+	s := newDiagnosticTestStore(t)
+	mutations := []store.SyncMutation{
+		{Entity: store.SyncEntitySession, EntityKey: "\t", Op: store.SyncOpUpsert, Payload: `{"id":"","project":"engram","directory":"/first"}`},
+		{Entity: store.SyncEntitySession, EntityKey: "\n", Op: store.SyncOpUpsert, Payload: `{"id":"","project":"engram","directory":"/second"}`},
+	}
+	if err := s.ApplyPulledChunk(store.DefaultSyncTargetKey, "blank-identities", mutations); err != nil {
+		t.Fatalf("ApplyPulledChunk: %v", err)
+	}
+
+	report, err := NewRunner().RunOne(context.Background(), Scope{Store: s, Project: "engram"}, CheckInvalidSessionIdentity)
+	if err != nil {
+		t.Fatalf("RunOne: %v", err)
+	}
+	if len(report.Checks) != 1 || len(report.Checks[0].Findings) != 2 {
+		t.Fatalf("report=%+v, want one finding per dropped mutation", report)
+	}
+	seen := map[string]string{}
+	for _, finding := range report.Checks[0].Findings {
+		var evidence store.QuarantinedPulledSessionEvidence
+		if err := json.Unmarshal(finding.Evidence, &evidence); err != nil {
+			t.Fatalf("decode evidence: %v", err)
+		}
+		if previous, duplicated := seen[evidence.SyncID]; duplicated {
+			t.Fatalf("sync_id %q reported twice (%q and %q)", evidence.SyncID, previous, evidence.EntityKey)
+		}
+		seen[evidence.SyncID] = evidence.EntityKey
+	}
+	if len(seen) != 2 {
+		t.Fatalf("distinct quarantined sync ids=%v, want 2", seen)
+	}
+}
+
+// TestRepairPlanReportsQuarantinedPulledSessionsAsSkipped keeps repair honest:
+// doctor reports the quarantined mutation, so the repair plan must name it as
+// unrepairable instead of returning a bare noop.
+func TestRepairPlanReportsQuarantinedPulledSessionsAsSkipped(t *testing.T) {
+	s := newDiagnosticTestStore(t)
+	if err := s.ApplyPulledMutation(store.DefaultSyncTargetKey, store.SyncMutation{
+		Seq:       3,
+		Entity:    store.SyncEntitySession,
+		EntityKey: "\n",
+		Op:        store.SyncOpUpsert,
+		Payload:   `{"id":"","project":"engram","directory":"/remote"}`,
+	}); err != nil {
+		t.Fatalf("ApplyPulledMutation: %v", err)
+	}
+	scope := Scope{Store: s, Project: "engram"}
+	report, err := NewRunner().RunOne(context.Background(), scope, CheckInvalidSessionIdentity)
+	if err != nil {
+		t.Fatalf("RunOne: %v", err)
+	}
+	plan, err := BuildRepairPlan(context.Background(), scope, report, CheckInvalidSessionIdentity, RepairModeApply)
+	if err != nil {
+		t.Fatalf("BuildRepairPlan: %v", err)
+	}
+	if plan.Status != "noop" || len(plan.Actions) != 0 || len(plan.Skipped) != 1 {
+		t.Fatalf("plan=%+v", plan)
+	}
+	if plan.Skipped[0].ReasonCode != ReasonQuarantinedPulledSessionIdentity {
+		t.Fatalf("skip reason=%q", plan.Skipped[0].ReasonCode)
 	}
 }
 

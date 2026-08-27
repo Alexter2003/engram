@@ -138,6 +138,10 @@ type DeferredRow struct {
 	TargetKey       string         `json:"target_key"`
 	Project         string         `json:"project"`
 	ScopeClass      string         `json:"scope_class"`
+	RemoteSeq       int64          `json:"remote_seq,omitempty"`
+	EntityKey       string         `json:"entity_key,omitempty"`
+	Op              string         `json:"op,omitempty"`
+	ReasonCode      string         `json:"reason_code,omitempty"`
 	Payload         map[string]any `json:"payload,omitempty"`
 	PayloadRaw      string         `json:"payload_raw"`
 	PayloadValid    bool           `json:"payload_valid"`

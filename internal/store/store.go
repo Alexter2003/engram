@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/Gentleman-Programming/engram/internal/timeutil"
@@ -49,6 +50,7 @@ var sqliteWriteRetryBackoffs = []time.Duration{
 // Sentinel errors returned by Store operations so callers can use errors.Is.
 var (
 	ErrSessionNotFound            = errors.New("session not found")
+	ErrSessionIDRequired          = errors.New("session id is required")
 	ErrSessionHasObservations     = errors.New("session still has observations")
 	ErrSessionDeleteBlocked       = errors.New("session deletion is blocked while cloud sync enrollment is active")
 	ErrObservationNotFound        = errors.New("observation not found")
@@ -78,6 +80,9 @@ var (
 	// sync_apply_deferred with apply_status='dead' and is never retried
 	// automatically; Phase 3 adds a republish CLI.
 	ErrApplyDead = errors.New("relation apply permanently failed: payload invalid or undecodable")
+
+	// ErrPulledSessionIdentityInvalid identifies an invalid identity after successful decoding and legacy fallback.
+	ErrPulledSessionIdentityInvalid = errors.New("pulled session identity is invalid")
 )
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -250,6 +255,8 @@ const (
 
 	SyncSourceLocal  = "local"
 	SyncSourceRemote = "remote"
+
+	SyncSessionIdentityInvalidReasonCode = "sync_session_identity_invalid"
 
 	// Decay defaults — months added to now() to compute review_after on new inserts.
 	// expires_at is NULL for all types in Phase 1.
@@ -692,6 +699,12 @@ func New(cfg Config) (*Store, error) {
 		return nil, fmt.Errorf("engram: open database: %w", err)
 	}
 	db.SetMaxOpenConns(1)
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			_ = db.Close()
+		}
+	}()
 
 	// SQLite performance pragmas
 	pragmas := []string{
@@ -711,6 +724,7 @@ func New(cfg Config) (*Store, error) {
 		return nil, fmt.Errorf("engram: migration: %w", err)
 	}
 
+	succeeded = true
 	return s, nil
 }
 
@@ -1160,6 +1174,10 @@ func (s *Store) migrate() error {
 			entity            TEXT    NOT NULL,
 			payload           TEXT    NOT NULL,
 			target_key        TEXT    NOT NULL DEFAULT '',
+			remote_seq        INTEGER NOT NULL DEFAULT 0,
+			entity_key        TEXT    NOT NULL DEFAULT '',
+			op                TEXT    NOT NULL DEFAULT '',
+			reason_code       TEXT    NOT NULL DEFAULT '',
 			project           TEXT    NOT NULL DEFAULT '',
 			scope_class       TEXT    NOT NULL DEFAULT 'legacy_unscoped',
 			apply_status      TEXT    NOT NULL DEFAULT 'deferred',
@@ -1178,6 +1196,10 @@ func (s *Store) migrate() error {
 		definition string
 	}{
 		{name: "target_key", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "remote_seq", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "entity_key", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "op", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "reason_code", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "project", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "scope_class", definition: "TEXT NOT NULL DEFAULT 'legacy_unscoped'"},
 	}
@@ -1212,7 +1234,7 @@ func (s *Store) redactCloudUpgradeSnapshots() error {
 				WHEN json_type(snapshot_json, '$.cloud_config_present') IS NOT NULL
 					OR json_type(snapshot_json, '$.cloud_config_json') IS NOT NULL
 					THEN CASE
-						WHEN stage IN ('planned', 'doctor_ready', 'doctor_blocked', 'repair_applied')
+						WHEN stage IN ('planned', 'doctor_ready', 'doctor_blocked', 'repair_applied', 'bootstrap_enrolled', 'bootstrap_pushed')
 							AND (
 								json_extract(snapshot_json, '$.cloud_config_present') = 1
 								OR ifnull(json_extract(snapshot_json, '$.cloud_config_json'), '') != ''
@@ -2157,6 +2179,9 @@ func (s *Store) migrateFTSTopicKey() error {
 // ─── Sessions ────────────────────────────────────────────────────────────────
 
 func (s *Store) CreateSession(id, project, directory string) error {
+	if err := validateSessionID(id); err != nil {
+		return err
+	}
 	// Normalize project name before storing
 	project, _ = NormalizeProject(project)
 
@@ -2164,20 +2189,27 @@ func (s *Store) CreateSession(id, project, directory string) error {
 		if err := s.createSessionTx(tx, id, project, directory); err != nil {
 			return err
 		}
-		var startedAt string
-		if err := tx.QueryRow(`SELECT started_at FROM sessions WHERE id = ?`, id).Scan(&startedAt); err != nil {
+		var persisted Session
+		if err := tx.QueryRow(`SELECT id, project, directory, started_at, ended_at, summary FROM sessions WHERE id = ?`, id).Scan(
+			&persisted.ID, &persisted.Project, &persisted.Directory, &persisted.StartedAt, &persisted.EndedAt, &persisted.Summary,
+		); err != nil {
 			return err
 		}
-		return s.enqueueSyncMutationTx(tx, SyncEntitySession, id, SyncOpUpsert, syncSessionPayload{
-			ID:        id,
-			Project:   project,
-			Directory: directory,
-			StartedAt: startedAt,
+		return s.enqueueSyncMutationTx(tx, SyncEntitySession, persisted.ID, SyncOpUpsert, syncSessionPayload{
+			ID:        persisted.ID,
+			Project:   persisted.Project,
+			Directory: persisted.Directory,
+			StartedAt: persisted.StartedAt,
+			EndedAt:   persisted.EndedAt,
+			Summary:   persisted.Summary,
 		})
 	})
 }
 
 func (s *Store) EndSession(id string, summary string) error {
+	if err := validateSessionID(id); err != nil {
+		return err
+	}
 	return s.withTx(func(tx *sql.Tx) error {
 		res, err := s.execHook(tx,
 			`UPDATE sessions SET ended_at = datetime('now'), summary = ? WHERE id = ?`,
@@ -2978,6 +3010,9 @@ func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt
 // When the session belongs to an enrolled project, this operation also enqueues
 // a session/delete mutation so cloud replicas can remove the session.
 func (s *Store) DeleteSession(id string) error {
+	if err := validateSessionID(id); err != nil {
+		return err
+	}
 	return s.withTx(func(tx *sql.Tx) error {
 		var project string
 		if err := tx.QueryRow(`SELECT project FROM sessions WHERE id = ?`, id).Scan(&project); err != nil {
@@ -3903,6 +3938,11 @@ func (s *Store) exportWithProjectScope(project string) (*ExportData, error) {
 }
 
 func (s *Store) Import(data *ExportData) (*ImportResult, error) {
+	for _, sess := range data.Sessions {
+		if err := validateSessionID(sess.ID); err != nil {
+			return nil, fmt.Errorf("import session: %w", err)
+		}
+	}
 	tx, err := s.beginTxHook()
 	if err != nil {
 		return nil, fmt.Errorf("import: begin tx: %w", err)
@@ -4696,6 +4736,19 @@ func (s *Store) MarkSyncPending(targetKey string) error {
 	})
 }
 
+// ApplyPulledMutation applies one remote mutation and advances the pull cursor.
+//
+// Session-identity semantics are skip-plus-evidence, not fail-closed. A blank
+// or inconsistent session identity in a pulled mutation is quarantined through
+// deadLetterPulledSessionIdentityTx and the cursor still advances past it.
+// Failing closed here would be a permanent retry loop: servers that predate the
+// identity rule hold historical chunks with blank session IDs, and no local
+// action can ever make such a mutation valid, so halting would pin the cursor
+// forever and block every later mutation behind it. Quarantining keeps the
+// dropped data visible — `engram doctor --check invalid_session_identity`
+// reports it and `engram conflicts deferred` lists the raw row.
+//
+// Every other apply failure keeps its existing fail-closed behavior.
 func (s *Store) ApplyPulledMutation(targetKey string, mutation SyncMutation) error {
 	targetKey = normalizeSyncTargetKey(targetKey)
 	return s.withTx(func(tx *sql.Tx) error {
@@ -4712,7 +4765,13 @@ func (s *Store) ApplyPulledMutation(targetKey string, mutation SyncMutation) err
 			if handled, err := s.recordRelationApplyFailureTx(tx, targetKey, mutation, applyErr); err != nil {
 				return err
 			} else if !handled {
-				return applyErr
+				if errors.Is(applyErr, ErrPulledSessionIdentityInvalid) {
+					if err := s.deadLetterPulledSessionIdentityTx(tx, targetKey, mutation); err != nil {
+						return err
+					}
+				} else {
+					return applyErr
+				}
 			}
 		}
 
@@ -4782,6 +4841,13 @@ func (s *Store) recordRelationApplyFailureTx(tx *sql.Tx, targetKey string, mutat
 // ApplyPulledChunk atomically applies all mutations contained in a pulled chunk
 // and records the chunk as synced in the same transaction. This guarantees
 // retry safety: a failed chunk import leaves no partial semantic mutations.
+//
+// It shares ApplyPulledMutation's skip-plus-evidence rule for invalid session
+// identities: such a mutation is quarantined and the rest of the chunk still
+// applies, so one historical blank identity cannot block the chunk forever.
+// A payload that does not even decode stays fail-closed and rolls back the
+// whole chunk, because an undecodable payload is a transport-level fault rather
+// than known-corrupt historical data.
 func (s *Store) ApplyPulledChunk(targetKey, chunkID string, mutations []SyncMutation) error {
 	targetKey = normalizeSyncTargetKey(targetKey)
 	chunkTargetKey := normalizeChunkTargetKey(targetKey)
@@ -4818,7 +4884,13 @@ func (s *Store) ApplyPulledChunk(targetKey, chunkID string, mutations []SyncMuta
 				if handled, err := s.recordRelationApplyFailureTx(tx, targetKey, mutation, applyErr); err != nil {
 					return fmt.Errorf("apply chunk mutation %d: %w", i, err)
 				} else if !handled {
-					return fmt.Errorf("apply chunk mutation %d: %w", i, applyErr)
+					if errors.Is(applyErr, ErrPulledSessionIdentityInvalid) {
+						if err := s.deadLetterPulledSessionIdentityTx(tx, targetKey, mutation); err != nil {
+							return fmt.Errorf("apply chunk mutation %d: %w", i, err)
+						}
+					} else {
+						return fmt.Errorf("apply chunk mutation %d: %w", i, applyErr)
+					}
 				}
 			}
 		}
@@ -5583,6 +5655,9 @@ func isRetryableSQLiteLockError(err error) bool {
 }
 
 func (s *Store) createSessionTx(tx *sql.Tx, id, project, directory string) error {
+	if err := validateSessionID(id); err != nil {
+		return err
+	}
 	_, err := s.execHook(tx,
 		`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET
@@ -5654,13 +5729,19 @@ func (s *Store) projectNeedsBackfill(project string) (bool, error) {
 	}
 	queries := []countQuery{
 		{
+			// Blank source identities can never be enqueued (enqueueSyncMutationTx
+			// rejects them), so counting them here would make every open of an
+			// affected store run a backfill transaction that can only fail or
+			// no-op. The predicate must stay identical to the one in
+			// backfillSessionSyncMutationsTx and to isBlankSessionID.
 			q: `SELECT COUNT(*) FROM sessions
 			    WHERE project = ?
+			      AND ` + sqlSessionIDNotBlank("id") + `
 			      AND NOT EXISTS (
 			        SELECT 1 FROM sync_mutations sm
 			        WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = sessions.id AND sm.source = ?
 			      )`,
-			args: []any{project, DefaultSyncTargetKey, SyncEntitySession, SyncSourceLocal},
+			args: []any{project, sqlWhitespaceTrimSet, DefaultSyncTargetKey, SyncEntitySession, SyncSourceLocal},
 		},
 		{
 			q: `SELECT COUNT(*) FROM observations o
@@ -5810,10 +5891,15 @@ func (s *Store) repairEnrolledProjectSyncMutations() error {
 }
 
 func (s *Store) backfillSessionSyncMutationsTx(tx *sql.Tx, project string) error {
+	// Blank source identities are skipped, not enqueued: enqueueSyncMutationTx
+	// rejects them and a single corrupt row would otherwise roll back the whole
+	// backfill transaction. The predicate must stay identical to the COUNT in
+	// projectNeedsBackfill and to isBlankSessionID.
 	rows, err := s.queryItHook(tx, `
 		SELECT id, project, directory, started_at, ended_at, summary
 		FROM sessions
 		WHERE project = ?
+		  AND `+sqlSessionIDNotBlank("id")+`
 		  AND NOT EXISTS (
 			SELECT 1
 			FROM sync_mutations sm
@@ -5823,7 +5909,7 @@ func (s *Store) backfillSessionSyncMutationsTx(tx *sql.Tx, project string) error
 			  AND sm.source = ?
 		  )
 		ORDER BY started_at ASC, id ASC`,
-		project, DefaultSyncTargetKey, SyncEntitySession, SyncSourceLocal,
+		project, sqlWhitespaceTrimSet, DefaultSyncTargetKey, SyncEntitySession, SyncSourceLocal,
 	)
 	if err != nil {
 		return err
@@ -6157,6 +6243,9 @@ func (s *Store) backfillRelationSyncMutationsTx(tx *sql.Tx, project string) erro
 }
 
 func (s *Store) enqueueSyncMutationTx(tx *sql.Tx, entity, entityKey, op string, payload any) error {
+	if entity == SyncEntitySession && strings.TrimSpace(entityKey) == "" {
+		return ErrSessionIDRequired
+	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -6274,8 +6363,12 @@ func (s *Store) applyPulledMutationTx(tx *sql.Tx, mutation SyncMutation) error {
 		if err := decodeSyncPayload([]byte(mutation.Payload), &payload); err != nil {
 			return err
 		}
-		if strings.TrimSpace(payload.ID) == "" {
-			payload.ID = strings.TrimSpace(mutation.EntityKey)
+		entityKey := mutation.EntityKey
+		if strings.TrimSpace(payload.ID) == "" && strings.TrimSpace(entityKey) != "" {
+			payload.ID = entityKey
+		}
+		if err := validateSessionMutationIdentity(payload.ID, entityKey); err != nil {
+			return fmt.Errorf("%w: %v", ErrPulledSessionIdentityInvalid, err)
 		}
 		if mutation.Op == SyncOpDelete || isSessionDeletePayload(payload) {
 			return s.applySessionDeleteTx(tx, payload)
@@ -6302,6 +6395,66 @@ func (s *Store) applyPulledMutationTx(tx *sql.Tx, mutation SyncMutation) error {
 	default:
 		return fmt.Errorf("unknown sync entity %q", mutation.Entity)
 	}
+}
+
+// pulledSessionDeadLetterSyncID derives the identity of a quarantined pulled
+// session mutation from the mutation itself, never from its position in the pull.
+//
+// The row it identifies is the only record that remote data was discarded, and
+// the insert resolves conflicts with ON CONFLICT(sync_id) DO UPDATE, so the
+// identity carries two obligations at once. Two different dropped mutations must
+// land on different rows, or the second silently erases the first and
+// skip-plus-evidence degrades into the silent drop it exists to prevent. One
+// dropped mutation redelivered must land on the same row, or a single discarded
+// session accumulates an evidence row per delivery and overstates the loss.
+//
+// The pull sequence satisfies neither obligation. ApplyPulledChunk overwrites it
+// with the local cursor position, so it describes when a mutation was applied
+// rather than what was applied: two unrelated mutations can carry the same value
+// (including zero), and one mutation redelivered inside a differently hashed
+// chunk carries a new one. The mutation's own entity, key, operation and payload
+// are what actually distinguish dropped data, so they are what the identity
+// hashes. Each field is length-prefixed so no field content can imitate a
+// separator and forge a collision.
+func pulledSessionDeadLetterSyncID(targetKey string, mutation SyncMutation) string {
+	digest := sha256.New()
+	for _, field := range []string{targetKey, mutation.Entity, mutation.EntityKey, mutation.Op, mutation.Payload} {
+		digest.Write([]byte(strconv.Itoa(len(field))))
+		digest.Write([]byte(":"))
+		digest.Write([]byte(field))
+	}
+	return "pulled-session-" + hex.EncodeToString(digest.Sum(nil))
+}
+
+func (s *Store) deadLetterPulledSessionIdentityTx(tx *sql.Tx, targetKey string, mutation SyncMutation) error {
+	syncID := pulledSessionDeadLetterSyncID(targetKey, mutation)
+	project := strings.TrimSpace(mutation.Project)
+	if project == "" {
+		var payload syncSessionPayload
+		if err := decodeSyncPayload([]byte(mutation.Payload), &payload); err == nil {
+			project = strings.TrimSpace(payload.Project)
+		}
+	}
+	project, _ = NormalizeProject(project)
+	scopeClass := "target_scoped"
+	if project != "" {
+		scopeClass = "scoped"
+	}
+	_, err := s.execHook(tx, `
+		INSERT INTO sync_apply_deferred
+			(sync_id, entity, payload, target_key, remote_seq, entity_key, op, reason_code, project, scope_class, apply_status, retry_count, first_seen_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'dead', 0, datetime('now'))
+		ON CONFLICT(sync_id) DO UPDATE SET
+			entity = excluded.entity, payload = excluded.payload, target_key = excluded.target_key,
+			remote_seq = excluded.remote_seq, entity_key = excluded.entity_key, op = excluded.op,
+			reason_code = excluded.reason_code, project = excluded.project, scope_class = excluded.scope_class,
+			apply_status = 'dead', last_attempted_at = datetime('now')`,
+		syncID, mutation.Entity, mutation.Payload, targetKey, mutation.Seq, mutation.EntityKey, mutation.Op, SyncSessionIdentityInvalidReasonCode, project, scopeClass,
+	)
+	if err != nil {
+		return fmt.Errorf("write invalid pulled session evidence: %w", err)
+	}
+	return nil
 }
 
 // applyRelationUpsertTx handles a pulled mutation with entity='relation' and
@@ -6344,7 +6497,7 @@ func (s *Store) applyRelationUpsertTx(tx *sql.Tx, mutation SyncMutation) error {
 
 	// Step 1b: validate the relation wire contract before classifying an FK miss.
 	// A malformed relation is terminal evidence, never a retryable dependency.
-	missing := make([]string, 0, 8)
+	missing := make([]string, 0, 5)
 	if p.SyncID == "" {
 		missing = append(missing, "sync_id")
 	}
@@ -6359,15 +6512,6 @@ func (s *Store) applyRelationUpsertTx(tx *sql.Tx, mutation SyncMutation) error {
 	}
 	if p.JudgmentStatus == "" {
 		missing = append(missing, "judgment_status")
-	}
-	if p.MarkedByActor == nil || *p.MarkedByActor == "" {
-		missing = append(missing, "marked_by_actor")
-	}
-	if p.MarkedByKind == nil || *p.MarkedByKind == "" {
-		missing = append(missing, "marked_by_kind")
-	}
-	if p.Project == "" {
-		missing = append(missing, "project")
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("%w: relation payload missing required fields: %s", ErrApplyDead, strings.Join(missing, ", "))
@@ -6528,6 +6672,9 @@ func observationPayloadFromObservation(obs *Observation) syncObservationPayload 
 }
 
 func (s *Store) applySessionPayloadTx(tx *sql.Tx, payload syncSessionPayload) error {
+	if err := validateSessionID(payload.ID); err != nil {
+		return err
+	}
 	if isSessionDeletePayload(payload) {
 		return s.applySessionDeleteTx(tx, payload)
 	}
@@ -6556,15 +6703,81 @@ func isSessionDeletePayload(payload syncSessionPayload) bool {
 }
 
 func (s *Store) applySessionDeleteTx(tx *sql.Tx, payload syncSessionPayload) error {
-	sessionID := strings.TrimSpace(payload.ID)
-	if sessionID == "" {
-		return nil
+	sessionID := payload.ID
+	if err := validateSessionID(sessionID); err != nil {
+		return err
 	}
 	if _, err := s.execHook(tx, `DELETE FROM user_prompts WHERE session_id = ?`, sessionID); err != nil {
 		return err
 	}
 	_, err := s.execHook(tx, `DELETE FROM sessions WHERE id = ?`, sessionID)
 	return err
+}
+
+// isBlankSessionID is the single authority on what "blank session identity"
+// means. Everything else — the Go guards and the SQL predicates built from
+// sqlWhitespaceTrimSet — must agree with it byte for byte.
+func isBlankSessionID(id string) bool {
+	return strings.TrimSpace(id) == ""
+}
+
+func validateSessionID(id string) error {
+	if isBlankSessionID(id) {
+		return ErrSessionIDRequired
+	}
+	return nil
+}
+
+// sqlWhitespaceTrimSet holds every rune strings.TrimSpace strips, so a SQL
+// predicate can express exactly the rule isBlankSessionID applies in Go.
+//
+// SQLite's one-argument trim(X) only strips U+0020. Relying on it split the
+// blank rule in two: a tab-, newline-, or CR-only legacy identity looked
+// non-blank to SQL and blank to Go, so doctor's source-row scan skipped the
+// corrupt row while the backfill SELECT kept it and enqueueSyncMutationTx then
+// aborted the whole transaction, rolling back every valid session batched with
+// it. Pass this value as the second argument of SQLite's trim(X, Y) — see
+// sqlSessionIDBlank / sqlSessionIDNotBlank — to keep both sides on one rule.
+var sqlWhitespaceTrimSet = buildSQLWhitespaceTrimSet()
+
+func buildSQLWhitespaceTrimSet() string {
+	var b strings.Builder
+	appendRange := func(lo, hi, stride rune) {
+		for r := lo; r <= hi; r += stride {
+			b.WriteRune(r)
+		}
+	}
+	for _, r := range unicode.White_Space.R16 {
+		appendRange(rune(r.Lo), rune(r.Hi), rune(r.Stride))
+	}
+	for _, r := range unicode.White_Space.R32 {
+		appendRange(rune(r.Lo), rune(r.Hi), rune(r.Stride))
+	}
+	return b.String()
+}
+
+// sqlSessionIDBlank and sqlSessionIDNotBlank render the blank-identity
+// predicate for a session-identity column. Both expect sqlWhitespaceTrimSet to
+// be bound as the next positional argument of the enclosing statement.
+func sqlSessionIDBlank(column string) string {
+	return "trim(" + column + ", ?) = ''"
+}
+
+func sqlSessionIDNotBlank(column string) string {
+	return "trim(" + column + ", ?) != ''"
+}
+
+func validateSessionMutationIdentity(payloadID, entityKey string) error {
+	if err := validateSessionID(payloadID); err != nil {
+		return fmt.Errorf("session mutation payload id: %w", err)
+	}
+	if err := validateSessionID(entityKey); err != nil {
+		return fmt.Errorf("session mutation entity_key: %w", err)
+	}
+	if payloadID != entityKey {
+		return fmt.Errorf("session mutation entity_key %q does not match payload id %q", entityKey, payloadID)
+	}
+	return nil
 }
 
 func (s *Store) applyObservationUpsertTx(tx *sql.Tx, payload syncObservationPayload) error {
@@ -7729,7 +7942,7 @@ func (s *Store) CountDeferredAndDeadForScope(targetKey, project string) (deferre
 // JSON, PayloadValid is false and PayloadRaw is preserved.
 func (s *Store) ListDeferred(opts ListDeferredOptions) ([]DeferredRow, error) {
 	query := `
-		SELECT sync_id, entity, payload, target_key, project, scope_class, apply_status, retry_count,
+		SELECT sync_id, entity, payload, target_key, project, scope_class, remote_seq, entity_key, op, reason_code, apply_status, retry_count,
 		       last_error, last_attempted_at, first_seen_at
 		FROM sync_apply_deferred
 		WHERE 1=1`
@@ -7776,7 +7989,7 @@ func (s *Store) ListDeferred(opts ListDeferredOptions) ([]DeferredRow, error) {
 // Returns an error wrapping "not found" when no row exists (matches FindCandidates style).
 func (s *Store) GetDeferred(syncID string) (DeferredRow, error) {
 	row := s.db.QueryRow(`
-		SELECT sync_id, entity, payload, target_key, project, scope_class, apply_status, retry_count,
+		SELECT sync_id, entity, payload, target_key, project, scope_class, remote_seq, entity_key, op, reason_code, apply_status, retry_count,
 		       last_error, last_attempted_at, first_seen_at
 		FROM sync_apply_deferred
 		WHERE sync_id = ?
@@ -7802,7 +8015,7 @@ func scanDeferredRow(row scannable) (DeferredRow, error) {
 	var r DeferredRow
 	var rawPayload string
 	if err := row.Scan(
-		&r.SyncID, &r.Entity, &rawPayload, &r.TargetKey, &r.Project, &r.ScopeClass, &r.ApplyStatus, &r.RetryCount,
+		&r.SyncID, &r.Entity, &rawPayload, &r.TargetKey, &r.Project, &r.ScopeClass, &r.RemoteSeq, &r.EntityKey, &r.Op, &r.ReasonCode, &r.ApplyStatus, &r.RetryCount,
 		&r.LastError, &r.LastAttemptedAt, &r.FirstSeenAt,
 	); err != nil {
 		return r, err

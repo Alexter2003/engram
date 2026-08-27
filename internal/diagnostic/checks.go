@@ -15,12 +15,19 @@ const (
 	CheckSessionProjectDirectoryMismatch  = "session_project_directory_mismatch"
 	CheckManualSessionNameProjectMismatch = "manual_session_name_project_mismatch"
 	CheckSyncMutationRequiredFields       = "sync_mutation_required_fields"
+	CheckInvalidSessionIdentity           = "invalid_session_identity"
 	CheckSQLiteLockContention             = "sqlite_lock_contention"
 )
+
+// ReasonQuarantinedPulledSessionIdentity marks a finding of
+// CheckInvalidSessionIdentity that describes a pulled session mutation the
+// apply path skipped rather than a corrupt local source row.
+const ReasonQuarantinedPulledSessionIdentity = "quarantined_pulled_session_identity"
 
 type SessionProjectDirectoryMismatchCheck struct{}
 type ManualSessionNameProjectMismatchCheck struct{}
 type SyncMutationRequiredFieldsCheck struct{}
+type InvalidSessionIdentityCheck struct{}
 type SQLiteLockContentionCheck struct{}
 
 func (SessionProjectDirectoryMismatchCheck) Code() string {
@@ -30,6 +37,7 @@ func (ManualSessionNameProjectMismatchCheck) Code() string {
 	return CheckManualSessionNameProjectMismatch
 }
 func (SyncMutationRequiredFieldsCheck) Code() string { return CheckSyncMutationRequiredFields }
+func (InvalidSessionIdentityCheck) Code() string     { return CheckInvalidSessionIdentity }
 func (SQLiteLockContentionCheck) Code() string       { return CheckSQLiteLockContention }
 
 func (c SessionProjectDirectoryMismatchCheck) Run(ctx context.Context, scope Scope) (CheckResult, error) {
@@ -256,6 +264,53 @@ func (c SyncMutationRequiredFieldsCheck) quarantinedFinding(mutation store.SyncM
 		SafeNextStep:         "No action required. Inspect the recorded disposition evidence if you need to know what was dropped from cloud sync.",
 		RequiresConfirmation: false,
 	}
+}
+
+func (c InvalidSessionIdentityCheck) Run(ctx context.Context, scope Scope) (CheckResult, error) {
+	_ = ctx
+	evidence, err := scope.Store.ListInvalidSessionIdentityEvidence(scope.Project)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	quarantined, err := scope.Store.ListQuarantinedPulledSessionEvidence(scope.Project)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	findings := make([]Finding, 0, len(evidence)+len(quarantined))
+	// Blocking source-row findings stay first: resultFromFindings derives the
+	// check-level reason code from findings[0].
+	for _, item := range evidence {
+		findings = append(findings, Finding{
+			CheckID:              c.Code(),
+			Severity:             SeverityBlocking,
+			ReasonCode:           CheckInvalidSessionIdentity,
+			Message:              "Session source ID is blank; affected references and journal entries cannot be repaired without an explicit canonical session ID.",
+			Why:                  "A blank session ID is not accepted by cloud replication and re-emitting it would preserve corrupt identity data.",
+			Evidence:             mustJSON(item),
+			SafeNextStep:         "Provide an explicit canonical session ID through a supported repair workflow; automatic ID generation is intentionally unavailable.",
+			RequiresConfirmation: true,
+		})
+	}
+	// Quarantined pulled mutations are reported but not blocking: the pull
+	// already skipped them and advanced its cursor, so replication itself is
+	// healthy and only the dropped remote rows need an operator decision.
+	for _, item := range quarantined {
+		findings = append(findings, Finding{
+			CheckID:              c.Code(),
+			Severity:             SeverityWarning,
+			ReasonCode:           ReasonQuarantinedPulledSessionIdentity,
+			Message:              "A pulled session mutation was skipped because its identity is blank or does not match its payload; the pull cursor advanced past it.",
+			Why:                  "Halting the pull on a historical blank identity would pin the cursor forever, so the mutation is quarantined as evidence instead.",
+			Evidence:             mustJSON(item),
+			SafeNextStep:         "Inspect the quarantined mutation with `engram conflicts deferred`; it can only be applied once the remote side publishes a canonical session ID.",
+			RequiresConfirmation: true,
+		})
+	}
+	details := map[string]any{
+		"invalid_source_sessions":     len(evidence),
+		"quarantined_pulled_sessions": len(quarantined),
+	}
+	return resultFromFindings(c.Code(), details, findings), nil
 }
 
 func (c SQLiteLockContentionCheck) Run(ctx context.Context, scope Scope) (CheckResult, error) {

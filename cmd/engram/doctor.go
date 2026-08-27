@@ -211,7 +211,10 @@ func cmdDoctorRepair(cfg store.Config) {
 
 func isSupportedDoctorRepairCheck(check string) bool {
 	switch check {
-	case diagnostic.CheckSessionProjectDirectoryMismatch, diagnostic.CheckManualSessionNameProjectMismatch, diagnostic.CheckSyncMutationRequiredFields:
+	case diagnostic.CheckSessionProjectDirectoryMismatch,
+		diagnostic.CheckManualSessionNameProjectMismatch,
+		diagnostic.CheckInvalidSessionIdentity,
+		diagnostic.CheckSyncMutationRequiredFields:
 		return true
 	default:
 		return false
