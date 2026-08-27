@@ -2348,6 +2348,20 @@ func (s *Store) SessionObservations(sessionID string, limit int) ([]Observation,
 
 // ─── Observations ────────────────────────────────────────────────────────────
 
+// ValidateObservationTitle is the one definition of "an observation has a
+// usable title", shared by every write path so the CLI, MCP and HTTP entry
+// points can reject a titleless write before they create a session or open a
+// transaction. It mirrors what ValidateSyncMutationPayload requires of an
+// observation upsert: cloud sync rejects a payload whose title is empty, and
+// because the mutation queue is an ordered log, one rejected row blocks every
+// later mutation for the same project.
+func ValidateObservationTitle(title string) error {
+	if strings.TrimSpace(title) == "" {
+		return ErrObservationTitleRequired
+	}
+	return nil
+}
+
 func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 	// Normalize project name (lowercase + trim) before any persistence
 	p.Project, _ = NormalizeProject(p.Project)
@@ -2355,8 +2369,13 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 	// Strip <private>...</private> tags before persisting ANYTHING.
 	title := stripPrivateTags(p.Title)
 	content, _ := s.prepareStoredContent(p.Content)
-	if title == "" {
-		return 0, ErrObservationTitleRequired
+
+	// The title guard runs on the post-strip title so redaction cannot turn a
+	// valid title into an empty one behind our back. Persisting a titleless
+	// observation also enqueues a cloud upsert that the sync validators reject,
+	// which blocks every later mutation for the project (#459).
+	if err := ValidateObservationTitle(title); err != nil {
+		return 0, err
 	}
 	if content == "" {
 		return 0, ErrObservationContentRequired
@@ -3038,8 +3057,13 @@ func (s *Store) GetObservation(id int64) (*Observation, error) {
 }
 
 func (s *Store) UpdateObservation(id int64, p UpdateObservationParams) (*Observation, error) {
-	if p.Title != nil && stripPrivateTags(*p.Title) == "" {
-		return nil, ErrObservationTitleRequired
+	// Admission runs before the transaction so a rejected update opens no
+	// transaction, touches no row and enqueues no sync mutation. The title is
+	// checked post-strip so redaction cannot smuggle an empty one through.
+	if p.Title != nil {
+		if err := ValidateObservationTitle(stripPrivateTags(*p.Title)); err != nil {
+			return nil, err
+		}
 	}
 	if p.Content != nil && stripPrivateTags(*p.Content) == "" {
 		return nil, ErrObservationContentRequired

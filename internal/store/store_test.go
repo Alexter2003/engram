@@ -10244,3 +10244,275 @@ func TestSanitizeFTS(t *testing.T) {
 		})
 	}
 }
+
+// TestAddObservationRejectsEmptyTitle pins the write-time guard for #459: an
+// observation without a usable title must never reach the observations table,
+// because it also enqueues a cloud upsert the sync validators reject, which
+// blocks every later mutation for the project.
+func TestAddObservationRejectsEmptyTitle(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s-title-guard", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	countMutations := func() int {
+		t.Helper()
+		var n int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE entity = ?`, SyncEntityObservation).Scan(&n); err != nil {
+			t.Fatalf("count sync mutations: %v", err)
+		}
+		return n
+	}
+	countObservations := func() int {
+		t.Helper()
+		var n int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM observations`).Scan(&n); err != nil {
+			t.Fatalf("count observations: %v", err)
+		}
+		return n
+	}
+
+	cases := []struct {
+		name  string
+		title string
+	}{
+		{"empty title", ""},
+		{"whitespace only title", "   "},
+		// stripPrivateTags trims the value, so a title made only of blank
+		// characters is still empty after stripping. The guard runs on the
+		// post-strip title precisely so redaction cannot smuggle one through.
+		{"title empty after stripping private tags", " \t\n "},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mutationsBefore := countMutations()
+			observationsBefore := countObservations()
+
+			id, err := s.AddObservation(AddObservationParams{
+				SessionID: "s-title-guard",
+				Type:      "note",
+				Title:     tc.title,
+				Content:   "content that is perfectly valid",
+				Project:   "engram",
+				Scope:     "project",
+			})
+			if !errors.Is(err, ErrObservationTitleRequired) {
+				t.Fatalf("expected ErrObservationTitleRequired, got id=%d err=%v", id, err)
+			}
+			if id != 0 {
+				t.Fatalf("expected no observation id, got %d", id)
+			}
+			if got := countObservations(); got != observationsBefore {
+				t.Fatalf("expected no observation persisted, count went %d → %d", observationsBefore, got)
+			}
+			if got := countMutations(); got != mutationsBefore {
+				t.Fatalf("expected no sync mutation enqueued, count went %d → %d", mutationsBefore, got)
+			}
+		})
+	}
+}
+
+// TestAddObservationAcceptsValidTitle pins that the #459 guard does not change
+// behaviour for observations that already carry a usable title, including a
+// title whose private tags collapse into the redaction marker.
+func TestAddObservationAcceptsValidTitle(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s-title-ok", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	cases := []struct {
+		name      string
+		title     string
+		wantTitle string
+	}{
+		{"plain title", "  Reject empty titles  ", "Reject empty titles"},
+		{"title reduced to redaction marker", "<private>secret</private>", "[REDACTED]"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			id, err := s.AddObservation(AddObservationParams{
+				SessionID: "s-title-ok",
+				Type:      "note",
+				Title:     tc.title,
+				Content:   "content for " + tc.name,
+				Project:   "engram",
+				Scope:     "project",
+			})
+			if err != nil {
+				t.Fatalf("add observation: %v", err)
+			}
+			obs, err := s.GetObservation(id)
+			if err != nil {
+				t.Fatalf("get observation: %v", err)
+			}
+			if obs.Title != tc.wantTitle {
+				t.Fatalf("expected title %q, got %q", tc.wantTitle, obs.Title)
+			}
+
+			var mutations int
+			if err := s.db.QueryRow(
+				`SELECT COUNT(*) FROM sync_mutations WHERE entity = ? AND entity_key = ?`,
+				SyncEntityObservation, obs.SyncID,
+			).Scan(&mutations); err != nil {
+				t.Fatalf("count sync mutations: %v", err)
+			}
+			if mutations != 1 {
+				t.Fatalf("expected 1 sync mutation for %s, got %d", obs.SyncID, mutations)
+			}
+		})
+	}
+}
+
+// TestValidateObservationTitleMatchesSyncPayloadRule pins that the write-time
+// guard and the sync payload validator agree on what a missing title is, so the
+// rule keeps living in exactly one place.
+func TestValidateObservationTitleMatchesSyncPayloadRule(t *testing.T) {
+	cases := []struct {
+		name  string
+		title string
+		valid bool
+	}{
+		{"empty", "", false},
+		{"whitespace", "   ", false},
+		{"present", "Real title", true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateObservationTitle(tc.title)
+			if tc.valid && err != nil {
+				t.Fatalf("expected title %q to be accepted, got %v", tc.title, err)
+			}
+			if !tc.valid && !errors.Is(err, ErrObservationTitleRequired) {
+				t.Fatalf("expected ErrObservationTitleRequired for %q, got %v", tc.title, err)
+			}
+
+			payload, marshalErr := json.Marshal(map[string]string{
+				"sync_id":    "obs-1",
+				"session_id": "s-1",
+				"type":       "note",
+				"title":      tc.title,
+				"content":    "content",
+				"scope":      "project",
+			})
+			if marshalErr != nil {
+				t.Fatalf("marshal payload: %v", marshalErr)
+			}
+			result := ValidateSyncMutationPayload(SyncEntityObservation, SyncOpUpsert, string(payload), "obs-1")
+			missingTitle := false
+			for _, field := range result.MissingFields {
+				if field == "title" {
+					missingTitle = true
+				}
+			}
+			if missingTitle == tc.valid {
+				t.Fatalf("validator disagrees with write guard for %q: missing_fields=%v", tc.title, result.MissingFields)
+			}
+		})
+	}
+}
+
+func TestUpdateObservationRejectsBlankTitleWithoutSideEffects(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s-update-title-guard", "engram", t.TempDir()); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	id, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-update-title-guard",
+		Type:      "note",
+		Title:     "Original title",
+		Content:   "Original content",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+	before, err := s.GetObservation(id)
+	if err != nil {
+		t.Fatalf("get original observation: %v", err)
+	}
+	countMutations := func() int {
+		t.Helper()
+		var count int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE entity = ? AND entity_key = ?`, SyncEntityObservation, before.SyncID).Scan(&count); err != nil {
+			t.Fatalf("count observation mutations: %v", err)
+		}
+		return count
+	}
+	mutationsBefore := countMutations()
+
+	for _, title := range []string{"", " \t\n "} {
+		title := title
+		t.Run(fmt.Sprintf("title %q", title), func(t *testing.T) {
+			_, err := s.UpdateObservation(id, UpdateObservationParams{Title: &title})
+			if !errors.Is(err, ErrObservationTitleRequired) {
+				t.Fatalf("expected ErrObservationTitleRequired, got %v", err)
+			}
+			after, err := s.GetObservation(id)
+			if err != nil {
+				t.Fatalf("get observation after rejected update: %v", err)
+			}
+			if after.Title != before.Title || after.Content != before.Content || after.RevisionCount != before.RevisionCount {
+				t.Fatalf("rejected update changed observation: before=%#v after=%#v", before, after)
+			}
+			if got := countMutations(); got != mutationsBefore {
+				t.Fatalf("rejected update enqueued a mutation: got %d, want %d", got, mutationsBefore)
+			}
+		})
+	}
+}
+
+func TestUpdateObservationAcceptsPrivateTagOnlyTitle(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s-update-redaction", "engram", t.TempDir()); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	id, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-update-redaction",
+		Type:      "note",
+		Title:     "Original title",
+		Content:   "Original content",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+	title := "<private>secret</private>"
+	updated, err := s.UpdateObservation(id, UpdateObservationParams{Title: &title})
+	if err != nil {
+		t.Fatalf("update observation: %v", err)
+	}
+	if updated.Title != "[REDACTED]" {
+		t.Fatalf("expected redacted title, got %q", updated.Title)
+	}
+
+	var mutationCount int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE entity = ? AND entity_key = ?`, SyncEntityObservation, updated.SyncID).Scan(&mutationCount); err != nil {
+		t.Fatalf("count observation mutations: %v", err)
+	}
+	if mutationCount != 2 {
+		t.Fatalf("expected exactly two observation mutations (create and update), got %d", mutationCount)
+	}
+	var mutation SyncMutation
+	if err := s.db.QueryRow(`SELECT op, payload FROM sync_mutations WHERE entity = ? AND entity_key = ? ORDER BY seq DESC LIMIT 1`, SyncEntityObservation, updated.SyncID).Scan(&mutation.Op, &mutation.Payload); err != nil {
+		t.Fatalf("load update mutation: %v", err)
+	}
+	if mutation.Op != SyncOpUpsert {
+		t.Fatalf("expected update mutation op %q, got %q", SyncOpUpsert, mutation.Op)
+	}
+	if validation := ValidateSyncMutationPayload(SyncEntityObservation, mutation.Op, mutation.Payload, updated.SyncID); len(validation.MissingFields) != 0 || validation.ReasonCode != "" {
+		t.Fatalf("expected valid update mutation, got %#v", validation)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(mutation.Payload), &payload); err != nil {
+		t.Fatalf("decode update mutation payload: %v", err)
+	}
+	if payload["title"] != "[REDACTED]" {
+		t.Fatalf("expected redacted title in update payload, got %#v", payload["title"])
+	}
+}
