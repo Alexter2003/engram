@@ -103,6 +103,53 @@ function buildScheduleEngramSelfHealForTest({ waitUnref, isEngramRunning, maxAtt
   return factory(waitUnref, isEngramRunning, 1, maxAttempts);
 }
 
+function buildInitializeEngramServerForTest({ configuredUrl = false, probeEngramHealth, spawnAndWaitForEngram, waitForEngramReadiness }) {
+  const body = extractFunctionBody("initializeEngramServer", "{\n  if (CONFIGURED_ENGRAM_URL");
+  const factory = new Function(
+    "CONFIGURED_ENGRAM_URL",
+    "probeEngramHealth",
+    "spawnAndWaitForEngram",
+    "waitForEngramReadiness",
+    `
+    async function initializeEngramServer() {
+      ${body}
+    }
+    return initializeEngramServer;
+    `,
+  );
+  return factory(configuredUrl ? "http://configured" : undefined, probeEngramHealth, spawnAndWaitForEngram, waitForEngramReadiness);
+}
+
+function buildProbeEngramHealthForTest({ fetch, isTimeoutError }) {
+  const body = extractFunctionBody("probeEngramHealth", "{\n  try")
+    .replace("(error as Error & { cause?: unknown }).cause", "error.cause");
+  const factory = new Function(
+    "fetch",
+    "isTimeoutError",
+    "ENGRAM_URL",
+    "AbortSignal",
+    `
+    async function probeEngramHealth() {
+      ${body}
+    }
+    return probeEngramHealth;
+    `,
+  );
+  return factory(fetch, isTimeoutError, "http://127.0.0.1:7437", { timeout: () => undefined });
+}
+
+function buildSharedInitializationForTest() {
+  const body = extractFunctionBody("sharedInitialization", "{\n  if (!initialization)");
+  const factory = new Function(`
+    let initialization;
+    function sharedInitialization(start) {
+      ${body}
+    }
+    return sharedInitialization;
+  `);
+  return factory();
+}
+
 function sessionCtx(id, sink) {
   return {
     sessionManager: { getSessionId: () => id },
@@ -144,6 +191,118 @@ test("memory protocol declares gentle-engram as the Pi-native provider", () => {
   assert.match(source, /These instructions are injected by gentle-engram, the Pi-native memory provider/);
   assert.match(source, /Use the memory tools named in this section as the authoritative Pi memory contract/);
   assert.match(source, /Do not infer alternative Engram tool names from other integrations/);
+});
+
+test("a slow existing health endpoint waits for readiness without spawning", async () => {
+  let probes = 0;
+  let spawns = 0;
+  let readinessWaits = 0;
+  const initializeEngramServer = buildInitializeEngramServerForTest({
+    probeEngramHealth: async () => {
+      probes += 1;
+      return "indeterminate";
+    },
+    spawnAndWaitForEngram: async () => { spawns += 1; },
+    waitForEngramReadiness: async () => { readinessWaits += 1; },
+  });
+
+  await initializeEngramServer();
+  assert.equal(probes, 1);
+  assert.equal(spawns, 0);
+  assert.equal(readinessWaits, 1, "readiness, not a timeout fallback, completes initialization");
+});
+
+test("a generic connection-refused health error is a definitive refusal", async () => {
+  const probeEngramHealth = buildProbeEngramHealthForTest({
+    fetch: async () => { throw new Error("connection refused"); },
+    isTimeoutError: () => false,
+  });
+
+  assert.equal(await probeEngramHealth(), "refused");
+});
+
+test("a nested ECONNREFUSED health error is a definitive refusal", async () => {
+  const probeEngramHealth = buildProbeEngramHealthForTest({
+    fetch: async () => {
+      throw Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNREFUSED" } });
+    },
+    isTimeoutError: () => false,
+  });
+
+  assert.equal(await probeEngramHealth(), "refused");
+});
+
+test("timeout-shaped health errors remain indeterminate", async () => {
+  for (const error of [
+    Object.assign(new Error("timed out"), { name: "TimeoutError" }),
+    Object.assign(new Error("aborted"), { name: "AbortError" }),
+    new Error("request timeout"),
+  ]) {
+    const probeEngramHealth = buildProbeEngramHealthForTest({
+      fetch: async () => { throw error; },
+      isTimeoutError: (candidate) => candidate instanceof Error && (candidate.name === "TimeoutError" || candidate.name === "AbortError"),
+    });
+    assert.equal(await probeEngramHealth(), "indeterminate");
+  }
+});
+
+test("a definitive refusal spawns once and awaits spawned-server readiness", async () => {
+  let spawns = 0;
+  let readinessWaits = 0;
+  const initializeEngramServer = buildInitializeEngramServerForTest({
+    probeEngramHealth: async () => "refused",
+    spawnAndWaitForEngram: async () => { spawns += 1; },
+    waitForEngramReadiness: async () => { readinessWaits += 1; },
+  });
+
+  await initializeEngramServer();
+  assert.equal(spawns, 1);
+  assert.equal(readinessWaits, 0, "the spawned child owns its readiness result");
+});
+
+test("a child error or bind-collision exit is a terminal initialization failure", async () => {
+  const initializeEngramServer = buildInitializeEngramServerForTest({
+    probeEngramHealth: async () => "refused",
+    spawnAndWaitForEngram: async () => { throw new Error("Engram server exited before readiness (code 1)"); },
+    waitForEngramReadiness: async () => assert.fail("a failed child must not fall through to readiness"),
+  });
+
+  await assert.rejects(initializeEngramServer(), /exited before readiness/);
+});
+
+test("concurrent initialization callers share one startup and its terminal result", async () => {
+  const sharedInitialization = buildSharedInitializationForTest();
+  let starts = 0;
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const start = async () => {
+    starts += 1;
+    await gate;
+  };
+
+  const first = sharedInitialization(start);
+  const second = sharedInitialization(start);
+  assert.strictEqual(first, second);
+  assert.equal(starts, 1);
+  release();
+  await Promise.all([first, second]);
+});
+
+test("ENGRAM_URL bypasses Pi readiness and automatic spawn", async () => {
+  let spawns = 0;
+  let probes = 0;
+  let readinessWaits = 0;
+  const initializeEngramServer = buildInitializeEngramServerForTest({
+    configuredUrl: true,
+    probeEngramHealth: async () => { probes += 1; return "refused"; },
+    spawnAndWaitForEngram: async () => { spawns += 1; },
+    waitForEngramReadiness: async () => { readinessWaits += 1; },
+  });
+
+  await initializeEngramServer();
+  assert.equal(spawns, 0);
+  assert.equal(probes, 0);
+  assert.equal(readinessWaits, 0);
 });
 
 test("native tool fetches retry transient HTTP startup failures", async () => {

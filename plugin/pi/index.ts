@@ -26,6 +26,8 @@ const ENGRAM_FETCH_MAX_ATTEMPTS = 3;
 const ENGRAM_FETCH_BACKOFF_BASE_MS = 250;
 const ENGRAM_SELF_HEAL_INTERVAL_MS = 5000;
 const ENGRAM_SELF_HEAL_MAX_ATTEMPTS = 6;
+const ENGRAM_STARTUP_TIMEOUT_MS = 10000;
+const ENGRAM_STARTUP_POLL_MS = 100;
 
 const ENGRAM_TOOLS = [
   "mem_search",
@@ -298,15 +300,29 @@ async function ensureSessionBestEffort(sessionId: string, sessionProject = proje
   } catch {}
 }
 
-async function isEngramRunning(): Promise<boolean> {
+type EngramHealth = "ready" | "refused" | "indeterminate";
+
+async function probeEngramHealth(): Promise<EngramHealth> {
   try {
     const res = await fetch(`${ENGRAM_URL}/health`, {
       signal: AbortSignal.timeout(500),
     });
-    return res.ok;
-  } catch {
-    return false;
+    return res.ok ? "ready" : "indeterminate";
+  } catch (error) {
+    if (isTimeoutError(error)) return "indeterminate";
+    const cause = error instanceof Error ? (error as Error & { cause?: unknown }).cause : undefined;
+    if (
+      (error instanceof Error && error.message === "connection refused") ||
+      (typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ECONNREFUSED")
+    ) {
+      return "refused";
+    }
+    return "indeterminate";
   }
+}
+
+async function isEngramRunning(): Promise<boolean> {
+  return (await probeEngramHealth()) === "ready";
 }
 
 function waitUnref(ms: number): Promise<void> {
@@ -407,7 +423,80 @@ function spawnDetached(command: string, args: readonly string[], cwd?: string): 
   });
 }
 
-let initialized = false;
+async function waitForEngramReadiness(): Promise<void> {
+  const deadline = Date.now() + ENGRAM_STARTUP_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (await probeEngramHealth() === "ready") return;
+    await wait(ENGRAM_STARTUP_POLL_MS);
+  }
+  throw new Error(`Engram server at ${ENGRAM_URL} did not become ready before startup timeout`);
+}
+
+function spawnAndWaitForEngram(): Promise<void> {
+  return new Promise((resolvePromise, reject) => {
+    let proc: ChildProcess | undefined;
+    let settled = false;
+    const cleanup = () => {
+      proc?.removeListener("error", onError);
+      proc?.removeListener("exit", onExit);
+    };
+    const resolve = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      proc?.unref();
+      resolvePromise();
+    };
+    const rejectBeforeReady = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const onError = (error: Error) => rejectBeforeReady(new Error(`Engram server failed before readiness: ${error.message}`));
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      rejectBeforeReady(new Error(`Engram server exited before readiness (code ${code ?? "unknown"}, signal ${signal ?? "none"})`));
+    };
+    try {
+      proc = spawn(ENGRAM_BIN, ["serve"], {
+        windowsHide: true,
+        detached: true,
+        stdio: "ignore",
+      });
+    } catch (error) {
+      rejectBeforeReady(error instanceof Error ? error : new Error("Engram server could not start"));
+      return;
+    }
+    proc.once("error", onError);
+    proc.once("exit", onExit);
+    proc.once("spawn", () => {
+      void waitForEngramReadiness().then(resolve, rejectBeforeReady);
+    });
+  });
+}
+
+async function initializeEngramServer(): Promise<void> {
+  if (CONFIGURED_ENGRAM_URL !== undefined) return;
+  const health = await probeEngramHealth();
+  if (health === "refused") {
+    await spawnAndWaitForEngram();
+    return;
+  }
+  await waitForEngramReadiness();
+}
+
+let initialization: Promise<void> | undefined;
+
+function sharedInitialization(start: () => Promise<void>): Promise<void> {
+  if (!initialization) {
+    initialization = start().catch((error) => {
+      initialization = undefined;
+      throw error;
+    });
+  }
+  return initialization;
+}
+
 let project = "unknown";
 let directory = "";
 let pendingRecoveryNotice: string | undefined;
@@ -473,19 +562,13 @@ function requireResolvedProject(): void {
   if (projectDetectionPending) throw new Error("Engram project detection is unavailable; cannot safely choose a project");
 }
 
-async function initOnce(cwd: string): Promise<void> {
-  if (initialized) return;
-  initialized = true;
+async function initialize(cwd: string): Promise<void> {
   directory = cwd;
 
   const oldProject = rawBasenameProjectName(cwd);
   project = fallbackProjectName(cwd);
 
-  const running = await isEngramRunning();
-  if (!running && CONFIGURED_ENGRAM_URL === undefined) {
-    await spawnDetached(ENGRAM_BIN, ["serve"]);
-    await wait(500);
-  }
+  await initializeEngramServer();
 
   applyDetectedProject(await detectServerProject(cwd));
 
@@ -501,6 +584,10 @@ async function initOnce(cwd: string): Promise<void> {
   if (existsSync(manifestFile)) {
     await spawnDetached(ENGRAM_BIN, ["sync", "--import"], cwd);
   }
+}
+
+function initOnce(cwd: string): Promise<void> {
+  return sharedInitialization(() => initialize(cwd));
 }
 
 function getSessionId(ctx: SessionContext): string | undefined {
