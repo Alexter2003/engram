@@ -548,6 +548,178 @@ func TestRelationApplyCleanup_MigrationBackfillsLegacyPayloadIdentity(t *testing
 	}
 }
 
+// ─── Interrupted migrations ───────────────────────────────────────────────────
+
+// newRelationBackfillStore opens a store on its own data directory, seeds the two
+// observations every relation payload in these tests points at, and returns the
+// config so the caller can close the store and reopen the same database file.
+func newRelationBackfillStore(t *testing.T, sessionID string) (cfg Config, s *Store, syncA, syncB string) {
+	t.Helper()
+	cfg = mustDefaultConfig(t)
+	cfg.DataDir = t.TempDir()
+	cfg.DedupeWindow = time.Hour
+
+	s, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := s.CreateSession(sessionID, "proj-apply", "/tmp/"+sessionID); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	_, syncA = addTestObsSession(t, s, sessionID, "Obs A "+sessionID, "decision", "proj-apply", "project")
+	_, syncB = addTestObsSession(t, s, sessionID, "Obs B "+sessionID, "decision", "proj-apply", "project")
+	return cfg, s, syncA, syncB
+}
+
+// insertLegacyRelationRowWithBlankIdentity writes the row shape an interrupted
+// migration leaves behind: payload_sync_id exists as a column but the row still
+// carries nothing in it, so the row's relation identity lives only in its payload.
+func insertLegacyRelationRowWithBlankIdentity(t *testing.T, s *Store, key, payload string) {
+	t.Helper()
+	if _, err := s.db.Exec(`
+		INSERT INTO sync_apply_deferred
+			(sync_id, entity, payload, target_key, project, scope_class, entity_key, op, payload_sync_id, apply_status, retry_count, first_seen_at)
+		VALUES (?, 'relation', ?, ?, 'proj-apply', 'scoped', '', '', '', 'dead', 0, datetime('now'))
+	`, key, payload, DefaultSyncTargetKey); err != nil {
+		t.Fatalf("insert legacy row with blank identity: %v", err)
+	}
+}
+
+// reopenRelationBackfillStore reopens the database the config points at and runs
+// the migration again.
+func reopenRelationBackfillStore(t *testing.T, cfg Config) *Store {
+	t.Helper()
+	reopened, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New (reopen): %v", err)
+	}
+	return reopened
+}
+
+// relationDeferredStoredIdentities returns the payload_sync_id column of every
+// relation row, keyed by the row's sync_id.
+func relationDeferredStoredIdentities(t *testing.T, s *Store) map[string]string {
+	t.Helper()
+	rows, err := s.db.Query(
+		`SELECT sync_id, payload_sync_id FROM sync_apply_deferred WHERE entity = 'relation'`,
+	)
+	if err != nil {
+		t.Fatalf("relationDeferredStoredIdentities: query: %v", err)
+	}
+	defer rows.Close()
+
+	stored := map[string]string{}
+	for rows.Next() {
+		var key, identity string
+		if err := rows.Scan(&key, &identity); err != nil {
+			t.Fatalf("relationDeferredStoredIdentities: scan: %v", err)
+		}
+		stored[key] = identity
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("relationDeferredStoredIdentities: rows: %v", err)
+	}
+	return stored
+}
+
+// The ALTER that adds payload_sync_id and the UPDATE that fills it are separate
+// auto-committed statements. A transient SQLITE_BUSY, an I/O error, or the process
+// dying between them leaves a database where the column exists and every legacy
+// row is still blank. Deriving the identity only in the open that added the column
+// would skip that database forever, so the backfill must converge on any later
+// open instead.
+func TestRelationMigration_InterruptedBackfillConvergesOnReopen(t *testing.T) {
+	cfg, s, syncA, syncB := newRelationBackfillStore(t, "ses-interrupted")
+	insertLegacyRelationRowWithBlankIdentity(t, s, "rel-legacy-key", relationPayloadJSON(t, "rel-interrupted", syncA, syncB))
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened := reopenRelationBackfillStore(t, cfg)
+	t.Cleanup(func() { _ = reopened.Close() })
+
+	stored := relationDeferredStoredIdentities(t, reopened)
+	if got := stored["rel-legacy-key"]; got != "rel-interrupted" {
+		t.Fatalf("payload_sync_id after reopen: want %q, got %q", "rel-interrupted", got)
+	}
+}
+
+// The blank payload_sync_id an interrupted migration leaves behind is what makes
+// the success-path cleanup dangerous: the row is reachable by the key it is stored
+// under, and a blank identity claims the row carries none of its own. Once the
+// backfill has converged, a legacy row whose key names one relation while its
+// payload describes another must survive a successful apply of the relation its
+// key names.
+func TestRelationApplyCleanup_EvidenceSurvivesRecoveryFromInterruptedBackfill(t *testing.T) {
+	cfg, s, syncA, syncB := newRelationBackfillStore(t, "ses-interrupted-evidence")
+	insertLegacyRelationRowWithBlankIdentity(t, s, "rel-applied", relationPayloadJSON(t, "rel-dropped", syncA, syncB))
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened := reopenRelationBackfillStore(t, cfg)
+	t.Cleanup(func() { _ = reopened.Close() })
+
+	applied := SyncMutation{
+		Entity:    SyncEntityRelation,
+		EntityKey: "rel-applied",
+		Op:        SyncOpUpsert,
+		Payload:   relationPayloadJSON(t, "rel-applied", syncA, syncB),
+		Source:    SyncSourceRemote,
+		Project:   "proj-apply",
+	}
+	if err := reopened.ApplyPulledChunk(DefaultSyncTargetKey, "chunk-interrupted-evidence", []SyncMutation{applied}); err != nil {
+		t.Fatalf("ApplyPulledChunk: %v", err)
+	}
+
+	if got := countRelationRows(t, reopened, "rel-applied"); got != 1 {
+		t.Fatalf("memory_relations rows for rel-applied: want 1, got %d", got)
+	}
+	got := relationDeferredPayloadIDs(t, reopened)
+	want := []string{"rel-dropped"}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("deferred payload identities: want %v, got %v", want, got)
+	}
+}
+
+// An unconditional backfill runs on every open, so repeating it must be a no-op.
+// A row whose payload carries no identity of its own has a genuinely blank
+// payload_sync_id and must stay that way, and no open may duplicate, drop, or
+// rewrite a row that was already derived.
+func TestRelationMigration_BackfillIsIdempotentAcrossRepeatedOpens(t *testing.T) {
+	cfg, s, syncA, syncB := newRelationBackfillStore(t, "ses-idempotent")
+	insertLegacyRelationRowWithBlankIdentity(t, s, "rel-derivable", relationPayloadJSON(t, "rel-derived", syncA, syncB))
+	// A payload that cannot be decoded has no identity to derive; that missing
+	// identity is itself one of the reasons its row is dead.
+	insertLegacyRelationRowWithBlankIdentity(t, s, "rel-undecodable", "{not json")
+	// A well-formed payload can still omit sync_id entirely.
+	insertLegacyRelationRowWithBlankIdentity(t, s, "rel-no-identity", `{"source_id":"a","target_id":"b"}`)
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	want := map[string]string{
+		"rel-derivable":   "rel-derived",
+		"rel-undecodable": "",
+		"rel-no-identity": "",
+	}
+	for open := 1; open <= 3; open++ {
+		reopened := reopenRelationBackfillStore(t, cfg)
+		stored := relationDeferredStoredIdentities(t, reopened)
+		if len(stored) != len(want) {
+			t.Fatalf("open %d: relation rows: want %d, got %d (%v)", open, len(want), len(stored), stored)
+		}
+		for key, identity := range want {
+			if got, ok := stored[key]; !ok || got != identity {
+				t.Fatalf("open %d: payload_sync_id for %q: want %q, got %q (present=%v)", open, key, identity, got, ok)
+			}
+		}
+		if err := reopened.Close(); err != nil {
+			t.Fatalf("open %d: Close: %v", open, err)
+		}
+	}
+}
+
 // ─── Rows written by the previous identity scheme ─────────────────────────────
 
 // Legacy rows carry no entity_key or op, because the old writer only stored the

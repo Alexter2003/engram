@@ -1219,14 +1219,9 @@ func (s *Store) migrate() error {
 		// at all, which is itself one of the reasons its row is dead.
 		{name: "payload_sync_id", definition: "TEXT NOT NULL DEFAULT ''"},
 	}
-	backfillPayloadSyncID := false
 	for _, c := range deferredColumns {
-		added, err := s.addColumnIfMissing("sync_apply_deferred", c.name, c.definition)
-		if err != nil {
+		if err := s.addColumnIfNotExists("sync_apply_deferred", c.name, c.definition); err != nil {
 			return err
-		}
-		if added && c.name == "payload_sync_id" {
-			backfillPayloadSyncID = true
 		}
 	}
 	if _, err := s.execHook(s.db, `
@@ -1237,22 +1232,42 @@ func (s *Store) migrate() error {
 	`); err != nil {
 		return err
 	}
-	if backfillPayloadSyncID {
-		// Rows written before the column existed carry their identity only inside
-		// the payload, so derive it once here rather than parsing JSON on every
-		// apply. CASE is used instead of a `json_valid(...) AND json_extract(...)`
-		// conjunction because only CASE guarantees the extract is never evaluated
-		// for a payload that is not valid JSON.
-		if _, err := s.execHook(s.db, `
-			UPDATE sync_apply_deferred
-			SET payload_sync_id = CASE
-				WHEN json_valid(payload) THEN ifnull(json_extract(payload, '$.sync_id'), '')
-				ELSE ''
-			END
-			WHERE entity = 'relation'
-		`); err != nil {
-			return err
-		}
+	// Rows written before payload_sync_id existed carry their relation identity
+	// only inside the payload, so derive it here rather than parsing JSON on every
+	// apply.
+	//
+	// This runs on every open rather than only in the open that added the column.
+	// The ALTER above and this UPDATE are separate auto-committed statements, so a
+	// transient SQLITE_BUSY, an I/O error, or the process dying between them leaves
+	// a database whose column exists while every legacy row is still blank. An open
+	// that derived only what it had just added would skip such a database forever,
+	// and a schema-version marker advanced past this point would skip it too. It is
+	// also what repairs rows an older binary writes into the same database once the
+	// column exists. That matters beyond migration hygiene: a blank identity is
+	// what lets relationApplyCleanupSQL delete a row by the key it is stored under,
+	// so a blank that means "not yet derived" is a route to deleting evidence about
+	// a different relation.
+	//
+	// Running it unconditionally is cheap because it converges. The two equality
+	// terms are the exact leading prefix of idx_sad_payload_sync(payload_sync_id,
+	// entity), so this is a point lookup rather than a scan of the backlog, and the
+	// CASE excludes every row whose identity cannot be derived — after one
+	// successful run no row matches at all. CASE is used instead of a
+	// `json_valid(...) AND json_extract(...)` conjunction because only CASE
+	// guarantees the extract is never evaluated for a payload that is not valid
+	// JSON. The value is trimmed so a derived identity is byte-identical to the one
+	// recordRelationApplyFailureTx stores for the same payload.
+	if _, err := s.execHook(s.db, `
+		UPDATE sync_apply_deferred
+		SET payload_sync_id = trim(json_extract(payload, '$.sync_id'))
+		WHERE payload_sync_id = ''
+		  AND entity = 'relation'
+		  AND CASE
+			WHEN json_valid(payload) THEN trim(ifnull(json_extract(payload, '$.sync_id'), ''))
+			ELSE ''
+		  END <> ''
+	`); err != nil {
+		return err
 	}
 
 	// Phase 3b: composite index for conflict-audit list/count queries.
@@ -7229,6 +7244,17 @@ func (s *Store) deadLetterPulledSessionIdentityTx(tx *sql.Tx, targetKey string, 
 //     relation: ones whose payload names it, and ones that carry no identity of
 //     their own and so are only known by the key they are stored under.
 //
+// The blank half of that IN clause is only sound because a blank payload_sync_id
+// has exactly one meaning: the row's payload carries no relation identity at all,
+// because it does not decode or names no sync_id. It can never mean "an identity
+// exists in the payload but has not been derived yet", because the migration
+// derives it unconditionally on every store open rather than only in the open
+// that added the column — see the backfill in migrate(). Making that backfill
+// conditional again, or gating it behind a schema-version marker, would restore
+// the second meaning and with it the evidence loss this comment describes: a
+// legacy row keyed on relation X whose payload really describes relation Y would
+// satisfy both clauses and be deleted by a successful apply of X.
+//
 // A row's entity_key is deliberately never consulted, and a key that merely
 // names this relation is not enough on its own. A dead row stores the discarded
 // mutation's raw entity_key and may be stored under it, and that key may be
@@ -7805,17 +7831,9 @@ func (s *Store) queryObservations(query string, args ...any) ([]Observation, err
 }
 
 func (s *Store) addColumnIfNotExists(tableName, columnName, definition string) error {
-	_, err := s.addColumnIfMissing(tableName, columnName, definition)
-	return err
-}
-
-// addColumnIfMissing is addColumnIfNotExists with the outcome reported, so a
-// migration that has to derive values for a newly added column can run that
-// backfill exactly once instead of on every store open.
-func (s *Store) addColumnIfMissing(tableName, columnName, definition string) (bool, error) {
 	rows, err := s.queryItHook(s.db, fmt.Sprintf("PRAGMA table_info(%s)", tableName))
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	for rows.Next() {
@@ -7825,25 +7843,23 @@ func (s *Store) addColumnIfMissing(tableName, columnName, definition string) (bo
 		var defaultValue any
 		var pk int
 		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
-			return false, closeRowsWithError(rows, err)
+			return closeRowsWithError(rows, err)
 		}
 		if name == columnName {
 			rows.Close()
-			return false, nil
+			return nil
 		}
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return false, err
+		return err
 	}
 	if err := rows.Close(); err != nil {
-		return false, err
+		return err
 	}
 
-	if _, err := s.db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", tableName, columnName, definition)); err != nil {
-		return false, err
-	}
-	return true, nil
+	_, err = s.db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", tableName, columnName, definition))
+	return err
 }
 
 func (s *Store) migrateSyncChunksTable() error {
