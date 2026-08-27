@@ -369,7 +369,9 @@ func TestWriteHandlersRejectWhitespaceOnlyRequiredFields(t *testing.T) {
 		t.Fatalf("seed observation: %v", err)
 	}
 
-	assertBadRequest := func(method, path, body string) {
+	// Every rejection must use the API's standard validation shape: HTTP 400
+	// carrying the sentinel error text in the JSON `error` field.
+	assertBadRequest := func(method, path, body string, wantError error) {
 		t.Helper()
 		req := httptest.NewRequest(method, path, strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
@@ -378,13 +380,20 @@ func TestWriteHandlersRejectWhitespaceOnlyRequiredFields(t *testing.T) {
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("expected 400 for %s %s, got %d body=%s", method, path, rec.Code, rec.Body.String())
 		}
+		var resp map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode %s %s response: %v (body %s)", method, path, err, rec.Body.String())
+		}
+		if got, _ := resp["error"].(string); got != wantError.Error() {
+			t.Fatalf("expected %s %s error %q, got %q", method, path, wantError.Error(), got)
+		}
 	}
 
-	assertBadRequest(http.MethodPost, "/observations", `{"session_id":"s-whitespace","type":"decision","title":" \t\n ","content":"Invalid observation","project":"engram"}`)
-	assertBadRequest(http.MethodPost, "/observations", `{"session_id":"s-whitespace","type":"decision","title":"Valid title","content":" \t\n ","project":"engram"}`)
-	assertBadRequest(http.MethodPatch, fmt.Sprintf("/observations/%d", observationID), `{"title":" \t\n "}`)
-	assertBadRequest(http.MethodPatch, fmt.Sprintf("/observations/%d", observationID), `{"content":" \t\n "}`)
-	assertBadRequest(http.MethodPost, "/prompts", `{"session_id":"s-whitespace","content":" \t\n ","project":"engram"}`)
+	assertBadRequest(http.MethodPost, "/observations", `{"session_id":"s-whitespace","type":"decision","title":" \t\n ","content":"Invalid observation","project":"engram"}`, store.ErrObservationTitleRequired)
+	assertBadRequest(http.MethodPost, "/observations", `{"session_id":"s-whitespace","type":"decision","title":"Valid title","content":" \t\n ","project":"engram"}`, store.ErrObservationContentRequired)
+	assertBadRequest(http.MethodPatch, fmt.Sprintf("/observations/%d", observationID), `{"title":" \t\n "}`, store.ErrObservationTitleRequired)
+	assertBadRequest(http.MethodPatch, fmt.Sprintf("/observations/%d", observationID), `{"content":" \t\n "}`, store.ErrObservationContentRequired)
+	assertBadRequest(http.MethodPost, "/prompts", `{"session_id":"s-whitespace","content":" \t\n ","project":"engram"}`, store.ErrPromptContentRequired)
 
 	var observationCount, promptCount int
 	if err := st.DB().QueryRow(`SELECT count(*) FROM observations`).Scan(&observationCount); err != nil {
@@ -2371,6 +2380,13 @@ func TestHandleUpdateObservationRejectsBlankTitleWithoutSideEffects(t *testing.T
 			h.ServeHTTP(rec, req)
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("expected 400, got %d body=%s", rec.Code, rec.Body.String())
+			}
+			var resp map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode response: %v (body %s)", err, rec.Body.String())
+			}
+			if msg, _ := resp["error"].(string); msg != store.ErrObservationTitleRequired.Error() {
+				t.Fatalf("expected the title error, got %q", msg)
 			}
 			after, err := st.GetObservation(id)
 			if err != nil {

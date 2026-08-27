@@ -7794,14 +7794,22 @@ func TestHandleSaveRejectsEmptyTitle(t *testing.T) {
 				t.Fatalf("expected no observation persisted, got %#v", obs)
 			}
 
+			// The guard runs before project resolution and session creation, so
+			// a rejected save must leave no session behind either.
+			var sessions int
+			if err := s.DB().QueryRow(`SELECT count(*) FROM sessions`).Scan(&sessions); err != nil {
+				t.Fatalf("count sessions: %v", err)
+			}
+			if sessions != 0 {
+				t.Fatalf("expected no session created by a rejected save, got %d", sessions)
+			}
+
 			mutations, err := s.ListPendingSyncMutations(store.DefaultSyncTargetKey, 100)
 			if err != nil {
 				t.Fatalf("list pending sync mutations: %v", err)
 			}
-			for _, mutation := range mutations {
-				if mutation.Entity == store.SyncEntityObservation {
-					t.Fatalf("expected no observation mutation enqueued, got %#v", mutation)
-				}
+			if len(mutations) != 0 {
+				t.Fatalf("expected no sync mutation enqueued, got %#v", mutations)
 			}
 		})
 	}
