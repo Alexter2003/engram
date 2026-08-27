@@ -23,6 +23,8 @@ func TestMCPConfigCandidateRankingValidation(t *testing.T) {
 		{name: "deprecated floor", cfg: MCPConfig{BM25Floor: &floor}, valid: true},
 		{name: "both options", cfg: MCPConfig{BM25MaxRank: &zero, BM25Floor: &floor}},
 		{name: "non-finite max rank", cfg: MCPConfig{BM25MaxRank: ptrBM25(math.Inf(1))}},
+		{name: "max rank NaN", cfg: MCPConfig{BM25MaxRank: ptrBM25(math.NaN())}},
+		{name: "max rank negative infinity", cfg: MCPConfig{BM25MaxRank: ptrBM25(math.Inf(-1))}},
 		{name: "deprecated floor NaN", cfg: MCPConfig{BM25Floor: ptrBM25(math.NaN())}},
 		{name: "deprecated floor positive infinity", cfg: MCPConfig{BM25Floor: ptrBM25(math.Inf(1))}},
 		{name: "deprecated floor negative infinity", cfg: MCPConfig{BM25Floor: ptrBM25(math.Inf(-1))}},
