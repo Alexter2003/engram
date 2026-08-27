@@ -2,39 +2,13 @@
 // process, so these tests exercise the actual spawn/readiness/failure lifecycle instead of
 // re-implementing it with stubs.
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { createServer } from "node:net";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { test } from "node:test";
-import { fileURLToPath, pathToFileURL } from "node:url";
-
-const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
-const NODE_MODULES = join(ROOT, "node_modules");
-
-async function installRuntimeStubs() {
-  await mkdir(join(NODE_MODULES, "@earendil-works", "pi-tui"), { recursive: true });
-  await writeFile(
-    join(NODE_MODULES, "@earendil-works", "pi-tui", "package.json"),
-    JSON.stringify({ type: "module", exports: "./index.js" }),
-  );
-  await writeFile(
-    join(NODE_MODULES, "@earendil-works", "pi-tui", "index.js"),
-    "export class Text { constructor(text) { this.text = text; } }\n",
-  );
-
-  await mkdir(join(NODE_MODULES, "typebox"), { recursive: true });
-  await writeFile(
-    join(NODE_MODULES, "typebox", "package.json"),
-    JSON.stringify({ type: "module", exports: "./index.js" }),
-  );
-  await writeFile(
-    join(NODE_MODULES, "typebox", "index.js"),
-    `const schema = (kind) => (...args) => ({ kind, args });
-export const Type = new Proxy({}, { get: (_target, prop) => schema(String(prop)) });
-`,
-  );
-}
+import { PLUGIN_ROOT as ROOT, RUNTIME_STUB_MARKER, createPluginSandbox, importPluginFromSandbox } from "./plugin-sandbox.mjs";
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -68,8 +42,19 @@ ${exitCode === undefined
   res.writeHead(200, { "content-type": "application/json" });
   res.end("{}");
 });
-setTimeout(() => {
+// The port was picked by a probe socket that has since closed, so another process can win it
+// in between. Retry the bind for a bounded window instead of dying on a lost race.
+let bindAttempts = 0;
+function listen() {
   server.listen(${port}, "127.0.0.1");
+}
+server.on("error", (error) => {
+  if (error.code !== "EADDRINUSE" || bindAttempts >= 40) throw error;
+  bindAttempts += 1;
+  setTimeout(listen, 25);
+});
+setTimeout(() => {
+  listen();
   // Never outlive the test run, even if the parent forgets this detached child.
   setTimeout(() => { server.close(); process.exit(0); }, 5000);
 }, ${readyAfterMs});`
@@ -80,15 +65,12 @@ setTimeout(() => {
   return binPath;
 }
 
-async function loadPlugin({ engramBin, port, cwd }) {
-  await installRuntimeStubs();
+async function loadPlugin({ engramBin, port, cwd, sandbox }) {
   delete process.env.ENGRAM_URL;
   process.env.ENGRAM_BIN = engramBin;
   process.env.ENGRAM_PORT = String(port);
 
-  const pluginUrl = pathToFileURL(join(ROOT, "index.ts"));
-  pluginUrl.search = `?startup=${Date.now()}-${Math.random()}`;
-  const { default: registerEngram } = await import(pluginUrl.href);
+  const registerEngram = await importPluginFromSandbox(sandbox);
 
   const tools = new Map();
   const hooks = new Map();
@@ -117,7 +99,8 @@ async function withFixture(options, run) {
     const engramBin = options.missingBin
       ? join(dir, "engram-does-not-exist")
       : await writeFakeEngramBin(dir, { spawnLog, port, readyAfterMs: options.readyAfterMs ?? 0, exitCode: options.exitCode });
-    const plugin = await loadPlugin({ engramBin, port, cwd: dir });
+    const sandbox = await createPluginSandbox(dir);
+    const plugin = await loadPlugin({ engramBin, port, cwd: dir, sandbox });
     await run({ ...plugin, spawnLog, dir, port });
   } finally {
     if (originalBin === undefined) delete process.env.ENGRAM_BIN; else process.env.ENGRAM_BIN = originalBin;
@@ -179,4 +162,38 @@ test("a child that cannot be spawned surfaces a normalized error through tools a
     assert.equal(result.isError, true);
     assert.match(result.content[0].text, /could not initialize the Engram memory provider/);
   });
+});
+
+test("a persistently failing provider does not restart Engram on every tool call", async () => {
+  await withFixture({ exitCode: 1 }, async ({ tools, ctx, spawnLog }) => {
+    const memSearch = tools.get("mem_search");
+
+    for (let call = 0; call < 50; call += 1) {
+      const result = await memSearch.execute(`call-${call}`, { query: "startup" }, undefined, undefined, ctx);
+      assert.equal(result.isError, true);
+      assert.match(result.content[0].text, /could not initialize the Engram memory provider/);
+    }
+
+    const spawns = await countSpawns(spawnLog);
+    assert.ok(spawns >= 1, "the first call still attempts a real startup");
+    assert.ok(spawns <= 2, `50 failing tool calls produced ${spawns} startup attempts, not a bounded retry`);
+  });
+});
+
+test("loading the plugin leaves the checkout's node_modules untouched", async () => {
+  await withFixture({ exitCode: 1 }, async ({ hooks, ctx }) => {
+    await assert.doesNotReject(hooks.get("session_start")({}, ctx));
+  });
+
+  for (const stub of [
+    join(ROOT, "node_modules", "typebox", "index.js"),
+    join(ROOT, "node_modules", "@earendil-works", "pi-tui", "index.js"),
+  ]) {
+    if (!existsSync(stub)) continue;
+    assert.doesNotMatch(
+      await readFile(stub, "utf8"),
+      new RegExp(RUNTIME_STUB_MARKER),
+      `${stub} was replaced by a test double; the suite must not write into the real node_modules`,
+    );
+  }
 });
