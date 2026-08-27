@@ -7851,6 +7851,63 @@ func TestMigrateProjectMigratesSyncIdentityForRename(t *testing.T) {
 	}
 }
 
+func TestMigrateProjectLeavesCoexistingNormalizedProjectUntouched(t *testing.T) {
+	s := newTestStore(t)
+	// A legacy row can carry a non-normalized spelling that no current write
+	// path produces. Renaming it moves only its own records, so it must not
+	// seize the sync identity of the live project stored under the normalized
+	// spelling either.
+	if err := s.CreateSession("live-session", "engram", "/work/live"); err != nil {
+		t.Fatalf("create live session: %v", err)
+	}
+	if err := s.EnrollProject("engram"); err != nil {
+		t.Fatalf("enroll live: %v", err)
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO sessions (id, project, directory, started_at) VALUES (?, ?, ?, datetime('now'))`,
+		"legacy-session", "Engram", "/work/legacy",
+	); err != nil {
+		t.Fatalf("seed legacy session: %v", err)
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO sync_enrolled_projects (project) VALUES (?)`, "Engram",
+	); err != nil {
+		t.Fatalf("seed legacy enrollment: %v", err)
+	}
+
+	if _, err := s.MigrateProject("Engram", "engram-v2"); err != nil {
+		t.Fatalf("MigrateProject: %v", err)
+	}
+
+	pending := pendingMutationsByEntityKey(t, s)
+	live, ok := pending["live-session"]
+	if !ok {
+		t.Fatalf("coexisting project mutation missing after rename; got %v", pending)
+	}
+	if live.Project != "engram" {
+		t.Fatalf("coexisting mutation project = %q, want %q", live.Project, "engram")
+	}
+	if got := payloadProject(t, live.Payload); got != "engram" {
+		t.Fatalf("coexisting mutation payload project = %q, want %q", got, "engram")
+	}
+
+	stillEnrolled, err := s.IsProjectEnrolled("engram")
+	if err != nil {
+		t.Fatalf("IsProjectEnrolled coexisting: %v", err)
+	}
+	if !stillEnrolled {
+		t.Fatal("coexisting project lost its enrollment to the rename")
+	}
+
+	skipped, err := s.SkipAckNonEnrolledMutations(DefaultSyncTargetKey)
+	if err != nil {
+		t.Fatalf("SkipAckNonEnrolledMutations: %v", err)
+	}
+	if skipped != 0 {
+		t.Fatalf("skip-acked mutations = %d, want 0", skipped)
+	}
+}
+
 func TestMigrateProjectNormalizesNewName(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.CreateSession("s1", "old-name", "/tmp/old"); err != nil {

@@ -4781,9 +4781,11 @@ func (s *Store) MigrateProject(oldName, newName string) (*MigrateResult, error) 
 
 		// Migrate the old name's sync identity — pending journal rows and
 		// enrollment — so renaming a project (including one that was
-		// consolidated) keeps a single deliverable sync identity.
-		normalizedOld, _ := NormalizeProject(oldName)
-		if err := s.migrateProjectSyncIdentityTx(tx, []string{oldName, normalizedOld}, newName); err != nil {
+		// consolidated) keeps a single deliverable sync identity. Only the
+		// exact spelling whose records moved above is migrated: a distinct
+		// project stored under the normalized spelling keeps its own journal
+		// rows and enrollment.
+		if err := s.migrateProjectSyncIdentityTx(tx, []string{oldName}, newName); err != nil {
 			return fmt.Errorf("migrate sync identity: %w", err)
 		}
 
