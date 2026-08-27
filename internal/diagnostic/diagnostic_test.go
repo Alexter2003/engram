@@ -2,7 +2,9 @@ package diagnostic
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +13,12 @@ import (
 )
 
 func newDiagnosticTestStore(t *testing.T) *store.Store {
+	t.Helper()
+	s, _ := newDiagnosticTestStoreWithConfig(t)
+	return s
+}
+
+func newDiagnosticTestStoreWithConfig(t *testing.T) (*store.Store, store.Config) {
 	t.Helper()
 	cfg, err := store.DefaultConfig()
 	if err != nil {
@@ -22,7 +30,7 @@ func newDiagnosticTestStore(t *testing.T) *store.Store {
 		t.Fatalf("store.New: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	return s
+	return s, cfg
 }
 
 func TestSQLiteLockContentionBranches(t *testing.T) {
@@ -126,6 +134,43 @@ func TestSessionProjectDirectoryMismatchFinding(t *testing.T) {
 	}
 	if report.Status != StatusWarning || len(report.Checks[0].Findings) != 1 {
 		t.Fatalf("report=%+v", report)
+	}
+}
+
+// TestSyncMutationRequiredFieldsSurfacesNonEnrolledCountFailure proves the
+// check fails loudly instead of reporting a clean bill of health when the
+// non-enrolled backlog query cannot run. The enrollment join target is dropped
+// after migrations so payload validation still succeeds and only
+// CountPendingNonEnrolledSyncMutations fails.
+func TestSyncMutationRequiredFieldsSurfacesNonEnrolledCountFailure(t *testing.T) {
+	s, cfg := newDiagnosticTestStoreWithConfig(t)
+
+	db, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE sync_enrolled_projects`); err != nil {
+		db.Close()
+		t.Fatalf("drop sync_enrolled_projects: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close probe db: %v", err)
+	}
+
+	report, err := NewRunner().RunOne(context.Background(), Scope{Store: s, Project: "engram"}, CheckSyncMutationRequiredFields)
+	if err == nil {
+		t.Fatalf("expected non-enrolled count failure, got report=%+v", report)
+	}
+	if !strings.Contains(err.Error(), "sync_enrolled_projects") {
+		t.Fatalf("expected error naming the enrollment table, got %v", err)
+	}
+
+	errReport := ErrorReport("engram", err)
+	if errReport.Status != StatusError || errReport.Summary.Errors != 1 {
+		t.Fatalf("expected error report, got %+v", errReport)
+	}
+	if errReport.Checks[0].ReasonCode != "diagnostic_error" || !strings.Contains(errReport.Checks[0].Message, "sync_enrolled_projects") {
+		t.Fatalf("expected surfaced query failure, got %+v", errReport.Checks[0])
 	}
 }
 

@@ -50,6 +50,19 @@ func newDoctorGitRepo(t *testing.T, name string) string {
 	return dir
 }
 
+// initDoctorStore creates the schema so raw seeding helpers can insert rows
+// without going through a higher level command first.
+func initDoctorStore(t *testing.T, cfg store.Config) {
+	t.Helper()
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("store.Close: %v", err)
+	}
+}
+
 func seedDoctorPendingMutation(t *testing.T, cfg store.Config, project, entity, entityKey, op, payload string) {
 	t.Helper()
 	db, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
@@ -72,6 +85,44 @@ func enrollDoctorProject(t *testing.T, cfg store.Config, project string) {
 	if err := s.EnrollProject(project); err != nil {
 		t.Fatalf("EnrollProject: %v", err)
 	}
+}
+
+// doctorValidObservationPayload builds a sync payload that passes required
+// field validation, so the only findings a test can produce come from the
+// non-enrolled backlog rule.
+func doctorValidObservationPayload(syncID, project string) string {
+	return `{"sync_id":"` + syncID + `","session_id":"session-` + syncID + `","type":"decision","title":"Valid","content":"Pending mutation","project":"` + project + `","scope":"project"}`
+}
+
+func decodeDoctorReport(t *testing.T, out string) map[string]any {
+	t.Helper()
+	var report map[string]any
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatalf("doctor json invalid: %v\n%s", err, out)
+	}
+	return report
+}
+
+// doctorNonEnrolledCounts collects the per-project pending mutation counts
+// reported by non_enrolled_pending_mutations findings, failing on any other
+// finding so unrelated regressions cannot pass silently.
+func doctorNonEnrolledCounts(t *testing.T, report map[string]any) map[string]float64 {
+	t.Helper()
+	checks, ok := report["checks"].([]any)
+	if !ok || len(checks) != 1 {
+		t.Fatalf("expected one check, got %v", report["checks"])
+	}
+	counts := map[string]float64{}
+	findings, _ := checks[0].(map[string]any)["findings"].([]any)
+	for _, raw := range findings {
+		finding := raw.(map[string]any)
+		if finding["reason_code"] != "non_enrolled_pending_mutations" {
+			t.Fatalf("unexpected finding reason_code: %v", finding)
+		}
+		evidence := finding["evidence"].(map[string]any)
+		counts[evidence["project"].(string)] = evidence["pending_mutations"].(float64)
+	}
+	return counts
 }
 
 func seedDoctorRepairRows(t *testing.T, cfg store.Config, id, project, directory string) {
@@ -362,5 +413,96 @@ func TestCmdDoctorNonEnrolledPendingMutationsBlockedEnvelope(t *testing.T) {
 	stdout, stderr = captureOutput(t, func() { cmdDoctor(cfg) })
 	if stderr != "" || !strings.Contains(stdout, "non_enrolled_pending_mutations") || !strings.Contains(stdout, "unmanaged") {
 		t.Fatalf("stderr=%q stdout=%q", stderr, stdout)
+	}
+}
+
+// TestCmdDoctorNonEnrolledPendingMutationsRespectsProjectScope proves that a
+// scoped run only reports the requested project, so a non-enrolled backlog in
+// another project never leaks into the findings.
+func TestCmdDoctorNonEnrolledPendingMutationsRespectsProjectScope(t *testing.T) {
+	cfg := testConfig(t)
+	initDoctorStore(t, cfg)
+	seedDoctorPendingMutation(t, cfg, "unmanaged", store.SyncEntityObservation, "obs-unmanaged", store.SyncOpUpsert, doctorValidObservationPayload("obs-unmanaged", "unmanaged"))
+	seedDoctorPendingMutation(t, cfg, "out-of-scope", store.SyncEntityObservation, "obs-out-of-scope", store.SyncOpUpsert, doctorValidObservationPayload("obs-out-of-scope", "out-of-scope"))
+
+	withArgs(t, "engram", "doctor", "--json", "--project", "unmanaged", "--check", "sync_mutation_required_fields")
+	stdout, stderr := captureOutput(t, func() { cmdDoctor(cfg) })
+	if stderr != "" {
+		t.Fatalf("stderr=%q", stderr)
+	}
+
+	report := decodeDoctorReport(t, stdout)
+	if report["status"] != "blocked" || report["project"] != "unmanaged" {
+		t.Fatalf("unexpected report: %v", report)
+	}
+	counts := doctorNonEnrolledCounts(t, report)
+	if len(counts) != 1 || counts["unmanaged"] != 1 {
+		t.Fatalf("expected only the scoped project, got %v", counts)
+	}
+	if strings.Contains(stdout, "out-of-scope") {
+		t.Fatalf("out-of-scope project leaked into scoped report: %s", stdout)
+	}
+}
+
+// TestCmdDoctorNonEnrolledPendingMutationsReportsEveryProject proves an
+// unscoped run reports every non-enrolled project with its own backlog count,
+// and never reports enrolled projects.
+func TestCmdDoctorNonEnrolledPendingMutationsReportsEveryProject(t *testing.T) {
+	cfg := testConfig(t)
+	initDoctorStore(t, cfg)
+	seedDoctorPendingMutation(t, cfg, "alpha", store.SyncEntityObservation, "obs-alpha-1", store.SyncOpUpsert, doctorValidObservationPayload("obs-alpha-1", "alpha"))
+	seedDoctorPendingMutation(t, cfg, "alpha", store.SyncEntityObservation, "obs-alpha-2", store.SyncOpUpsert, doctorValidObservationPayload("obs-alpha-2", "alpha"))
+	seedDoctorPendingMutation(t, cfg, "beta", store.SyncEntityObservation, "obs-beta-1", store.SyncOpUpsert, doctorValidObservationPayload("obs-beta-1", "beta"))
+	seedDoctorPendingMutation(t, cfg, "beta", store.SyncEntityObservation, "obs-beta-2", store.SyncOpUpsert, doctorValidObservationPayload("obs-beta-2", "beta"))
+	seedDoctorPendingMutation(t, cfg, "beta", store.SyncEntityObservation, "obs-beta-3", store.SyncOpUpsert, doctorValidObservationPayload("obs-beta-3", "beta"))
+	seedDoctorPendingMutation(t, cfg, "enrolled", store.SyncEntityObservation, "obs-enrolled", store.SyncOpUpsert, doctorValidObservationPayload("obs-enrolled", "enrolled"))
+	enrollDoctorProject(t, cfg, "enrolled")
+
+	withArgs(t, "engram", "doctor", "--json", "--check", "sync_mutation_required_fields")
+	stdout, stderr := captureOutput(t, func() { cmdDoctor(cfg) })
+	if stderr != "" {
+		t.Fatalf("stderr=%q", stderr)
+	}
+
+	report := decodeDoctorReport(t, stdout)
+	if report["status"] != "blocked" {
+		t.Fatalf("expected blocked report, got %v", report)
+	}
+	counts := doctorNonEnrolledCounts(t, report)
+	want := map[string]float64{"alpha": 2, "beta": 3}
+	if !reflect.DeepEqual(counts, want) {
+		t.Fatalf("counts=%v want %v", counts, want)
+	}
+	if strings.Contains(stdout, `"project": "enrolled"`) {
+		t.Fatalf("enrolled project reported as blocked: %s", stdout)
+	}
+}
+
+// TestCmdDoctorNonEnrolledPendingMutationsTextGuidance proves the human
+// readable output carries the enrollment guidance and the pending mutation
+// count, not just the machine readable envelope.
+func TestCmdDoctorNonEnrolledPendingMutationsTextGuidance(t *testing.T) {
+	cfg := testConfig(t)
+	initDoctorStore(t, cfg)
+	seedDoctorPendingMutation(t, cfg, "unmanaged", store.SyncEntityObservation, "obs-one", store.SyncOpUpsert, doctorValidObservationPayload("obs-one", "unmanaged"))
+	seedDoctorPendingMutation(t, cfg, "unmanaged", store.SyncEntityObservation, "obs-two", store.SyncOpUpsert, doctorValidObservationPayload("obs-two", "unmanaged"))
+
+	withArgs(t, "engram", "doctor", "--project", "unmanaged", "--check", "sync_mutation_required_fields")
+	stdout, stderr := captureOutput(t, func() { cmdDoctor(cfg) })
+	if stderr != "" {
+		t.Fatalf("stderr=%q", stderr)
+	}
+
+	for _, want := range []string{
+		"Engram Doctor: blocked",
+		"[blocked] sync_mutation_required_fields",
+		"next: Run `engram cloud enroll <project>`",
+		"- non_enrolled_pending_mutations:",
+		`"pending_mutations":2`,
+		`"project":"unmanaged"`,
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("doctor text missing %q\n%s", want, stdout)
+		}
 	}
 }
