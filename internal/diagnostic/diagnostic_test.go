@@ -134,6 +134,9 @@ func TestRunnerRunAllHealthyEvaluatesEveryMVPCheck(t *testing.T) {
 	if err := s.CreateSession("manual-save-engram", "engram", "/work/engram"); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
+	if err := s.EnrollProject("engram"); err != nil {
+		t.Fatalf("EnrollProject: %v", err)
+	}
 	report, err := NewRunner().RunAll(context.Background(), Scope{
 		Store:   s,
 		Project: "engram",
