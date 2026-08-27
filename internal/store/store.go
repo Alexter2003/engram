@@ -672,6 +672,7 @@ func New(cfg Config) (*Store, error) {
 
 	s := &Store{db: db, cfg: cfg, hooks: defaultStoreHooks()}
 	if err := s.migrate(); err != nil {
+		_ = db.Close()
 		return nil, fmt.Errorf("engram: migration: %w", err)
 	}
 
