@@ -2,9 +2,11 @@ package diagnostic
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 
+	"github.com/Gentleman-Programming/engram/internal/cloud/constants"
 	projectpkg "github.com/Gentleman-Programming/engram/internal/project"
 	"github.com/Gentleman-Programming/engram/internal/store"
 )
@@ -132,6 +134,18 @@ func knownSessionProjects(scope Scope) (map[string]bool, error) {
 	return known, nil
 }
 
+// cloudSyncInUse reports whether this device opted into cloud sync. Enrollment
+// is the store level signal the cloud paths already use to decide whether a
+// project may be delivered, so at least one enrolled project is the evidence
+// that the operator asked for cloud sync at all.
+func cloudSyncInUse(scope Scope) (bool, error) {
+	enrolled, err := scope.Store.ListEnrolledProjects()
+	if err != nil {
+		return false, err
+	}
+	return len(enrolled) > 0, nil
+}
+
 func (c SyncMutationRequiredFieldsCheck) Run(ctx context.Context, scope Scope) (CheckResult, error) {
 	_ = ctx
 	mutations, err := scope.Store.ListPendingProjectMutations(scope.Project)
@@ -156,6 +170,41 @@ func (c SyncMutationRequiredFieldsCheck) Run(ctx context.Context, scope Scope) (
 			Why:                  "A pending sync mutation with missing required fields can block safe cloud replication and must fail loudly instead of being silently dropped.",
 			Evidence:             mustJSON(map[string]any{"seq": mutation.Seq, "target_key": mutation.TargetKey, "project": mutation.Project, "entity": mutation.Entity, "op": mutation.Op, "entity_key": mutation.EntityKey, "missing_fields": validation.MissingFields}),
 			SafeNextStep:         nextStep,
+			RequiresConfirmation: true,
+		})
+	}
+	// A non-enrolled backlog is only a fault on a device that actually uses
+	// cloud sync. The store journals sync mutations unconditionally, so on a
+	// local-only install every pending mutation belongs to a non-enrolled
+	// project by definition — the normal steady state, not something doctor
+	// should block on and answer with `engram cloud enroll`. This mirrors the
+	// autosync manager, which owns the same reason code and only evaluates it
+	// while cloud sync is configured and running.
+	usesCloudSync, err := cloudSyncInUse(scope)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	if !usesCloudSync {
+		return resultFromFindings(c.Code(), map[string]any{"pending_mutations_evaluated": len(mutations)}, findings), nil
+	}
+	nonEnrolledCounts, err := scope.Store.CountPendingNonEnrolledSyncMutations(store.DefaultSyncTargetKey)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	scopedProject := normalizeProjectName(scope.Project)
+	for _, projectCount := range nonEnrolledCounts {
+		project := normalizeProjectName(projectCount.Project)
+		if scopedProject != "" && project != scopedProject {
+			continue
+		}
+		findings = append(findings, Finding{
+			CheckID:              c.Code(),
+			Severity:             SeverityBlocking,
+			ReasonCode:           constants.ReasonNonEnrolledPendingMutations,
+			Message:              fmt.Sprintf("Pending cloud sync mutations for project %q are blocked because it is not enrolled.", project),
+			Why:                  "Cloud delivery cannot continue while pending mutations belong to a project that is not enrolled.",
+			Evidence:             mustJSON(map[string]any{"project": project, "pending_mutations": projectCount.Count}),
+			SafeNextStep:         "Run `engram cloud enroll <project>` for each intended project or review enrollment, then rerun `engram doctor`.",
 			RequiresConfirmation: true,
 		})
 	}
