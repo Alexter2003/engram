@@ -2,9 +2,11 @@ package diagnostic
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 
+	"github.com/Gentleman-Programming/engram/internal/cloud/constants"
 	projectpkg "github.com/Gentleman-Programming/engram/internal/project"
 	"github.com/Gentleman-Programming/engram/internal/store"
 )
@@ -132,6 +134,18 @@ func knownSessionProjects(scope Scope) (map[string]bool, error) {
 	return known, nil
 }
 
+// cloudSyncInUse reports whether this device opted into cloud sync. Enrollment
+// is the store level signal the cloud paths already use to decide whether a
+// project may be delivered, so at least one enrolled project is the evidence
+// that the operator asked for cloud sync at all.
+func cloudSyncInUse(scope Scope) (bool, error) {
+	enrolled, err := scope.Store.ListEnrolledProjects()
+	if err != nil {
+		return false, err
+	}
+	return len(enrolled) > 0, nil
+}
+
 func (c SyncMutationRequiredFieldsCheck) Run(ctx context.Context, scope Scope) (CheckResult, error) {
 	_ = ctx
 	mutations, err := scope.Store.ListPendingProjectMutations(scope.Project)
@@ -167,14 +181,57 @@ func (c SyncMutationRequiredFieldsCheck) Run(ctx context.Context, scope Scope) (
 			RequiresConfirmation: true,
 		})
 	}
-	// Blocking findings lead the roll-up so the check summary always describes the
-	// work that still needs a decision rather than already-dispositioned evidence.
-	findings := append(blocking, quarantined...)
+	// Quarantined rows are already-taken dispositions, so they never count as
+	// work still pending delivery.
 	evidence := map[string]any{"pending_mutations_evaluated": len(mutations) - len(quarantined)}
 	if len(quarantined) > 0 {
 		evidence["quarantined_mutations"] = len(quarantined)
 	}
-	return resultFromFindings(c.Code(), evidence, findings), nil
+	// Blocking findings lead the roll-up so the check summary always describes the
+	// work that still needs a decision rather than already-dispositioned evidence.
+	rollUp := func() []Finding { return append(append([]Finding{}, blocking...), quarantined...) }
+
+	// A non-enrolled backlog is only a fault on a device that actually uses
+	// cloud sync. The store journals sync mutations unconditionally, so on a
+	// local-only install every pending mutation belongs to a non-enrolled
+	// project by definition — the normal steady state, not something doctor
+	// should block on and answer with `engram cloud enroll`. This mirrors the
+	// autosync manager, which owns the same reason code and only evaluates it
+	// while cloud sync is configured and running. The gate is deliberately
+	// placed after the payload/quarantine pass so a local-only install still
+	// gets its quarantined evidence reported instead of silently dropped.
+	usesCloudSync, err := cloudSyncInUse(scope)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	if !usesCloudSync {
+		return resultFromFindings(c.Code(), evidence, rollUp()), nil
+	}
+	// CountPendingNonEnrolledSyncMutations only counts rows whose disposition is
+	// still `pending`, so a quarantined row can never resurrect this blocking
+	// finding: the backlog it reports is genuinely undeliverable work.
+	nonEnrolledCounts, err := scope.Store.CountPendingNonEnrolledSyncMutations(store.DefaultSyncTargetKey)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	scopedProject := normalizeProjectName(scope.Project)
+	for _, projectCount := range nonEnrolledCounts {
+		project := normalizeProjectName(projectCount.Project)
+		if scopedProject != "" && project != scopedProject {
+			continue
+		}
+		blocking = append(blocking, Finding{
+			CheckID:              c.Code(),
+			Severity:             SeverityBlocking,
+			ReasonCode:           constants.ReasonNonEnrolledPendingMutations,
+			Message:              fmt.Sprintf("Pending cloud sync mutations for project %q are blocked because it is not enrolled.", project),
+			Why:                  "Cloud delivery cannot continue while pending mutations belong to a project that is not enrolled.",
+			Evidence:             mustJSON(map[string]any{"project": project, "pending_mutations": projectCount.Count}),
+			SafeNextStep:         "Run `engram cloud enroll <project>` for each intended project or review enrollment, then rerun `engram doctor`.",
+			RequiresConfirmation: true,
+		})
+	}
+	return resultFromFindings(c.Code(), evidence, rollUp()), nil
 }
 
 func (c SyncMutationRequiredFieldsCheck) quarantinedFinding(mutation store.SyncMutation) Finding {
