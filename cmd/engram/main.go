@@ -1033,6 +1033,13 @@ func cmdSave(cfg store.Config) {
 		}
 	}
 
+	// Reject titleless saves before opening the store or creating a session
+	// (#459). The store applies the same rule as a backstop.
+	if err := store.ValidateObservationTitle(title); err != nil {
+		fatal(err)
+		return
+	}
+
 	s, err := storeNew(cfg)
 	if err != nil {
 		fatal(err)
