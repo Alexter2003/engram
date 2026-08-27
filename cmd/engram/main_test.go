@@ -82,6 +82,21 @@ func captureOutput(t *testing.T, fn func()) (stdout string, stderr string) {
 	os.Stdout = outW
 	os.Stderr = errW
 
+	type capturedOutput struct {
+		bytes []byte
+		err   error
+	}
+	outDone := make(chan capturedOutput, 1)
+	errDone := make(chan capturedOutput, 1)
+	go func() {
+		bytes, err := io.ReadAll(outR)
+		outDone <- capturedOutput{bytes: bytes, err: err}
+	}()
+	go func() {
+		bytes, err := io.ReadAll(errR)
+		errDone <- capturedOutput{bytes: bytes, err: err}
+	}()
+
 	fn()
 
 	_ = outW.Close()
@@ -89,16 +104,30 @@ func captureOutput(t *testing.T, fn func()) (stdout string, stderr string) {
 	os.Stdout = oldOut
 	os.Stderr = oldErr
 
-	outBytes, err := io.ReadAll(outR)
-	if err != nil {
-		t.Fatalf("read stdout: %v", err)
+	out := <-outDone
+	if out.err != nil {
+		t.Fatalf("read stdout: %v", out.err)
 	}
-	errBytes, err := io.ReadAll(errR)
-	if err != nil {
-		t.Fatalf("read stderr: %v", err)
+	errOut := <-errDone
+	if errOut.err != nil {
+		t.Fatalf("read stderr: %v", errOut.err)
 	}
 
-	return string(outBytes), string(errBytes)
+	return string(out.bytes), string(errOut.bytes)
+}
+
+func TestCaptureOutputDrainsLargeStdoutAndStderrConcurrently(t *testing.T) {
+	stdout := strings.Repeat("stdout ", 12*1024)
+	stderr := strings.Repeat("stderr ", 12*1024)
+
+	gotStdout, gotStderr := captureOutput(t, func() {
+		_, _ = fmt.Fprint(os.Stdout, stdout)
+		_, _ = fmt.Fprint(os.Stderr, stderr)
+	})
+
+	if gotStdout != stdout || gotStderr != stderr {
+		t.Fatalf("captureOutput() = (%d stdout bytes, %d stderr bytes), want exact output", len(gotStdout), len(gotStderr))
+	}
 }
 
 func mustSeedObservation(t *testing.T, cfg store.Config, sessionID, project, typ, title, content, scope string) int64 {

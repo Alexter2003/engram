@@ -2829,8 +2829,8 @@ Commands:
                        list     [--project P]  [--status S]  [--since RFC3339]  [--limit N]
                        show     <relation_id>
                        stats    [--project P]
-                       scan     [--project P]  [--since RFC3339]  [--dry-run]  [--apply]  [--max-insert N]
-                                [--semantic]  [--concurrency N]  [--timeout-per-call SECONDS]
+                       scan     [--project P]  [--since RFC3339]  [--limit N]  [--cursor ID]
+                                [--dry-run]  [--apply]  [--max-insert N]  [--semantic]  [--concurrency N]  [--timeout-per-call SECONDS]
                                 [--max-semantic N]  [--yes]
                        deferred [--status S]  [--limit N]  [--inspect SYNC_ID]  [--replay]
   doctor             Run read-only operational diagnostics [--json] [--project P] [--check CODE]

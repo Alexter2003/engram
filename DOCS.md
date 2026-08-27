@@ -339,6 +339,7 @@ Request body:
 ```json
 {
   "project": "my-project",
+  "limit": 100,
   "apply": false,
   "max_insert": 100,
   "semantic": false,
@@ -348,6 +349,8 @@ Request body:
 }
 ```
 
+- `limit` — observations per page (default and maximum 100); rows are ordered by observation ID
+- `cursor` — optional `next_cursor` from a completed previous page; omit to start the first page
 - `apply: false` (default) — dry-run for the non-semantic lexical scan; reports candidates without inserting pending rows
 - `apply: true` — non-semantic lexical scan inserts new pending relation rows up to `max_insert` cap (default 100)
 - `semantic: true` — after FTS5 lexical scan, run LLM-judge semantic detection on the candidate pairs returned by `FindCandidates`. It does not discover totally lexically unrelated pairs on its own. Requires `ENGRAM_AGENT_CLI` to be set on the server to `claude` or `opencode`.
@@ -363,8 +366,10 @@ Response:
 ```json
 {
   "project": "my-project",
-  "inspected": 25,
+  "inspected": 100,
+  "ranked_queries": 100,
   "candidates_found": 5,
+  "next_cursor": 520,
   "already_related": 2,
   "inserted": 0,
   "capped": false,
@@ -375,14 +380,14 @@ Response:
 }
 ```
 
-`semantic_judged`, `semantic_skipped`, and `semantic_errors` are always present (zero when `semantic: false`).
+`semantic_judged`, `semantic_skipped`, and `semantic_errors` are always present (zero when `semantic: false`). `next_cursor` is present only after every candidate for the completed page has been handled. Scans never auto-loop through pages.
 
-When any scan cap is reached, including `max_insert` for lexical apply scans or `max_semantic` for semantic scans, a `warning` field is included:
+When any scan cap is reached, including `max_insert` for lexical apply scans or `max_semantic` for semantic scans, no `next_cursor` is returned. Re-run from the same incoming cursor with a higher cap; the response includes this warning:
 
 ```json
 {
   "project": "my-project",
-  "inspected": 250,
+  "inspected": 100,
   "candidates_found": 150,
   "already_related": 0,
   "inserted": 50,
@@ -391,7 +396,7 @@ When any scan cap is reached, including `max_insert` for lexical apply scans or 
   "semantic_judged": 0,
   "semantic_skipped": 0,
   "semantic_errors": 0,
-  "warning": "cap reached: not all candidates were inserted"
+  "warning": "cap reached: this page has no continuation; rerun from the same cursor with a higher applicable cap"
 }
 ```
 
@@ -518,7 +523,7 @@ Print aggregate grouped `judgment_status` counts (`pending` | `judged` | `orphan
 
 ```
 engram conflicts scan [--project <name>] [--dry-run] [--apply] [--max-insert <N>]
-                      [--since <RFC3339>]
+                      [--since <RFC3339>] [--limit <N>] [--cursor <ID>]
                       [--semantic] [--concurrency <N>] [--timeout-per-call <N>]
                       [--max-semantic <N>] [--yes]
 ```
@@ -528,6 +533,8 @@ Walk observations for the project, run FindCandidates, and report or insert new 
 - `--dry-run` (default): for non-semantic lexical scans, reports candidates found with 0 pending rows inserted.
 - `--apply`: inserts up to `--max-insert` (default 100) new rows; prints WARNING when cap is reached.
 - `--since RFC3339`: scan only observations created at or after the timestamp.
+- `--limit N`: inspect 1–100 observations per page (default 100), ordered by observation ID.
+- `--cursor ID`: resume after a printed `next_cursor`; no automatic follow-up page is run.
 - `--semantic`: enable LLM-judge semantic detection on FTS5 candidate pairs returned by `FindCandidates`. It can improve verdict quality for candidates that share lexical terms, but it does not discover totally lexically unrelated pairs on its own. Requires `ENGRAM_AGENT_CLI=claude` or `ENGRAM_AGENT_CLI=opencode`.
 - With `--semantic`, non-`not_conflict` verdicts are persisted by `JudgeBySemantic` even in the default `--dry-run` mode; `not_conflict` verdicts remain no-op.
 - `--concurrency N`: worker pool size for parallel LLM calls (default 5, max 20).
