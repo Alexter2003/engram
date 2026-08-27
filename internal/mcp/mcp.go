@@ -18,7 +18,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,15 +41,13 @@ type MCPConfig struct {
 	// auto-resolution; per-call project arguments remain separately validated.
 	DefaultProject string
 
-	// BM25MaxRank overrides the largest acceptable raw FTS5 BM25 rank used by
-	// FindCandidates. FTS5 ranks smaller numbers as better matches, so candidates
-	// with a greater rank are excluded. nil uses the store default (0.0).
-	BM25MaxRank *float64
-
-	// BM25Floor preserves the deprecated legacy minimum-rank behavior. Use
-	// BM25MaxRank for FTS5's best-first raw rank ordering. Both fields cannot be set.
+	// BM25Floor overrides the default BM25 score floor used by FindCandidates
+	// during conflict candidate detection (REQ-001). The floor is the minimum
+	// acceptable BM25 rank (negative; closer to 0 = better match). Candidates
+	// whose score falls below this threshold are excluded.
 	//
-	// An explicit pointer value (including 0.0) is forwarded directly. Using a pointer avoids the
+	// nil means "use the store default" (-2.0). An explicit pointer value
+	// (including 0.0) is forwarded directly. Using a pointer avoids the
 	// zero-value ambiguity where 0.0 would otherwise be indistinguishable
 	// from "not set".
 	BM25Floor *float64
@@ -59,18 +56,6 @@ type MCPConfig struct {
 	// mem_save call (REQ-001). nil means "use the store default" (3).
 	// An explicit pointer value (including 0) is forwarded directly.
 	Limit *int
-}
-
-func (c MCPConfig) validateCandidateRanking() error {
-	if c.BM25MaxRank != nil && c.BM25Floor != nil {
-		return fmt.Errorf("BM25MaxRank and deprecated BM25Floor cannot both be set")
-	}
-	for name, value := range map[string]*float64{"BM25MaxRank": c.BM25MaxRank, "BM25Floor": c.BM25Floor} {
-		if value != nil && (math.IsNaN(*value) || math.IsInf(*value, 0)) {
-			return fmt.Errorf("%s must be finite", name)
-		}
-	}
-	return nil
 }
 
 var suggestTopicKey = store.SuggestTopicKey
@@ -1202,9 +1187,6 @@ func handlePin(s *store.Store, pinned bool) server.ToolHandlerFunc {
 
 func handleSave(s *store.Store, cfg MCPConfig, activity *SessionActivity) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		if err := cfg.validateCandidateRanking(); err != nil {
-			return mcp.NewToolResultError("Invalid candidate ranking configuration: " + err.Error()), nil
-		}
 		title, _ := req.GetArguments()["title"].(string)
 		content, _ := req.GetArguments()["content"].(string)
 		if strings.TrimSpace(content) == "" {
@@ -1330,10 +1312,9 @@ func handleSave(s *store.Store, cfg MCPConfig, activity *SessionActivity) server
 		// Build CandidateOptions, forwarding any MCPConfig overrides.
 		// nil fields mean "use store defaults"; explicit pointer values override.
 		candOpts := store.CandidateOptions{
-			Project:     project,
-			Scope:       scope,
-			BM25MaxRank: cfg.BM25MaxRank,
-			BM25Floor:   cfg.BM25Floor,
+			Project:   project,
+			Scope:     scope,
+			BM25Floor: cfg.BM25Floor, // nil → store default (-2.0); explicit value overrides
 		}
 		if cfg.Limit != nil {
 			candOpts.Limit = *cfg.Limit

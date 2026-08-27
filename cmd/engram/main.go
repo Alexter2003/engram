@@ -17,7 +17,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -849,7 +848,6 @@ func tryStartAutosync(ctx context.Context, s *store.Store, cfg store.Config) (au
 func cmdMCP(cfg store.Config) {
 	toolsFilter := ""
 	projectOverride := strings.TrimSpace(os.Getenv("ENGRAM_PROJECT"))
-	var bm25MaxRank, bm25Floor *float64
 	for i := 2; i < len(os.Args); i++ {
 		if strings.HasPrefix(os.Args[i], "--tools=") {
 			toolsFilter = strings.TrimPrefix(os.Args[i], "--tools=")
@@ -870,42 +868,7 @@ func cmdMCP(cfg store.Config) {
 				fatal(fmt.Errorf("--project requires a value"))
 			}
 			i++
-		} else if strings.HasPrefix(os.Args[i], "--bm25-max-rank=") {
-			value, err := parseBM25RankOption("--bm25-max-rank", strings.TrimPrefix(os.Args[i], "--bm25-max-rank="))
-			if err != nil {
-				fatal(err)
-			}
-			bm25MaxRank = &value
-		} else if os.Args[i] == "--bm25-max-rank" {
-			if i+1 >= len(os.Args) {
-				fatal(fmt.Errorf("--bm25-max-rank requires a value"))
-			}
-			value, err := parseBM25RankOption("--bm25-max-rank", os.Args[i+1])
-			if err != nil {
-				fatal(err)
-			}
-			bm25MaxRank = &value
-			i++
-		} else if strings.HasPrefix(os.Args[i], "--bm25-floor=") {
-			value, err := parseBM25RankOption("--bm25-floor", strings.TrimPrefix(os.Args[i], "--bm25-floor="))
-			if err != nil {
-				fatal(err)
-			}
-			bm25Floor = &value
-		} else if os.Args[i] == "--bm25-floor" {
-			if i+1 >= len(os.Args) {
-				fatal(fmt.Errorf("--bm25-floor requires a value"))
-			}
-			value, err := parseBM25RankOption("--bm25-floor", os.Args[i+1])
-			if err != nil {
-				fatal(err)
-			}
-			bm25Floor = &value
-			i++
 		}
-	}
-	if bm25MaxRank != nil && bm25Floor != nil {
-		fatal(fmt.Errorf("--bm25-max-rank and deprecated --bm25-floor cannot both be set"))
 	}
 
 	s, err := storeNew(cfg)
@@ -932,7 +895,7 @@ func cmdMCP(cfg store.Config) {
 	}
 	defer stopAutosync()
 
-	mcpCfg := mcp.MCPConfig{DefaultProject: projectOverride, BM25MaxRank: bm25MaxRank, BM25Floor: bm25Floor}
+	mcpCfg := mcp.MCPConfig{DefaultProject: projectOverride}
 	allowlist := resolveMCPTools(toolsFilter)
 	mcpSrv := newMCPServerWithConfig(s, mcpCfg, allowlist)
 
@@ -940,14 +903,6 @@ func cmdMCP(cfg store.Config) {
 		stopAutosync()
 		fatal(err)
 	}
-}
-
-func parseBM25RankOption(name, raw string) (float64, error) {
-	value, err := strconv.ParseFloat(raw, 64)
-	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
-		return 0, fmt.Errorf("%s requires a finite number", name)
-	}
-	return value, nil
 }
 
 func cmdTUI(cfg store.Config) {
@@ -2696,15 +2651,13 @@ Usage:
 
 Commands:
   serve [port]       Start HTTP API server (default: 7437)
-  mcp [--tools=PROFILE] [--project NAME] [--bm25-max-rank N | --bm25-floor N]
+  mcp [--tools=PROFILE] [--project NAME]
                      Start MCP server (stdio transport, for any AI agent)
                        Profiles: agent (15 tools), admin (4 tools), all (default, 19)
                        Combine: --tools=agent,admin or pick individual tools
                        Example: engram mcp --tools=agent
                        --project NAME  Set process-level default project (overrides cwd detection).
                                        Also accepted as ENGRAM_PROJECT=NAME env var.
-                       --bm25-max-rank N  Keep raw FTS5 ranks <= N (default: 0).
-                       --bm25-floor N     Deprecated legacy ranks >= N behavior.
   tui                Launch interactive terminal UI
   search <query>     Search memories [--type TYPE] [--project PROJECT] [--scope SCOPE] [--limit N]
   save <title> <msg> Save a memory  [--type TYPE] [--project PROJECT] [--scope SCOPE]
@@ -2721,8 +2674,8 @@ Commands:
                        list     [--project P]  [--status S]  [--since RFC3339]  [--limit N]
                        show     <relation_id>
                        stats    [--project P]
-                       scan     [--project P]  [--since RFC3339]  [--dry-run]  [--apply]  [--max-insert N]
-                                [--semantic]  [--concurrency N]  [--timeout-per-call SECONDS]
+                       scan     [--project P]  [--since RFC3339]  [--limit N]  [--cursor ID]
+                                [--dry-run]  [--apply]  [--max-insert N]  [--semantic]  [--concurrency N]  [--timeout-per-call SECONDS]
                                 [--max-semantic N]  [--yes]
                        deferred [--status S]  [--limit N]  [--inspect SYNC_ID]  [--replay]
   doctor             Run read-only operational diagnostics [--json] [--project P] [--check CODE]

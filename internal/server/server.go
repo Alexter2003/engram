@@ -1137,7 +1137,7 @@ func (s *Server) handleListDeferred(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleScanConflicts serves POST /conflicts/scan
-// Body: {"project":"X","since":"...","apply":bool,"max_insert":int,
+// Body: {"project":"X","since":"...","limit":int,"cursor":int,"apply":bool,"max_insert":int,
 //
 //	"semantic":bool,"concurrency":int,"timeout_per_call_seconds":int,"max_semantic":int}
 func (s *Server) handleScanConflicts(w http.ResponseWriter, r *http.Request) {
@@ -1146,6 +1146,8 @@ func (s *Server) handleScanConflicts(w http.ResponseWriter, r *http.Request) {
 		Since     string `json:"since"`
 		Apply     bool   `json:"apply"`
 		MaxInsert int    `json:"max_insert"`
+		Limit     *int   `json:"limit"`
+		Cursor    *int64 `json:"cursor"`
 
 		// Phase 4 semantic fields — all optional, defaults match CLI.
 		// Pointer types so absent fields are nil (use default) vs. explicit 0 (invalid).
@@ -1162,7 +1164,14 @@ func (s *Server) handleScanConflicts(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "project is required")
 		return
 	}
-
+	if body.Limit != nil && (*body.Limit < 1 || *body.Limit > store.DefaultScanLimit) {
+		jsonError(w, http.StatusBadRequest, fmt.Sprintf("limit must be between 1 and %d", store.DefaultScanLimit))
+		return
+	}
+	if body.Cursor != nil && *body.Cursor < 0 {
+		jsonError(w, http.StatusBadRequest, "cursor must be non-negative")
+		return
+	}
 	// Resolve semantic params: validate explicit values, apply defaults for absent fields.
 	concurrency := 5
 	timeoutPerCallSeconds := 60
@@ -1194,10 +1203,12 @@ func (s *Server) handleScanConflicts(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	opts := store.ScanOptions{
-		Project:   body.Project,
-		Apply:     body.Apply,
-		MaxInsert: body.MaxInsert,
+	opts := store.ScanOptions{Project: body.Project, Apply: body.Apply, MaxInsert: body.MaxInsert}
+	if body.Limit != nil {
+		opts.Limit = *body.Limit
+	}
+	if body.Cursor != nil {
+		opts.Cursor = *body.Cursor
 	}
 	if body.Since != "" {
 		t, err := time.Parse(time.RFC3339, body.Since)
@@ -1247,6 +1258,7 @@ func (s *Server) handleScanConflicts(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{
 		"project":          result.Project,
 		"inspected":        result.Inspected,
+		"ranked_queries":   result.RankedQueries,
 		"candidates_found": result.CandidatesFound,
 		"already_related":  result.AlreadyRelated,
 		"inserted":         result.RelationsInserted,
@@ -1257,8 +1269,11 @@ func (s *Server) handleScanConflicts(w http.ResponseWriter, r *http.Request) {
 		"semantic_skipped": result.SemanticSkipped,
 		"semantic_errors":  result.SemanticErrors,
 	}
+	if result.NextCursor != nil {
+		resp["next_cursor"] = *result.NextCursor
+	}
 	if result.Capped {
-		resp["warning"] = "cap reached: not all candidates were inserted"
+		resp["warning"] = "cap reached: this page has no continuation; rerun from the same cursor with a higher applicable cap"
 	}
 
 	jsonResponse(w, http.StatusOK, resp)

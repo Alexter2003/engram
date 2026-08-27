@@ -197,11 +197,6 @@ func TestPrintUsage(t *testing.T) {
 	if !strings.Contains(stdout, "search <query>") || !strings.Contains(stdout, "setup [agent]") {
 		t.Fatalf("usage missing expected commands: %q", stdout)
 	}
-	for _, option := range []string{"--bm25-max-rank N", "--bm25-floor N", "Deprecated legacy ranks >= N behavior"} {
-		if !strings.Contains(stdout, option) {
-			t.Fatalf("usage missing candidate ranking option %q: %q", option, stdout)
-		}
-	}
 	for _, agent := range []string{"opencode", "pi", "claude-code", "gemini-cli", "codex", "antigravity-cli", "windsurf", "qwen", "kiro", "cursor", "vscode-copilot", "kilocode"} {
 		if !strings.Contains(stdout, agent) {
 			t.Fatalf("usage missing setup agent %q: %q", agent, stdout)
