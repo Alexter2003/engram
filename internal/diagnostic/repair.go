@@ -90,13 +90,21 @@ func BuildRepairPlan(ctx context.Context, scope Scope, report Report, check stri
 func planInvalidSessionIdentityRepair(plan *RepairPlan, report Report) {
 	for _, check := range report.Checks {
 		for _, finding := range check.Findings {
-			if finding.ReasonCode != CheckInvalidSessionIdentity {
-				continue
+			switch finding.ReasonCode {
+			case CheckInvalidSessionIdentity:
+				plan.Skipped = append(plan.Skipped, RepairSkip{
+					ReasonCode: "cannot_repair_without_explicit_canonical_session_id",
+					Message:    "cannot repair without explicit canonical session ID; no supported repair input exists",
+				})
+			case ReasonQuarantinedPulledSessionIdentity:
+				// The pull already skipped this mutation and advanced its
+				// cursor. Nothing local is broken, so repair reports it instead
+				// of leaving an unexplained noop next to a doctor finding.
+				plan.Skipped = append(plan.Skipped, RepairSkip{
+					ReasonCode: ReasonQuarantinedPulledSessionIdentity,
+					Message:    "pulled session mutation was quarantined with a blank identity; it can only be applied once the remote side publishes a canonical session ID",
+				})
 			}
-			plan.Skipped = append(plan.Skipped, RepairSkip{
-				ReasonCode: "cannot_repair_without_explicit_canonical_session_id",
-				Message:    "cannot repair without explicit canonical session ID; no supported repair input exists",
-			})
 		}
 	}
 }

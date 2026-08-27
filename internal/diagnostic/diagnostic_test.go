@@ -272,3 +272,79 @@ func TestInvalidSessionIdentityEvidenceDoesNotAttributeMalformedPayloadWithoutEx
 		t.Fatalf("evidence=%+v, want one unassigned malformed mutation", evidence)
 	}
 }
+
+// TestInvalidSessionIdentityCheckReportsQuarantinedPulledSessions proves the
+// pull-side skip is not silent: a historical chunk carrying a blank session
+// identity is skipped so the cursor can advance, and doctor must still report
+// the quarantined mutation as evidence.
+func TestInvalidSessionIdentityCheckReportsQuarantinedPulledSessions(t *testing.T) {
+	s := newDiagnosticTestStore(t)
+	mutation := store.SyncMutation{
+		Seq:       7,
+		Entity:    store.SyncEntitySession,
+		EntityKey: "\t",
+		Op:        store.SyncOpUpsert,
+		Payload:   `{"id":"","project":"engram","directory":"/remote"}`,
+	}
+	if err := s.ApplyPulledMutation(store.DefaultSyncTargetKey, mutation); err != nil {
+		t.Fatalf("ApplyPulledMutation: %v", err)
+	}
+
+	report, err := NewRunner().RunOne(context.Background(), Scope{Store: s, Project: "engram"}, CheckInvalidSessionIdentity)
+	if err != nil {
+		t.Fatalf("RunOne: %v", err)
+	}
+	if len(report.Checks) != 1 || len(report.Checks[0].Findings) != 1 {
+		t.Fatalf("report=%+v, want one quarantined finding", report)
+	}
+	finding := report.Checks[0].Findings[0]
+	if finding.ReasonCode != "quarantined_pulled_session_identity" {
+		t.Fatalf("finding reason code=%q", finding.ReasonCode)
+	}
+	var evidence store.QuarantinedPulledSessionEvidence
+	if err := json.Unmarshal(finding.Evidence, &evidence); err != nil {
+		t.Fatalf("decode evidence: %v", err)
+	}
+	if evidence.RemoteSeq != 7 || evidence.EntityKey != "\t" || evidence.TargetKey != store.DefaultSyncTargetKey || evidence.Project != "engram" {
+		t.Fatalf("evidence=%+v", evidence)
+	}
+
+	var details map[string]any
+	if err := json.Unmarshal(report.Checks[0].Evidence, &details); err != nil {
+		t.Fatalf("decode check evidence: %v", err)
+	}
+	if details["finding_count"] != float64(1) {
+		t.Fatalf("check evidence=%v", details)
+	}
+}
+
+// TestRepairPlanReportsQuarantinedPulledSessionsAsSkipped keeps repair honest:
+// doctor reports the quarantined mutation, so the repair plan must name it as
+// unrepairable instead of returning a bare noop.
+func TestRepairPlanReportsQuarantinedPulledSessionsAsSkipped(t *testing.T) {
+	s := newDiagnosticTestStore(t)
+	if err := s.ApplyPulledMutation(store.DefaultSyncTargetKey, store.SyncMutation{
+		Seq:       3,
+		Entity:    store.SyncEntitySession,
+		EntityKey: "\n",
+		Op:        store.SyncOpUpsert,
+		Payload:   `{"id":"","project":"engram","directory":"/remote"}`,
+	}); err != nil {
+		t.Fatalf("ApplyPulledMutation: %v", err)
+	}
+	scope := Scope{Store: s, Project: "engram"}
+	report, err := NewRunner().RunOne(context.Background(), scope, CheckInvalidSessionIdentity)
+	if err != nil {
+		t.Fatalf("RunOne: %v", err)
+	}
+	plan, err := BuildRepairPlan(context.Background(), scope, report, CheckInvalidSessionIdentity, RepairModeApply)
+	if err != nil {
+		t.Fatalf("BuildRepairPlan: %v", err)
+	}
+	if plan.Status != "noop" || len(plan.Actions) != 0 || len(plan.Skipped) != 1 {
+		t.Fatalf("plan=%+v", plan)
+	}
+	if plan.Skipped[0].ReasonCode != ReasonQuarantinedPulledSessionIdentity {
+		t.Fatalf("skip reason=%q", plan.Skipped[0].ReasonCode)
+	}
+}
