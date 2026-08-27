@@ -1956,6 +1956,47 @@ func findNormalizationEquivalentProjects(name string, existing []string) []proje
 	return matches
 }
 
+// mergedRecordCount reports how many records a merge actually moved. The store
+// validates every source against the canonical name and fail-closes on the ones
+// it cannot prove normalization-equivalent, so a merge can succeed while moving
+// nothing at all. Callers must report that outcome honestly instead of
+// announcing a completed merge.
+func mergedRecordCount(result *store.MergeResult) int64 {
+	if result == nil {
+		return 0
+	}
+	return result.ObservationsUpdated + result.SessionsUpdated + result.PromptsUpdated
+}
+
+// reportUnmergedSources names the selected sources the store left untouched, so
+// a partially applied merge never reads as a complete one.
+func reportUnmergedSources(sources []string, result *store.MergeResult) {
+	merged := make(map[string]bool, len(result.SourcesMerged))
+	for _, name := range result.SourcesMerged {
+		merged[name] = true
+	}
+
+	// SourcesMerged holds the trimmed spelling the store actually rewrote, while
+	// sources holds the raw spellings the operator selected. Only a source that
+	// is literally the canonical name was a no-op by request.
+	var skipped []string
+	seen := make(map[string]bool, len(sources))
+	for _, source := range sources {
+		if strings.TrimSpace(source) == "" || source == result.Canonical {
+			continue
+		}
+		if merged[strings.TrimSpace(source)] || seen[source] {
+			continue
+		}
+		seen[source] = true
+		skipped = append(skipped, source)
+	}
+	if len(skipped) == 0 {
+		return
+	}
+	fmt.Printf("  Not merged (no records moved): %s\n", strings.Join(skipped, ", "))
+}
+
 func cmdProjectsConsolidate(cfg store.Config) {
 	doAll := false
 	dryRun := false
@@ -2067,10 +2108,17 @@ func cmdProjectsConsolidate(cfg store.Config) {
 			fatal(err)
 		}
 
-		fmt.Printf("Done! Merged into %q:\n", result.Canonical)
+		if mergedRecordCount(result) == 0 {
+			fmt.Printf("Nothing merged into %q: the store moved no records for the %d selected project(s).\n",
+				result.Canonical, len(sources))
+			return
+		}
+
+		fmt.Printf("Done! Merged %d project(s) into %q:\n", len(result.SourcesMerged), result.Canonical)
 		fmt.Printf("  Observations: %d\n", result.ObservationsUpdated)
 		fmt.Printf("  Sessions:     %d\n", result.SessionsUpdated)
 		fmt.Printf("  Prompts:      %d\n", result.PromptsUpdated)
+		reportUnmergedSources(sources, result)
 		return
 	}
 
@@ -2188,8 +2236,14 @@ func cmdProjectsConsolidate(cfg store.Config) {
 			fmt.Println()
 			continue
 		}
-		fmt.Printf("  Merged: %d obs, %d sessions, %d prompts\n",
-			result.ObservationsUpdated, result.SessionsUpdated, result.PromptsUpdated)
+		if mergedRecordCount(result) == 0 {
+			fmt.Printf("  Nothing merged into %q: the store moved no records for the %d selected project(s).\n",
+				mergeCanonical, len(sources))
+		} else {
+			fmt.Printf("  Merged: %d obs, %d sessions, %d prompts\n",
+				result.ObservationsUpdated, result.SessionsUpdated, result.PromptsUpdated)
+			reportUnmergedSources(sources, result)
+		}
 
 		if renameTarget != "" && renameTarget != mergeCanonical {
 			migrateResult, err := s.MigrateProject(mergeCanonical, renameTarget)
