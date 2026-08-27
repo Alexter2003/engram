@@ -2746,9 +2746,11 @@ Environment:
   ENGRAM_HTTP_TOKEN  Optional Bearer auth for local HTTP server (engram serve).
                      When set, the following routes require Authorization: Bearer <token>:
                        DELETE /sessions/{id}, DELETE /observations/{id}, DELETE /prompts/{id},
-                       GET /export, POST /import, POST /projects/migrate
+                       GET /export, POST /import
+                     POST /projects/rescue-ownership and deprecated alias POST /projects/migrate
+                       always require a configured token and matching Bearer credential; unset returns 503.
                      Comparison is constant-time. Token is read per-request (no restart needed).
-                     When unset, all routes are open (zero-config default).
+                     Other routes remain open when unset (zero-config default).
   ENGRAM_TIMEZONE    Timezone for timestamp display in TUI and cloud dashboard.
                      Accepts any IANA zone name (e.g. America/New_York, Europe/Berlin).
                      Falls back to system local time when unset or invalid.
