@@ -50,14 +50,17 @@ func TestCmdMCPRejectsBothCandidateRankingOptions(t *testing.T) {
 	}
 }
 
-func TestCmdMCPForwardsBM25MaxRank(t *testing.T) {
+func TestCmdMCPForwardsCandidateRankingOptions(t *testing.T) {
 	for _, tt := range []struct {
-		name string
-		args []string
-		want float64
+		name      string
+		args      []string
+		maxRank   bool
+		wantValue float64
 	}{
-		{name: "equals form", args: []string{"--bm25-max-rank=-1.25"}, want: -1.25},
-		{name: "separate value form", args: []string{"--bm25-max-rank", "-2.5"}, want: -2.5},
+		{name: "max rank equals form", args: []string{"--bm25-max-rank=-1.25"}, maxRank: true, wantValue: -1.25},
+		{name: "max rank separate value form", args: []string{"--bm25-max-rank", "-2.5"}, maxRank: true, wantValue: -2.5},
+		{name: "deprecated floor equals form", args: []string{"--bm25-floor=-1.25"}, wantValue: -1.25},
+		{name: "deprecated floor separate value form", args: []string{"--bm25-floor", "-2.5"}, wantValue: -2.5},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			s, err := store.New(testConfig(t))
@@ -68,7 +71,11 @@ func TestCmdMCPForwardsBM25MaxRank(t *testing.T) {
 			storeNew = func(store.Config) (*store.Store, error) { return s, nil }
 			var got *float64
 			newMCPServerWithConfig = func(s *store.Store, cfg mcp.MCPConfig, allowlist map[string]bool) *mcpserver.MCPServer {
-				got = cfg.BM25MaxRank
+				if tt.maxRank {
+					got = cfg.BM25MaxRank
+				} else {
+					got = cfg.BM25Floor
+				}
 				return mcp.NewServer(s)
 			}
 			serveMCP = func(*mcpserver.MCPServer, ...mcpserver.StdioOption) error { return nil }
@@ -79,8 +86,8 @@ func TestCmdMCPForwardsBM25MaxRank(t *testing.T) {
 			withArgs(t, append([]string{"engram", "mcp"}, tt.args...)...)
 			cmdMCP(testConfig(t))
 
-			if got == nil || *got != tt.want {
-				t.Fatalf("MCPConfig.BM25MaxRank = %v, want %v", got, tt.want)
+			if got == nil || *got != tt.wantValue {
+				t.Fatalf("candidate ranking option = %v, want %v", got, tt.wantValue)
 			}
 		})
 	}
