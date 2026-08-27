@@ -1181,6 +1181,13 @@ func handleSave(s *store.Store, cfg MCPConfig, activity *SessionActivity) server
 		if strings.TrimSpace(content) == "" {
 			return mcp.NewToolResultError("content is required for mem_save (use content, or observation for backward-compatible clients)"), nil
 		}
+		// Reject titleless saves before any project resolution or session
+		// creation, so a rejected mem_save leaves no session behind (#459). The
+		// store applies the same rule as a backstop, and this message keeps the
+		// "Failed to save" prefix so callers read one wording either way.
+		if err := store.ValidateObservationTitle(title); err != nil {
+			return mcp.NewToolResultError("Failed to save: " + err.Error()), nil
+		}
 		typ, _ := req.GetArguments()["type"].(string)
 		sessionID, _ := req.GetArguments()["session_id"].(string)
 		scope, _ := req.GetArguments()["scope"].(string)

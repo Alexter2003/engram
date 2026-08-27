@@ -721,10 +721,11 @@ async function callMemoryTool(toolName: string, params: Record<string, unknown>,
       if (!requestedProject) requireResolvedProject();
       const promptSessionId = runtimeSessionForWrite();
       await ensureSession(promptSessionId, activeProject);
-      return engramFetch("/prompts", {
+      const response = await engramFetch<{ id: number }>("/prompts", {
         method: "POST",
         body: { session_id: promptSessionId, content: params.content, project: activeProject },
       });
+      return response ? { prompt_id: response.id, status: "saved" } : response;
     }
     case "mem_session_summary": {
       if (!requestedProject) requireResolvedProject();

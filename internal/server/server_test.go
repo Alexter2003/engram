@@ -588,7 +588,9 @@ func TestWriteHandlersRejectWhitespaceOnlyRequiredFields(t *testing.T) {
 		t.Fatalf("seed observation: %v", err)
 	}
 
-	assertBadRequest := func(method, path, body string) {
+	// Every rejection must use the API's standard validation shape: HTTP 400
+	// carrying the sentinel error text in the JSON `error` field.
+	assertBadRequest := func(method, path, body string, wantError error) {
 		t.Helper()
 		req := httptest.NewRequest(method, path, strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
@@ -597,13 +599,20 @@ func TestWriteHandlersRejectWhitespaceOnlyRequiredFields(t *testing.T) {
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("expected 400 for %s %s, got %d body=%s", method, path, rec.Code, rec.Body.String())
 		}
+		var resp map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode %s %s response: %v (body %s)", method, path, err, rec.Body.String())
+		}
+		if got, _ := resp["error"].(string); got != wantError.Error() {
+			t.Fatalf("expected %s %s error %q, got %q", method, path, wantError.Error(), got)
+		}
 	}
 
-	assertBadRequest(http.MethodPost, "/observations", `{"session_id":"s-whitespace","type":"decision","title":" \t\n ","content":"Invalid observation","project":"engram"}`)
-	assertBadRequest(http.MethodPost, "/observations", `{"session_id":"s-whitespace","type":"decision","title":"Valid title","content":" \t\n ","project":"engram"}`)
-	assertBadRequest(http.MethodPatch, fmt.Sprintf("/observations/%d", observationID), `{"title":" \t\n "}`)
-	assertBadRequest(http.MethodPatch, fmt.Sprintf("/observations/%d", observationID), `{"content":" \t\n "}`)
-	assertBadRequest(http.MethodPost, "/prompts", `{"session_id":"s-whitespace","content":" \t\n ","project":"engram"}`)
+	assertBadRequest(http.MethodPost, "/observations", `{"session_id":"s-whitespace","type":"decision","title":" \t\n ","content":"Invalid observation","project":"engram"}`, store.ErrObservationTitleRequired)
+	assertBadRequest(http.MethodPost, "/observations", `{"session_id":"s-whitespace","type":"decision","title":"Valid title","content":" \t\n ","project":"engram"}`, store.ErrObservationContentRequired)
+	assertBadRequest(http.MethodPatch, fmt.Sprintf("/observations/%d", observationID), `{"title":" \t\n "}`, store.ErrObservationTitleRequired)
+	assertBadRequest(http.MethodPatch, fmt.Sprintf("/observations/%d", observationID), `{"content":" \t\n "}`, store.ErrObservationContentRequired)
+	assertBadRequest(http.MethodPost, "/prompts", `{"session_id":"s-whitespace","content":" \t\n ","project":"engram"}`, store.ErrPromptContentRequired)
 
 	var observationCount, promptCount int
 	if err := st.DB().QueryRow(`SELECT count(*) FROM observations`).Scan(&observationCount); err != nil {
@@ -2417,5 +2426,176 @@ func TestMigrateProjectRejectsLegacyRenamePayload(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected legacy rename payload to be rejected, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestHandleAddObservationRejectsBlankTitle pins that POST /observations answers
+// 400 (client mistake) rather than 500 or 201 when the title is blank (#459).
+func TestHandleAddObservationRejectsBlankTitle(t *testing.T) {
+	st := newServerTestStore(t)
+	srv := New(st, 0)
+	h := srv.Handler()
+
+	var writeCount atomic.Int32
+	srv.SetOnWrite(func() { writeCount.Add(1) })
+
+	if err := st.CreateSession("s-blank-title", "engram", t.TempDir()); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	for _, body := range []string{
+		`{"session_id":"s-blank-title","type":"note","title":"","content":"body","project":"engram"}`,
+		`{"session_id":"s-blank-title","type":"note","title":"   ","content":"body","project":"engram"}`,
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/observations", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("body %s: expected 400, got %d (%s)", body, rec.Code, rec.Body.String())
+		}
+	}
+
+	if writeCount.Load() != 0 {
+		t.Fatalf("expected 0 onWrite calls for rejected writes, got %d", writeCount.Load())
+	}
+}
+
+// TestHandleAddObservationBlankTitleNotMaskedBySessionError pins that the title
+// check runs before the session/project lookup. A whitespace-only title passes
+// the raw required-fields check, so before #459's follow-up the request was
+// answered with the session error instead of the documented title 400.
+func TestHandleAddObservationBlankTitleNotMaskedBySessionError(t *testing.T) {
+	st := newServerTestStore(t)
+	srv := New(st, 0)
+	h := srv.Handler()
+
+	var writeCount atomic.Int32
+	srv.SetOnWrite(func() { writeCount.Add(1) })
+
+	// Exists, but bound to a different project than the request claims.
+	if err := st.CreateSession("s-mismatched", "engram", t.TempDir()); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{
+			name: "nonexistent session",
+			body: `{"session_id":"s-does-not-exist","type":"note","title":"   ","content":"body","project":"engram"}`,
+		},
+		{
+			name: "mismatched project",
+			body: `{"session_id":"s-mismatched","type":"note","title":"   ","content":"body","project":"other"}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/observations", strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d (%s)", rec.Code, rec.Body.String())
+			}
+
+			var resp map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode response: %v (body %s)", err, rec.Body.String())
+			}
+			msg, _ := resp["error"].(string)
+			if msg != store.ErrObservationTitleRequired.Error() {
+				t.Fatalf("expected the title error, got %q — the session lookup masked it", msg)
+			}
+		})
+	}
+
+	if writeCount.Load() != 0 {
+		t.Fatalf("expected 0 onWrite calls for rejected writes, got %d", writeCount.Load())
+	}
+}
+
+func TestHandleUpdateObservationRejectsBlankTitleWithoutSideEffects(t *testing.T) {
+	st := newServerTestStore(t)
+	srv := New(st, 0)
+	h := srv.Handler()
+	var writeCount atomic.Int32
+	srv.SetOnWrite(func() { writeCount.Add(1) })
+
+	if err := st.CreateSession("s-update-title-guard", "engram", t.TempDir()); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	id, err := st.AddObservation(store.AddObservationParams{
+		SessionID: "s-update-title-guard",
+		Type:      "note",
+		Title:     "Original title",
+		Content:   "Original content",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+	before, err := st.GetObservation(id)
+	if err != nil {
+		t.Fatalf("get original observation: %v", err)
+	}
+	countMutations := func() int {
+		t.Helper()
+		mutations, err := st.ListPendingSyncMutations(store.DefaultSyncTargetKey, 10)
+		if err != nil {
+			t.Fatalf("list pending mutations: %v", err)
+		}
+		count := 0
+		for _, mutation := range mutations {
+			if mutation.Entity == store.SyncEntityObservation && mutation.EntityKey == before.SyncID {
+				count++
+			}
+		}
+		return count
+	}
+	mutationsBefore := countMutations()
+
+	for _, title := range []string{"", " \t\n "} {
+		title := title
+		t.Run("blank title", func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/observations/%d", id), strings.NewReader(fmt.Sprintf(`{"title":%q}`, title)))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d body=%s", rec.Code, rec.Body.String())
+			}
+			var resp map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode response: %v (body %s)", err, rec.Body.String())
+			}
+			if msg, _ := resp["error"].(string); msg != store.ErrObservationTitleRequired.Error() {
+				t.Fatalf("expected the title error, got %q", msg)
+			}
+			after, err := st.GetObservation(id)
+			if err != nil {
+				t.Fatalf("get observation after rejected update: %v", err)
+			}
+			if after.Title != before.Title || after.Content != before.Content || after.RevisionCount != before.RevisionCount {
+				t.Fatalf("rejected update changed observation: before=%#v after=%#v", before, after)
+			}
+			if got := countMutations(); got != mutationsBefore {
+				t.Fatalf("rejected update enqueued a mutation: got %d, want %d", got, mutationsBefore)
+			}
+		})
+	}
+	if writeCount.Load() != 0 {
+		t.Fatalf("expected no onWrite calls for rejected updates, got %d", writeCount.Load())
+	}
+
+	req := httptest.NewRequest(http.MethodPatch, "/observations/999999", strings.NewReader(`{"title":"updated"}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for missing observation, got %d body=%s", rec.Code, rec.Body.String())
 	}
 }

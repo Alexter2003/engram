@@ -65,6 +65,87 @@ function runtimeContext(sessionId) {
   };
 }
 
+// Records every request the extension issues so a test can assert the wire contract the Engram
+// HTTP server actually receives, instead of asserting over the extension source text.
+function recordingFetch(routes) {
+  const calls = [];
+  const fetchStub = async (url, init = {}) => {
+    const method = init.method ?? "GET";
+    const path = new URL(url).pathname + new URL(url).search;
+    const body = init.body ? JSON.parse(init.body) : undefined;
+    calls.push({ method, path, body });
+    const route = routes.find((candidate) => candidate.method === method && path.startsWith(candidate.path));
+    const status = route?.status ?? 200;
+    const payload = route?.body ?? {};
+    return new Response(JSON.stringify(payload), {
+      status,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+  return { calls, fetchStub };
+}
+
+test("registered Pi-native mem_save_prompt persists through the Engram /prompts endpoint", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalUrl = process.env.ENGRAM_URL;
+  process.env.ENGRAM_URL = "http://127.0.0.1:17437";
+
+  // The server assigns prompt ids from user_prompts, a table whose sequence is independent of
+  // observations. Issue #706 read one of these low ids as an observation id; the response must
+  // therefore name the namespace it belongs to.
+  const serverAssignedPromptID = 213;
+  const { calls, fetchStub } = recordingFetch([
+    { method: "GET", path: "/health", body: { status: "ok" } },
+    { method: "GET", path: "/project/current", body: { project: "paidosdep" } },
+    { method: "POST", path: "/sessions", body: { status: "ok" } },
+    { method: "POST", path: "/prompts", status: 201, body: { id: serverAssignedPromptID, status: "saved" } },
+  ]);
+  globalThis.fetch = fetchStub;
+
+  try {
+    const { registeredTools } = await loadPluginHarness("prompt-identity");
+    const memSavePrompt = registeredTools.get("mem_save_prompt");
+    assert.ok(memSavePrompt, "mem_save_prompt tool should be registered");
+
+    const result = await memSavePrompt.execute(
+      "tool-call-prompt",
+      { content: "preserve this exact user prompt", project: "paidosdep" },
+      undefined,
+      undefined,
+      runtimeContext("test-session"),
+    );
+
+    assert.notEqual(result.isError, true, "a successful prompt save must not surface as a tool error");
+
+    // The prompt must reach POST /prompts carrying the requested project scope, and the session it
+    // references must have been created under that same project first.
+    const promptCall = calls.find((call) => call.method === "POST" && call.path === "/prompts");
+    assert.ok(promptCall, "mem_save_prompt must POST to /prompts");
+    assert.equal(promptCall.body.project, "paidosdep");
+    assert.equal(promptCall.body.content, "preserve this exact user prompt");
+    assert.ok(promptCall.body.session_id, "the prompt must be attributed to a session");
+
+    const sessionCall = calls.find((call) => call.method === "POST" && call.path === "/sessions");
+    assert.ok(sessionCall, "mem_save_prompt must ensure its session exists before writing");
+    assert.equal(sessionCall.body.project, "paidosdep");
+    assert.equal(sessionCall.body.id, promptCall.body.session_id);
+    assert.ok(
+      calls.indexOf(sessionCall) < calls.indexOf(promptCall),
+      "the session must be created before the prompt that references it",
+    );
+
+    // The returned identity is prompt-scoped: it echoes the id the server assigned, and it is not
+    // offered under a name that mem_get_observation would accept.
+    assert.deepEqual(result.details.data, { prompt_id: serverAssignedPromptID, status: "saved" });
+    assert.equal(result.details.data.id, undefined, "an observation-shaped id must not be returned");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalUrl === undefined) delete process.env.ENGRAM_URL;
+    else process.env.ENGRAM_URL = originalUrl;
+    await rm(NODE_MODULES, { recursive: true, force: true });
+  }
+});
+
 test("registered Pi-native mem_search reports native provider transport failure", async () => {
   const originalFetch = globalThis.fetch;
   const originalUrl = process.env.ENGRAM_URL;
