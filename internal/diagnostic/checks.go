@@ -152,8 +152,16 @@ func (c SyncMutationRequiredFieldsCheck) Run(ctx context.Context, scope Scope) (
 	if err != nil {
 		return CheckResult{}, err
 	}
-	findings := make([]Finding, 0)
+	blocking := make([]Finding, 0)
+	quarantined := make([]Finding, 0)
 	for _, mutation := range mutations {
+		// A quarantined row is an explicit, already-taken disposition: it no
+		// longer reaches transport, so it must not keep doctor blocked. It stays
+		// reported as non-blocking evidence of what was dropped from sync.
+		if strings.TrimSpace(mutation.Disposition) == store.SyncMutationDispositionQuarantined {
+			quarantined = append(quarantined, c.quarantinedFinding(mutation))
+			continue
+		}
 		validation := store.ValidateSyncMutationPayload(mutation.Entity, mutation.Op, mutation.Payload, mutation.EntityKey)
 		if validation.ReasonCode == "" {
 			continue
@@ -162,7 +170,7 @@ func (c SyncMutationRequiredFieldsCheck) Run(ctx context.Context, scope Scope) (
 		if strings.TrimSpace(scope.Project) != "" {
 			nextStep = "Run `engram cloud upgrade doctor --project " + scope.Project + "` and inspect the mutation payload before any manual repair."
 		}
-		findings = append(findings, Finding{
+		blocking = append(blocking, Finding{
 			CheckID:              c.Code(),
 			Severity:             SeverityBlocking,
 			ReasonCode:           validation.ReasonCode,
@@ -173,20 +181,35 @@ func (c SyncMutationRequiredFieldsCheck) Run(ctx context.Context, scope Scope) (
 			RequiresConfirmation: true,
 		})
 	}
+	// Quarantined rows are already-taken dispositions, so they never count as
+	// work still pending delivery.
+	evidence := map[string]any{"pending_mutations_evaluated": len(mutations) - len(quarantined)}
+	if len(quarantined) > 0 {
+		evidence["quarantined_mutations"] = len(quarantined)
+	}
+	// Blocking findings lead the roll-up so the check summary always describes the
+	// work that still needs a decision rather than already-dispositioned evidence.
+	rollUp := func() []Finding { return append(append([]Finding{}, blocking...), quarantined...) }
+
 	// A non-enrolled backlog is only a fault on a device that actually uses
 	// cloud sync. The store journals sync mutations unconditionally, so on a
 	// local-only install every pending mutation belongs to a non-enrolled
 	// project by definition — the normal steady state, not something doctor
 	// should block on and answer with `engram cloud enroll`. This mirrors the
 	// autosync manager, which owns the same reason code and only evaluates it
-	// while cloud sync is configured and running.
+	// while cloud sync is configured and running. The gate is deliberately
+	// placed after the payload/quarantine pass so a local-only install still
+	// gets its quarantined evidence reported instead of silently dropped.
 	usesCloudSync, err := cloudSyncInUse(scope)
 	if err != nil {
 		return CheckResult{}, err
 	}
 	if !usesCloudSync {
-		return resultFromFindings(c.Code(), map[string]any{"pending_mutations_evaluated": len(mutations)}, findings), nil
+		return resultFromFindings(c.Code(), evidence, rollUp()), nil
 	}
+	// CountPendingNonEnrolledSyncMutations only counts rows whose disposition is
+	// still `pending`, so a quarantined row can never resurrect this blocking
+	// finding: the backlog it reports is genuinely undeliverable work.
 	nonEnrolledCounts, err := scope.Store.CountPendingNonEnrolledSyncMutations(store.DefaultSyncTargetKey)
 	if err != nil {
 		return CheckResult{}, err
@@ -197,7 +220,7 @@ func (c SyncMutationRequiredFieldsCheck) Run(ctx context.Context, scope Scope) (
 		if scopedProject != "" && project != scopedProject {
 			continue
 		}
-		findings = append(findings, Finding{
+		blocking = append(blocking, Finding{
 			CheckID:              c.Code(),
 			Severity:             SeverityBlocking,
 			ReasonCode:           constants.ReasonNonEnrolledPendingMutations,
@@ -208,7 +231,31 @@ func (c SyncMutationRequiredFieldsCheck) Run(ctx context.Context, scope Scope) (
 			RequiresConfirmation: true,
 		})
 	}
-	return resultFromFindings(c.Code(), map[string]any{"pending_mutations_evaluated": len(mutations)}, findings), nil
+	return resultFromFindings(c.Code(), evidence, rollUp()), nil
+}
+
+func (c SyncMutationRequiredFieldsCheck) quarantinedFinding(mutation store.SyncMutation) Finding {
+	return Finding{
+		CheckID:    c.Code(),
+		Severity:   SeverityInfo,
+		ReasonCode: "sync_mutation_quarantined",
+		Message:    "Sync mutation is quarantined and no longer blocks cloud replication.",
+		Why:        "Quarantine keeps the irreparable journal row as durable local evidence while removing it from transport, so doctor reports it instead of staying blocked forever.",
+		Evidence: mustJSON(map[string]any{
+			"seq":                  mutation.Seq,
+			"target_key":           mutation.TargetKey,
+			"project":              mutation.Project,
+			"entity":               mutation.Entity,
+			"op":                   mutation.Op,
+			"entity_key":           mutation.EntityKey,
+			"disposition":          mutation.Disposition,
+			"disposition_reason":   mutation.DispositionReason,
+			"disposition_evidence": mutation.DispositionEvidence,
+			"disposition_at":       mutation.DispositionAt,
+		}),
+		SafeNextStep:         "No action required. Inspect the recorded disposition evidence if you need to know what was dropped from cloud sync.",
+		RequiresConfirmation: false,
+	}
 }
 
 func (c SQLiteLockContentionCheck) Run(ctx context.Context, scope Scope) (CheckResult, error) {
