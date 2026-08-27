@@ -152,7 +152,7 @@ func TestCmdDoctorRepairValidation(t *testing.T) {
 		{name: "missing mode", args: []string{"engram", "doctor", "repair", "--project", "sias-app", "--check", "session_project_directory_mismatch"}, want: "exactly one of --plan, --dry-run, or --apply is required"},
 		{name: "multiple modes", args: []string{"engram", "doctor", "repair", "--project", "sias-app", "--check", "session_project_directory_mismatch", "--plan", "--apply"}, want: "exactly one of --plan, --dry-run, or --apply is required"},
 		{name: "missing project", args: []string{"engram", "doctor", "repair", "--check", "session_project_directory_mismatch", "--plan"}, want: "--project is required"},
-		{name: "unsupported check", args: []string{"engram", "doctor", "repair", "--project", "sias-app", "--check", "sync_mutation_required_fields", "--plan"}, want: "unsupported repair check"},
+		{name: "unsupported check", args: []string{"engram", "doctor", "repair", "--project", "sias-app", "--check", "not_real", "--plan"}, want: "unsupported repair check"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -218,6 +218,66 @@ func TestCmdDoctorRepairPlanDryRunApplyJSON(t *testing.T) {
 		t.Fatalf("backup missing: %v", err)
 	}
 	assertDoctorRepairProject(t, cfg, "repair-s1", "engram")
+}
+
+func TestCmdDoctorRepairInvalidSessionIdentityReportsExplicitImpossibility(t *testing.T) {
+	cfg := testConfig(t)
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close initialized store: %v", err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO sessions (id, project, directory) VALUES ('', 'engram', '/tmp/engram');
+		INSERT INTO sync_enrolled_projects (project) VALUES ('engram');`); err != nil {
+		_ = db.Close()
+		t.Fatalf("seed corrupt session: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close seeded database: %v", err)
+	}
+
+	for _, mode := range []string{"--plan", "--dry-run", "--apply"} {
+		t.Run(mode, func(t *testing.T) {
+			withArgs(t, "engram", "doctor", "repair", "--project", "engram", "--check", "invalid_session_identity", mode)
+			stdout, stderr := captureOutput(t, func() { cmdDoctor(cfg) })
+			if stderr != "" {
+				t.Fatalf("stderr=%q", stderr)
+			}
+			plan := decodeRepairPlan(t, stdout)
+			if plan["status"] != "noop" || len(plan["actions"].([]any)) != 0 {
+				t.Fatalf("plan=%v", plan)
+			}
+			skipped := plan["skipped"].([]any)
+			if len(skipped) != 1 || skipped[0].(map[string]any)["reason_code"] != "cannot_repair_without_explicit_canonical_session_id" {
+				t.Fatalf("skipped=%v", skipped)
+			}
+		})
+	}
+
+	db, err = sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
+	if err != nil {
+		t.Fatalf("reopen database: %v", err)
+	}
+	defer db.Close()
+	var sessions, mutations int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sessions WHERE id = ''`).Scan(&sessions); err != nil {
+		t.Fatalf("count source sessions: %v", err)
+	}
+	if sessions != 1 {
+		t.Fatalf("repair unexpectedly changed source session count=%d", sessions)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE entity = ?`, store.SyncEntitySession).Scan(&mutations); err != nil {
+		t.Fatalf("count session mutations: %v", err)
+	}
+	if mutations != 0 {
+		t.Fatalf("doctor startup emitted %d broken session mutation(s)", mutations)
+	}
 }
 
 func decodeRepairPlan(t *testing.T, out string) map[string]any {
@@ -374,6 +434,160 @@ func TestCmdDoctorSyncMutationRequiredFieldsBlockedEnvelope(t *testing.T) {
 	evidence := finding["evidence"].(map[string]any)
 	if evidence["entity"] != store.SyncEntityObservation || evidence["entity_key"] != "obs-missing" {
 		t.Fatalf("unexpected evidence: %v", evidence)
+	}
+}
+
+func TestCmdDoctorRepairQuarantinesOnlyIrreparableMutations(t *testing.T) {
+	cfg := testConfig(t)
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	seedDoctorPendingMutation(t, cfg, "", store.SyncEntitySession, "poison", store.SyncOpUpsert, `{"id":"poison"}`)
+	seedDoctorPendingMutation(t, cfg, "", store.SyncEntitySession, "later", store.SyncOpDelete, `{"id":"later"}`)
+
+	withArgs(t, "engram", "doctor", "repair", "--check", "sync_mutation_required_fields", "--dry-run")
+	dryOut, dryErr := captureOutput(t, func() { cmdDoctor(cfg) })
+	if dryErr != "" {
+		t.Fatalf("dry-run stderr=%q", dryErr)
+	}
+	dry := decodeRepairPlan(t, dryOut)
+	if dry["applied"] != false || len(dry["actions"].([]any)) != 1 {
+		t.Fatalf("dry-run=%v", dry)
+	}
+
+	withArgs(t, "engram", "doctor", "repair", "--check", "sync_mutation_required_fields", "--apply")
+	applyOut, applyErr := captureOutput(t, func() { cmdDoctor(cfg) })
+	if applyErr != "" {
+		t.Fatalf("apply stderr=%q", applyErr)
+	}
+	applied := decodeRepairPlan(t, applyOut)
+	if applied["applied"] != true || len(applied["actions"].([]any)) != 1 {
+		t.Fatalf("apply=%v", applied)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	var poison, later string
+	if err := db.QueryRow(`SELECT disposition FROM sync_mutations WHERE entity_key = 'poison'`).Scan(&poison); err != nil {
+		t.Fatalf("read poison: %v", err)
+	}
+	if err := db.QueryRow(`SELECT disposition FROM sync_mutations WHERE entity_key = 'later'`).Scan(&later); err != nil {
+		t.Fatalf("read later: %v", err)
+	}
+	if poison != store.SyncMutationDispositionQuarantined || later != store.SyncMutationDispositionPending {
+		t.Fatalf("dispositions poison=%q later=%q", poison, later)
+	}
+}
+
+func TestCmdDoctorRepairApplyUnblocksDoctorAndKeepsPendingWork(t *testing.T) {
+	cfg := testConfig(t)
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	seedDoctorPendingMutation(t, cfg, "engram", store.SyncEntitySession, "poison", store.SyncOpUpsert, `{"id":"poison"}`)
+	seedDoctorPendingMutation(t, cfg, "engram", store.SyncEntitySession, "keep", store.SyncOpUpsert, `{"id":"keep","directory":"/work/engram"}`)
+	// `engram` is enrolled on purpose: the repair contract this test pins is the
+	// cloud one, so the check must run past the cloud-sync gate instead of taking
+	// the local-only early return.
+	enrollDoctorProject(t, cfg, "engram")
+
+	runDoctor := func(stage string) map[string]any {
+		t.Helper()
+		withArgs(t, "engram", "doctor", "--json", "--project", "engram", "--check", "sync_mutation_required_fields")
+		stdout, stderr := captureOutput(t, func() { cmdDoctor(cfg) })
+		if stderr != "" {
+			t.Fatalf("%s stderr=%q", stage, stderr)
+		}
+		var report map[string]any
+		if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+			t.Fatalf("%s doctor json invalid: %v\n%s", stage, err, stdout)
+		}
+		return report
+	}
+
+	if report := runDoctor("before repair"); report["status"] != "blocked" {
+		t.Fatalf("expected blocked doctor before repair, got %v", report)
+	}
+
+	withArgs(t, "engram", "doctor", "repair", "--project", "engram", "--check", "sync_mutation_required_fields", "--apply")
+	applyOut, applyErr := captureOutput(t, func() { cmdDoctor(cfg) })
+	if applyErr != "" {
+		t.Fatalf("apply stderr=%q", applyErr)
+	}
+	applied := decodeRepairPlan(t, applyOut)
+	if applied["applied"] != true || len(applied["actions"].([]any)) != 1 {
+		t.Fatalf("apply=%v", applied)
+	}
+
+	report := runDoctor("after repair")
+	if report["status"] == "blocked" {
+		t.Fatalf("doctor stayed blocked after quarantine repair: %v", report)
+	}
+	check := report["checks"].([]any)[0].(map[string]any)
+	if check["result"] == "blocked" || check["severity"] == "blocking" {
+		t.Fatalf("check stayed blocking after quarantine repair: %v", check)
+	}
+	findings := check["findings"].([]any)
+	if len(findings) != 1 {
+		t.Fatalf("expected the quarantined row to remain visible as evidence, got %v", findings)
+	}
+	finding := findings[0].(map[string]any)
+	if finding["severity"] != "info" || finding["reason_code"] != "sync_mutation_quarantined" || finding["requires_confirmation"] != false {
+		t.Fatalf("unexpected quarantined finding: %v", finding)
+	}
+	evidence := finding["evidence"].(map[string]any)
+	if evidence["entity_key"] != "poison" || evidence["disposition"] != store.SyncMutationDispositionQuarantined {
+		t.Fatalf("quarantined evidence lost mutation identity: %v", evidence)
+	}
+
+	reopened, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer reopened.Close()
+	pending, err := reopened.HasPendingSyncMutationsForProject("engram")
+	if err != nil || !pending {
+		t.Fatalf("HasPendingSyncMutationsForProject=%v err=%v", pending, err)
+	}
+	for _, targetKey := range []string{store.DefaultSyncTargetKey, store.DefaultSyncTargetKey + ":engram"} {
+		state, err := reopened.GetSyncState(targetKey)
+		if err != nil {
+			t.Fatalf("state for %q: %v", targetKey, err)
+		}
+		if state.Lifecycle != store.SyncLifecyclePending {
+			t.Fatalf("quarantine repair masked pending work for %q: lifecycle=%q", targetKey, state.Lifecycle)
+		}
+	}
+}
+
+func TestPrintDoctorUsageMarksProjectOptionalOnlyForSyncMutationRepair(t *testing.T) {
+	withArgs(t, "engram", "doctor", "--help")
+	stdout, stderr := captureOutput(t, func() { cmdDoctor(testConfig(t)) })
+	if stderr != "" {
+		t.Fatalf("stderr=%q", stderr)
+	}
+	wantLines := []string{
+		"usage: engram doctor [--json] [--project PROJECT] [--check CODE]",
+		"       engram doctor repair --project PROJECT --check CODE (--plan|--dry-run|--apply)",
+		"       engram doctor repair [--project PROJECT] --check sync_mutation_required_fields (--plan|--dry-run|--apply)",
+	}
+	for _, line := range wantLines {
+		if !strings.Contains(stdout, line+"\n") {
+			t.Fatalf("usage missing line %q\n%s", line, stdout)
+		}
+	}
+	if !strings.Contains(stdout, "checks: ") {
+		t.Fatalf("usage lost the registered check list\n%s", stdout)
 	}
 }
 

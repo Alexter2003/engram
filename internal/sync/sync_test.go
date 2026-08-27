@@ -2,6 +2,7 @@ package sync
 
 import (
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/Gentleman-Programming/engram/internal/cloud/chunkcodec"
 	"github.com/Gentleman-Programming/engram/internal/store"
+	_ "modernc.org/sqlite"
 )
 
 func newTestStore(t *testing.T) *store.Store {
@@ -1339,6 +1341,66 @@ func TestUpgradeBootstrapCheckpointResume(t *testing.T) {
 	}
 	if strings.Contains(snapshotJSON, `"token"`) || strings.Contains(snapshotJSON, "cloud_config") {
 		t.Fatalf("checkpoint persisted credential material: %s", snapshotJSON)
+	}
+}
+
+func TestBootstrapAndRollbackAcceptMigratedLegacyCheckpoints(t *testing.T) {
+	cfg, err := store.DefaultConfig()
+	if err != nil {
+		t.Fatalf("default store config: %v", err)
+	}
+	cfg.DataDir = t.TempDir()
+
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("create store: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close store before legacy seed: %v", err)
+	}
+
+	raw, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
+	if err != nil {
+		t.Fatalf("open legacy store: %v", err)
+	}
+	for _, project := range []string{"legacy-resume", "legacy-rollback"} {
+		if _, err := raw.Exec(`INSERT INTO cloud_upgrade_state (project, stage, snapshot_json) VALUES (?, ?, ?)`, project, store.UpgradeStageBootstrapPushed, `{"cloud_config_present":true,"project_enrolled":false}`); err != nil {
+			_ = raw.Close()
+			t.Fatalf("seed legacy checkpoint for %s: %v", project, err)
+		}
+	}
+	if _, err := raw.Exec(`INSERT INTO sync_enrolled_projects (project) VALUES ('legacy-rollback')`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("seed interrupted enrollment: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close legacy store: %v", err)
+	}
+
+	s, err = store.New(cfg)
+	if err != nil {
+		t.Fatalf("reopen migrated store: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	resumed, err := BootstrapProject(s, newFakeCloudTransport(), UpgradeBootstrapOptions{Project: "legacy-resume"})
+	if err != nil {
+		t.Fatalf("resume migrated checkpoint: %v", err)
+	}
+	if !resumed.Resumed || resumed.Stage != store.UpgradeStageBootstrapVerified {
+		t.Fatalf("expected migrated checkpoint to resume, got %+v", resumed)
+	}
+
+	rolledBack, err := RollbackProject(s, UpgradeRollbackOptions{Project: "legacy-rollback"})
+	if err != nil {
+		t.Fatalf("rollback migrated checkpoint: %v", err)
+	}
+	if rolledBack.Stage != store.UpgradeStageRolledBack {
+		t.Fatalf("expected migrated checkpoint to roll back, got %+v", rolledBack)
+	}
+	enrolled, err := s.IsProjectEnrolled("legacy-rollback")
+	if err != nil || enrolled {
+		t.Fatalf("rollback must restore legacy enrollment snapshot: enrolled=%t err=%v", enrolled, err)
 	}
 }
 

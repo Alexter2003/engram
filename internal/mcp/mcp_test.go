@@ -3743,6 +3743,30 @@ func TestSessionEndClearsActivity(t *testing.T) {
 	}
 }
 
+func TestSessionEndRejectsBlankIDsWithoutMutation(t *testing.T) {
+	s := newMCPTestStore(t)
+	if err := s.CreateSession("valid-session", "engram", "/tmp"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	end := handleSessionEnd(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+	for _, id := range []string{"", " \t"} {
+		t.Run(fmt.Sprintf("%q", id), func(t *testing.T) {
+			res, err := end(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"id": id}}})
+			if err != nil || !res.IsError || !strings.Contains(callResultText(t, res), "session id is required") {
+				t.Fatalf("session end result=%+v err=%v", res, err)
+			}
+			session, err := s.GetSession("valid-session")
+			if err != nil || session.EndedAt != nil {
+				t.Fatalf("valid session changed: %+v, %v", session, err)
+			}
+			var mutations int
+			if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations WHERE entity = 'session' AND entity_key = ?`, id).Scan(&mutations); err != nil || mutations != 0 {
+				t.Fatalf("blank session mutations=%d, err=%v", mutations, err)
+			}
+		})
+	}
+}
+
 func TestCapturePassiveRecordsToolCall(t *testing.T) {
 	s := newMCPTestStore(t)
 
@@ -3814,6 +3838,29 @@ func TestSessionStartUsesDefaultSessionID(t *testing.T) {
 	realScore := activity.ActivityScore("real-unique-session-id")
 	if realScore != "" {
 		t.Fatalf("expected no activity under real session ID, got: %q", realScore)
+	}
+}
+
+func TestSessionStartRejectsEmptyID(t *testing.T) {
+	s := newMCPTestStore(t)
+	dir := t.TempDir()
+	initTestGitRepo(t, dir)
+	t.Chdir(dir)
+
+	res, err := handleSessionStart(s, MCPConfig{}, NewSessionActivity(10*time.Minute))(context.Background(), mcppkg.CallToolRequest{
+		Params: mcppkg.CallToolParams{Arguments: map[string]any{"id": " \t"}},
+	})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if !res.IsError || !strings.Contains(callResultText(t, res), "session id is required") {
+		t.Fatalf("result isError=%v text=%q, want clear required-id error", res.IsError, callResultText(t, res))
+	}
+	if _, err := s.GetSession(" \t"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("whitespace session was persisted: %v", err)
+	}
+	if _, err := s.GetSession(""); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("empty session was persisted: %v", err)
 	}
 }
 
