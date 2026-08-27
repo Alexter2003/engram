@@ -68,6 +68,13 @@ var loadMCPStats = func(s *store.Store) (*store.Stats, error) {
 	return s.Stats()
 }
 
+func truncationWarning(metadata store.TruncationMetadata) string {
+	if !metadata.Truncated {
+		return ""
+	}
+	return fmt.Sprintf("\n⚠ WARNING: Content was truncated from %d to %d bytes. Consider splitting into smaller observations.", metadata.OriginalBytes, metadata.LimitBytes)
+}
+
 func currentWorkingDirectory() string {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -190,36 +197,13 @@ DEFERRED TOOLS (use ToolSearch when needed):
 
 PROACTIVE SAVE RULE: Call mem_save immediately after ANY decision, bug fix, discovery, or convention — not just when asked.
 
-## CONFLICT SURFACING — when mem_save returns candidates
+## CONFLICT SURFACING
 
-After every mem_save call, check the response envelope for judgment_required.
-
-IF judgment_required IS TRUE:
-  Iterate candidates[] and call mem_judge once per candidate using the
-  judgment_id from that candidate entry. Do NOT use the top-level judgment_id
-  for multiple candidates — each candidate has its own.
-
-  HEURISTIC — when to ask the user vs. resolve autonomously:
-
-  ASK the user (conversationally, as part of your next reply) when:
-    - confidence is below 0.7, OR
-    - the relation you would choose is supersedes or conflicts_with AND the
-      observation type is architecture, policy, or decision
-
-  RESOLVE silently (call mem_judge without asking) when:
-    - confidence >= 0.7 AND the relation is not supersedes/conflicts_with, OR
-    - the relation is related, compatible, scoped, or not_conflict
-
-  HOW TO ASK (conversationally — never via blocking CLI or dashboard prompt):
-    Raise it naturally in your next reply to the user. Example phrasing:
-    "I noticed memory #abc123 might conflict with what we just saved.
-     Want me to mark the new one as superseding it, or are they about
-     different scopes? I can also mark them as compatible if both still apply."
-
-  AFTER RESOLUTION (both paths):
-    Call mem_judge with the chosen relation, a reason, and if the user gave
-    explicit direction, include their words as the evidence field. This persists
-    the verdict and closes the pending conflict row.`
+After mem_save: if judgment_required, iterate candidates[] and call mem_judge
+once per entry using that entry's judgment_id; never reuse the top-level judgment_id.
+Ask conversationally when confidence < 0.7 OR (relation in
+{supersedes, conflicts_with} AND type in {architecture, policy, decision}); else
+resolve with related | compatible | scoped | not_conflict. Pass evidence from user reply.`
 
 // NewServerWithTools creates an MCP server registering only the tools in
 // the allowlist. If allowlist is nil, all tools are registered.
@@ -1261,7 +1245,7 @@ func handleSave(s *store.Store, cfg MCPConfig, activity *SessionActivity) server
 		// Ensure the implicit MCP session exists with the current working directory.
 		_ = ensureImplicitSessionWithCWD(s, sessionID, project)
 
-		truncated := len(content) > s.MaxObservationLength()
+		truncation := s.ContentTruncation(content)
 
 		savedID, err := s.AddObservation(store.AddObservationParams{
 			SessionID: sessionID,
@@ -1296,9 +1280,7 @@ func handleSave(s *store.Store, cfg MCPConfig, activity *SessionActivity) server
 		if topicKey == "" && suggestedTopicKey != "" {
 			msg += fmt.Sprintf("\nSuggested topic_key: %s", suggestedTopicKey)
 		}
-		if truncated {
-			msg += fmt.Sprintf("\n⚠ WARNING: Content was truncated from %d to %d chars. Consider splitting into smaller observations.", len(content), s.MaxObservationLength())
-		}
+		msg += truncationWarning(truncation)
 		if normWarning != "" {
 			msg += "\n" + normWarning
 		}
@@ -1308,7 +1290,7 @@ func handleSave(s *store.Store, cfg MCPConfig, activity *SessionActivity) server
 
 		// Post-transaction conflict candidate detection (REQ-001).
 		// Errors are logged and swallowed — detection failure never fails the save.
-		extra := map[string]any{}
+		extra := map[string]any{"truncation": truncation}
 		// Build CandidateOptions, forwarding any MCPConfig overrides.
 		// nil fields mean "use store defaults"; explicit pointer values override.
 		candOpts := store.CandidateOptions{
@@ -1417,9 +1399,10 @@ func handleUpdate(s *store.Store) server.ToolHandlerFunc {
 			return mcp.NewToolResultError("provide at least one field to update"), nil
 		}
 
-		var contentLen int
+		var truncation *store.TruncationMetadata
 		if update.Content != nil {
-			contentLen = len(*update.Content)
+			metadata := s.ContentTruncation(*update.Content)
+			truncation = &metadata
 		}
 
 		obs, err := s.UpdateObservation(id, update)
@@ -1428,8 +1411,10 @@ func handleUpdate(s *store.Store) server.ToolHandlerFunc {
 		}
 
 		msg := fmt.Sprintf("Memory updated: #%d %q (%s, scope=%s)", obs.ID, obs.Title, obs.Type, obs.Scope)
-		if contentLen > s.MaxObservationLength() {
-			msg += fmt.Sprintf("\n⚠ WARNING: Content was truncated from %d to %d chars. Consider splitting into smaller observations.", contentLen, s.MaxObservationLength())
+		extra := map[string]any{}
+		if truncation != nil {
+			msg += truncationWarning(*truncation)
+			extra["truncation"] = *truncation
 		}
 
 		// Auto-detect for envelope; tolerant — don't fail update on resolution error
@@ -1438,7 +1423,7 @@ func handleUpdate(s *store.Store) server.ToolHandlerFunc {
 			// Still return success for the update itself.
 			return mcp.NewToolResultText(msg), nil
 		}
-		return respondWithProject(detRes, msg, nil), nil
+		return respondWithProject(detRes, msg, extra), nil
 	}
 }
 
@@ -1594,6 +1579,7 @@ func handleSavePrompt(s *store.Store, cfg MCPConfig, activity *SessionActivity) 
 		// Ensure the implicit MCP session exists with the current working directory.
 		_ = ensureImplicitSessionWithCWD(s, sessionID, project)
 
+		truncation := s.ContentTruncation(content)
 		_, err = s.AddPrompt(store.AddPromptParams{
 			SessionID: sessionID,
 			Content:   content,
@@ -1608,7 +1594,8 @@ func handleSavePrompt(s *store.Store, cfg MCPConfig, activity *SessionActivity) 
 		}
 
 		detRes.Project = project
-		return respondWithProject(detRes, fmt.Sprintf("Prompt saved: %q", truncate(content, 80)), nil), nil
+		msg := fmt.Sprintf("Prompt saved: %q", truncate(content, 80)) + truncationWarning(truncation)
+		return respondWithProject(detRes, msg, map[string]any{"truncation": truncation}), nil
 	}
 }
 
