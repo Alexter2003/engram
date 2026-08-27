@@ -2,9 +2,11 @@ package diagnostic
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 
+	"github.com/Gentleman-Programming/engram/internal/cloud/constants"
 	projectpkg "github.com/Gentleman-Programming/engram/internal/project"
 	"github.com/Gentleman-Programming/engram/internal/store"
 )
@@ -156,6 +158,27 @@ func (c SyncMutationRequiredFieldsCheck) Run(ctx context.Context, scope Scope) (
 			Why:                  "A pending sync mutation with missing required fields can block safe cloud replication and must fail loudly instead of being silently dropped.",
 			Evidence:             mustJSON(map[string]any{"seq": mutation.Seq, "target_key": mutation.TargetKey, "project": mutation.Project, "entity": mutation.Entity, "op": mutation.Op, "entity_key": mutation.EntityKey, "missing_fields": validation.MissingFields}),
 			SafeNextStep:         nextStep,
+			RequiresConfirmation: true,
+		})
+	}
+	nonEnrolledCounts, err := scope.Store.CountPendingNonEnrolledSyncMutations(store.DefaultSyncTargetKey)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	scopedProject := normalizeProjectName(scope.Project)
+	for _, projectCount := range nonEnrolledCounts {
+		project := normalizeProjectName(projectCount.Project)
+		if scopedProject != "" && project != scopedProject {
+			continue
+		}
+		findings = append(findings, Finding{
+			CheckID:              c.Code(),
+			Severity:             SeverityBlocking,
+			ReasonCode:           constants.ReasonNonEnrolledPendingMutations,
+			Message:              fmt.Sprintf("Pending cloud sync mutations for project %q are blocked because it is not enrolled.", project),
+			Why:                  "Cloud delivery cannot continue while pending mutations belong to a project that is not enrolled.",
+			Evidence:             mustJSON(map[string]any{"project": project, "pending_mutations": projectCount.Count}),
+			SafeNextStep:         "Run `engram cloud enroll <project>` for each intended project or review enrollment, then rerun `engram doctor`.",
 			RequiresConfirmation: true,
 		})
 	}

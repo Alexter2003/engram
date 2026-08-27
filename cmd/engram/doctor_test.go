@@ -62,6 +62,18 @@ func seedDoctorPendingMutation(t *testing.T, cfg store.Config, project, entity, 
 	}
 }
 
+func enrollDoctorProject(t *testing.T, cfg store.Config, project string) {
+	t.Helper()
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	defer s.Close()
+	if err := s.EnrollProject(project); err != nil {
+		t.Fatalf("EnrollProject: %v", err)
+	}
+}
+
 func seedDoctorRepairRows(t *testing.T, cfg store.Config, id, project, directory string) {
 	t.Helper()
 	s, err := store.New(cfg)
@@ -278,6 +290,7 @@ func TestCmdDoctorSyncMutationRequiredFieldsBlockedEnvelope(t *testing.T) {
 	cfg := testConfig(t)
 	seedDoctorSession(t, cfg, "manual-save-engram", "engram", "/work/engram")
 	seedDoctorPendingMutation(t, cfg, "engram", store.SyncEntityObservation, "obs-missing", store.SyncOpUpsert, `{"sync_id":"obs-missing"}`)
+	enrollDoctorProject(t, cfg, "engram")
 
 	withArgs(t, "engram", "doctor", "--json", "--project", "engram", "--check", "sync_mutation_required_fields")
 	stdout, stderr := captureOutput(t, func() { cmdDoctor(cfg) })
@@ -311,5 +324,43 @@ func TestCmdDoctorSyncMutationRequiredFieldsBlockedEnvelope(t *testing.T) {
 	evidence := finding["evidence"].(map[string]any)
 	if evidence["entity"] != store.SyncEntityObservation || evidence["entity_key"] != "obs-missing" {
 		t.Fatalf("unexpected evidence: %v", evidence)
+	}
+}
+
+func TestCmdDoctorNonEnrolledPendingMutationsBlockedEnvelope(t *testing.T) {
+	cfg := testConfig(t)
+	seedDoctorSession(t, cfg, "manual-save-bootstrap", "bootstrap", "/work/bootstrap")
+	seedDoctorPendingMutation(t, cfg, "unmanaged", store.SyncEntityObservation, "obs-valid", store.SyncOpUpsert, `{"sync_id":"obs-valid","session_id":"session-valid","type":"decision","title":"Valid","content":"Pending mutation","project":"unmanaged","scope":"project"}`)
+
+	withArgs(t, "engram", "doctor", "--json", "--project", "unmanaged", "--check", "sync_mutation_required_fields")
+	stdout, stderr := captureOutput(t, func() { cmdDoctor(cfg) })
+	if stderr != "" {
+		t.Fatalf("stderr=%q", stderr)
+	}
+
+	var report map[string]any
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatalf("doctor json invalid: %v\n%s", err, stdout)
+	}
+	if report["status"] != "blocked" {
+		t.Fatalf("expected blocked report, got %v", report)
+	}
+	check := report["checks"].([]any)[0].(map[string]any)
+	if check["result"] != "blocked" || check["severity"] != "blocking" || check["safe_next_step"] == "No action required." {
+		t.Fatalf("unexpected check envelope: %v", check)
+	}
+	finding := check["findings"].([]any)[0].(map[string]any)
+	if finding["reason_code"] != "non_enrolled_pending_mutations" || !strings.Contains(finding["safe_next_step"].(string), "engram cloud enroll <project>") {
+		t.Fatalf("unexpected finding: %v", finding)
+	}
+	evidence := finding["evidence"].(map[string]any)
+	if evidence["project"] != "unmanaged" || evidence["pending_mutations"] != float64(1) {
+		t.Fatalf("unexpected evidence: %v", evidence)
+	}
+
+	withArgs(t, "engram", "doctor", "--project", "unmanaged", "--check", "sync_mutation_required_fields")
+	stdout, stderr = captureOutput(t, func() { cmdDoctor(cfg) })
+	if stderr != "" || !strings.Contains(stdout, "non_enrolled_pending_mutations") || !strings.Contains(stdout, "unmanaged") {
+		t.Fatalf("stderr=%q stdout=%q", stderr, stdout)
 	}
 }
