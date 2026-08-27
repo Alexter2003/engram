@@ -1189,6 +1189,7 @@ func (s *Store) migrate() error {
 			scope_class       TEXT    NOT NULL DEFAULT 'legacy_unscoped',
 			apply_status      TEXT    NOT NULL DEFAULT 'deferred',
 			retry_count       INTEGER NOT NULL DEFAULT 0,
+			payload_sync_id   TEXT    NOT NULL DEFAULT '',
 			last_error        TEXT,
 			last_attempted_at TEXT,
 			first_seen_at     TEXT    NOT NULL DEFAULT (datetime('now'))
@@ -1209,17 +1210,49 @@ func (s *Store) migrate() error {
 		{name: "reason_code", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "project", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "scope_class", definition: "TEXT NOT NULL DEFAULT 'legacy_unscoped'"},
+		// payload_sync_id records the entity identity the row's own payload
+		// claims, which is not always the key the row is stored under. The
+		// success-path cleanup needs that identity, and reading it from a stored
+		// column keeps a JSON extract out of the apply write transaction. It stays
+		// blank for payloads that carry no sync_id of their own — pulled session
+		// payloads are keyed on `id`, and an undecodable payload has no identity
+		// at all, which is itself one of the reasons its row is dead.
+		{name: "payload_sync_id", definition: "TEXT NOT NULL DEFAULT ''"},
 	}
+	backfillPayloadSyncID := false
 	for _, c := range deferredColumns {
-		if err := s.addColumnIfNotExists("sync_apply_deferred", c.name, c.definition); err != nil {
+		added, err := s.addColumnIfMissing("sync_apply_deferred", c.name, c.definition)
+		if err != nil {
 			return err
+		}
+		if added && c.name == "payload_sync_id" {
+			backfillPayloadSyncID = true
 		}
 	}
 	if _, err := s.execHook(s.db, `
 		CREATE INDEX IF NOT EXISTS idx_sad_scope_status_seen
 			ON sync_apply_deferred(target_key, project, apply_status, first_seen_at);
+		CREATE INDEX IF NOT EXISTS idx_sad_payload_sync
+			ON sync_apply_deferred(payload_sync_id, entity);
 	`); err != nil {
 		return err
+	}
+	if backfillPayloadSyncID {
+		// Rows written before the column existed carry their identity only inside
+		// the payload, so derive it once here rather than parsing JSON on every
+		// apply. CASE is used instead of a `json_valid(...) AND json_extract(...)`
+		// conjunction because only CASE guarantees the extract is never evaluated
+		// for a payload that is not valid JSON.
+		if _, err := s.execHook(s.db, `
+			UPDATE sync_apply_deferred
+			SET payload_sync_id = CASE
+				WHEN json_valid(payload) THEN ifnull(json_extract(payload, '$.sync_id'), '')
+				ELSE ''
+			END
+			WHERE entity = 'relation'
+		`); err != nil {
+			return err
+		}
 	}
 
 	// Phase 3b: composite index for conflict-audit list/count queries.
@@ -4888,17 +4921,30 @@ func (s *Store) recordRelationApplyFailureTx(tx *sql.Tx, targetKey string, mutat
 		return false, nil
 	}
 
+	// Read the payload the same way applyRelationUpsertTx reads it, so the
+	// identity stored on the row is the identity the applier would recognise.
+	var payload syncRelationPayload
+	payloadDecoded := decodeSyncPayload([]byte(mutation.Payload), &payload) == nil
+
 	project := strings.TrimSpace(mutation.Project)
-	if project == "" {
-		var payload syncRelationPayload
-		if err := json.Unmarshal([]byte(mutation.Payload), &payload); err == nil {
-			project = strings.TrimSpace(payload.Project)
-		}
+	if project == "" && payloadDecoded {
+		project = strings.TrimSpace(payload.Project)
 	}
 	project, _ = NormalizeProject(project)
 	scopeClass := "target_scoped"
 	if project != "" {
 		scopeClass = "scoped"
+	}
+
+	// The relation this payload claims to be. It is not derivable from the row
+	// key, because a dead row is keyed on the discarded mutation's own material,
+	// and it is not derivable from entity_key, because a dead mutation's key may
+	// be blank or may name some other relation entirely. Persisting it is what
+	// lets the success-path cleanup find a relation's rows without parsing JSON
+	// inside the apply write transaction.
+	payloadSyncID := ""
+	if payloadDecoded {
+		payloadSyncID = strings.TrimSpace(payload.SyncID)
 	}
 
 	syncID := relationApplyFailureSyncID(status, targetKey, mutation)
@@ -4924,13 +4970,14 @@ func (s *Store) recordRelationApplyFailureTx(tx *sql.Tx, targetKey string, mutat
 
 	if _, err := s.execHook(tx, `
 		INSERT INTO sync_apply_deferred
-			(sync_id, entity, payload, target_key, entity_key, op, project, scope_class, apply_status, retry_count, first_seen_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, datetime('now'))
+			(sync_id, entity, payload, target_key, entity_key, op, payload_sync_id, project, scope_class, apply_status, retry_count, first_seen_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, datetime('now'))
 		ON CONFLICT(sync_id) DO UPDATE SET
 			payload           = excluded.payload,
 			target_key        = excluded.target_key,
 			entity_key        = excluded.entity_key,
 			op                = excluded.op,
+			payload_sync_id   = excluded.payload_sync_id,
 			project           = excluded.project,
 			scope_class       = excluded.scope_class,
 			apply_status      = CASE
@@ -4938,7 +4985,7 @@ func (s *Store) recordRelationApplyFailureTx(tx *sql.Tx, targetKey string, mutat
 				ELSE sync_apply_deferred.apply_status
 			END,
 			last_attempted_at = datetime('now')
-	`, syncID, mutation.Entity, mutation.Payload, targetKey, mutation.EntityKey, mutation.Op, project, scopeClass, status); err != nil {
+	`, syncID, mutation.Entity, mutation.Payload, targetKey, mutation.EntityKey, mutation.Op, payloadSyncID, project, scopeClass, status); err != nil {
 		return false, fmt.Errorf("write relation apply failure: %w", err)
 	}
 
@@ -7142,6 +7189,48 @@ func (s *Store) deadLetterPulledSessionIdentityTx(tx *sql.Tx, targetKey string, 
 	return nil
 }
 
+// relationApplyCleanupSQL removes the sync_apply_deferred rows that belong to a
+// relation which has just applied successfully. It runs inside the apply write
+// transaction on every successful relation upsert, so the test suite plans it
+// directly to keep it off a full table scan.
+//
+// A row belongs to this relation when the relation it is about is this one. Two
+// clauses say that, and both are index-satisfiable:
+//
+//   - The disjunction locates the row. It can be found under either identity it
+//     may be stored with: as a primary-key point delete on sync_id, which is
+//     where this relation's retry state lives — a 'deferred' row is proven to be
+//     keyed on the relation's own sync_id, because applyRelationUpsertTx
+//     validates the wire contract before it ever reports a missing endpoint, and
+//     rows written by the old scheme are keyed the same way — or as an indexed
+//     lookup on payload_sync_id, which is how evidence keyed on a discarded
+//     mutation's own material is reached. Both terms are point lookups on the
+//     relation identity, so the statement stays off a table scan no matter which
+//     one the planner drives.
+//   - The IN clause then keeps only the rows that really are about this
+//     relation: ones whose payload names it, and ones that carry no identity of
+//     their own and so are only known by the key they are stored under.
+//
+// A row's entity_key is deliberately never consulted, and a key that merely
+// names this relation is not enough on its own. A dead row stores the discarded
+// mutation's raw entity_key and may be stored under it, and that key may be
+// blank or may name a completely different relation — the disagreement is one of
+// the reasons the row is dead. Deleting on that match let a successful apply of
+// relation X destroy the evidence that a mutation describing relation Y had been
+// dropped, which is the evidence loss this table exists to prevent.
+//
+// Nothing is scoped by target_key or project, because a relation sync_id is
+// global: rows for one relation collapse onto a single key regardless of which
+// target delivered them, and the relation now exists locally for every scope.
+//
+// Arguments: entity, relation sync_id, relation sync_id, relation sync_id.
+const relationApplyCleanupSQL = `
+	DELETE FROM sync_apply_deferred
+	WHERE entity = ?
+	  AND (sync_id = ? OR payload_sync_id = ?)
+	  AND payload_sync_id IN ('', ?)
+`
+
 // applyRelationUpsertTx handles a pulled mutation with entity='relation' and
 // op='upsert'. It implements the pull-side behavior for Phase 2:
 //
@@ -7250,20 +7339,10 @@ func (s *Store) applyRelationUpsertTx(tx *sql.Tx, mutation SyncMutation) error {
 		return fmt.Errorf("applyRelationUpsertTx: upsert: %w", err)
 	}
 
-	// Step 4: clean up every row this relation left behind (resolves any prior
-	// FK-miss deferral and any evidence of a discarded delivery of the same
-	// relation). The three predicates cover the three ways such a row can be
-	// keyed: rows written before entity_key was stored carry the relation sync_id
-	// as their key, retryable rows carry it in entity_key, and evidence rows for a
-	// mutation whose entity_key was blank or wrong are only reachable through the
-	// relation identity inside their payload.
-	if _, err := s.execHook(tx, `
-		DELETE FROM sync_apply_deferred
-		WHERE entity = ?
-		  AND (sync_id = ?
-		       OR entity_key = ?
-		       OR (json_valid(payload) AND json_extract(payload, '$.sync_id') = ?))
-	`, SyncEntityRelation, p.SyncID, p.SyncID, p.SyncID); err != nil {
+	// Step 4: clean up the rows this relation left behind (its pending retry
+	// state and any evidence about this same relation).
+	if _, err := s.execHook(tx, relationApplyCleanupSQL,
+		SyncEntityRelation, p.SyncID, p.SyncID, p.SyncID); err != nil {
 		return fmt.Errorf("applyRelationUpsertTx: clear deferred: %w", err)
 	}
 
@@ -7708,9 +7787,17 @@ func (s *Store) queryObservations(query string, args ...any) ([]Observation, err
 }
 
 func (s *Store) addColumnIfNotExists(tableName, columnName, definition string) error {
+	_, err := s.addColumnIfMissing(tableName, columnName, definition)
+	return err
+}
+
+// addColumnIfMissing is addColumnIfNotExists with the outcome reported, so a
+// migration that has to derive values for a newly added column can run that
+// backfill exactly once instead of on every store open.
+func (s *Store) addColumnIfMissing(tableName, columnName, definition string) (bool, error) {
 	rows, err := s.queryItHook(s.db, fmt.Sprintf("PRAGMA table_info(%s)", tableName))
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	for rows.Next() {
@@ -7720,23 +7807,25 @@ func (s *Store) addColumnIfNotExists(tableName, columnName, definition string) e
 		var defaultValue any
 		var pk int
 		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
-			return closeRowsWithError(rows, err)
+			return false, closeRowsWithError(rows, err)
 		}
 		if name == columnName {
 			rows.Close()
-			return nil
+			return false, nil
 		}
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return err
+		return false, err
 	}
 	if err := rows.Close(); err != nil {
-		return err
+		return false, err
 	}
 
-	_, err = s.db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", tableName, columnName, definition))
-	return err
+	if _, err := s.db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", tableName, columnName, definition)); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Store) migrateSyncChunksTable() error {

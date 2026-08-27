@@ -3,7 +3,9 @@ package store
 import (
 	"encoding/json"
 	"sort"
+	"strings"
 	"testing"
+	"time"
 )
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -261,6 +263,288 @@ func TestRelationDeferred_FKMissThenReplaySucceedsWithoutOrphan(t *testing.T) {
 	}
 	if got := countRelationRows(t, s, relSyncID); got != 1 {
 		t.Fatalf("memory_relations rows: want 1, got %d", got)
+	}
+}
+
+// ─── Success-path cleanup scope ───────────────────────────────────────────────
+
+// evidenceMutationUnderEntityKey builds a relation mutation whose entity_key
+// names one relation while its payload describes another. applyRelationUpsertTx
+// rejects the disagreement as terminal evidence, and the resulting dead row
+// stores that foreign entity_key — so it is the shape a cleanup keyed on
+// entity_key would destroy.
+func evidenceMutationUnderEntityKey(t *testing.T, entityKey, relSyncID, sourceID, targetID string) SyncMutation {
+	t.Helper()
+	return SyncMutation{
+		Entity:    SyncEntityRelation,
+		EntityKey: entityKey,
+		Op:        SyncOpUpsert,
+		Payload:   relationPayloadJSON(t, relSyncID, sourceID, targetID),
+		Source:    SyncSourceRemote,
+		Project:   "proj-apply",
+	}
+}
+
+// A dead row keeps the discarded mutation's raw entity_key, and that key may name
+// a different relation entirely. Applying that other relation successfully must
+// not delete the evidence, which is the only record that the first mutation's
+// data was dropped.
+func TestRelationApplyCleanup_EvidenceForOtherMutationSurvivesUnrelatedApply(t *testing.T) {
+	s, syncA, syncB := setupSyncApplyStore(t)
+
+	discarded := evidenceMutationUnderEntityKey(t, "rel-applied", "rel-discarded", syncA, syncB)
+	if err := s.ApplyPulledChunk(DefaultSyncTargetKey, "chunk-foreign-entity-key", []SyncMutation{discarded}); err != nil {
+		t.Fatalf("ApplyPulledChunk (evidence): %v", err)
+	}
+	if got := countRelationDeferredRowsForPayload(t, s, "rel-discarded"); got != 1 {
+		t.Fatalf("evidence row for rel-discarded: want 1, got %d", got)
+	}
+
+	// An unrelated but perfectly valid relation that happens to be named by that
+	// entity_key now applies.
+	applied := SyncMutation{
+		Entity:    SyncEntityRelation,
+		EntityKey: "rel-applied",
+		Op:        SyncOpUpsert,
+		Payload:   relationPayloadJSON(t, "rel-applied", syncA, syncB),
+		Source:    SyncSourceRemote,
+		Project:   "proj-apply",
+	}
+	if err := s.ApplyPulledChunk(DefaultSyncTargetKey, "chunk-unrelated-success", []SyncMutation{applied}); err != nil {
+		t.Fatalf("ApplyPulledChunk (success): %v", err)
+	}
+
+	if got := countRelationRows(t, s, "rel-applied"); got != 1 {
+		t.Fatalf("memory_relations rows for rel-applied: want 1, got %d", got)
+	}
+	got := relationDeferredPayloadIDs(t, s)
+	want := []string{"rel-discarded"}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("deferred payload identities: want %v, got %v", want, got)
+	}
+}
+
+// Distinct discarded mutations may share one entity_key. A successful apply of
+// the relation that key names must erase neither of them.
+func TestRelationApplyCleanup_SharedEntityKeyEvidenceRowsBothSurvive(t *testing.T) {
+	s, syncA, syncB := setupSyncApplyStore(t)
+
+	discarded := []SyncMutation{
+		evidenceMutationUnderEntityKey(t, "rel-applied", "rel-dropped-a", syncA, syncB),
+		evidenceMutationUnderEntityKey(t, "rel-applied", "rel-dropped-b", syncA, syncB),
+	}
+	if err := s.ApplyPulledChunk(DefaultSyncTargetKey, "chunk-shared-foreign-key", discarded); err != nil {
+		t.Fatalf("ApplyPulledChunk (evidence): %v", err)
+	}
+	if got := countRelationDeferredRows(t, s); got != 2 {
+		t.Fatalf("evidence rows before apply: want 2, got %d", got)
+	}
+
+	applied := SyncMutation{
+		Entity:    SyncEntityRelation,
+		EntityKey: "rel-applied",
+		Op:        SyncOpUpsert,
+		Payload:   relationPayloadJSON(t, "rel-applied", syncA, syncB),
+		Source:    SyncSourceRemote,
+		Project:   "proj-apply",
+	}
+	if err := s.ApplyPulledChunk(DefaultSyncTargetKey, "chunk-shared-key-success", []SyncMutation{applied}); err != nil {
+		t.Fatalf("ApplyPulledChunk (success): %v", err)
+	}
+
+	got := relationDeferredPayloadIDs(t, s)
+	want := []string{"rel-dropped-a", "rel-dropped-b"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("deferred payload identities: want %v, got %v", want, got)
+	}
+}
+
+// Narrowing the cleanup must not leave the retry row behind: a relation that was
+// deferred for a missing endpoint and then applies has no pending state left.
+func TestRelationApplyCleanup_RetryRowForAppliedRelationIsRemoved(t *testing.T) {
+	s, syncA, _ := setupSyncApplyStore(t)
+
+	missingTarget := "obs-missing-" + newSyncID("x")
+	relSyncID := newSyncID("rel")
+	deferred := SyncMutation{
+		Entity:    SyncEntityRelation,
+		EntityKey: relSyncID,
+		Op:        SyncOpUpsert,
+		Payload:   relationPayloadJSON(t, relSyncID, syncA, missingTarget),
+		Source:    SyncSourceRemote,
+		Project:   "proj-apply",
+	}
+	if err := s.ApplyPulledChunk(DefaultSyncTargetKey, "chunk-retry-deferral", []SyncMutation{deferred}); err != nil {
+		t.Fatalf("ApplyPulledChunk (deferral): %v", err)
+	}
+	if status, _ := getDeferredRow(t, s, relSyncID); status != "deferred" {
+		t.Fatalf("apply_status: want deferred, got %q", status)
+	}
+
+	// The endpoint arrives and the same relation is redelivered with both
+	// endpoints present, so the apply succeeds.
+	if err := s.CreateSession("ses-endpoint", "proj-apply", "/tmp/endpoint"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	_, arrived := addTestObsSession(t, s, "ses-endpoint", "Arrived Obs", "decision", "proj-apply", "project")
+	applied := deferred
+	applied.Payload = relationPayloadJSON(t, relSyncID, syncA, arrived)
+	if err := s.ApplyPulledChunk(DefaultSyncTargetKey, "chunk-retry-success", []SyncMutation{applied}); err != nil {
+		t.Fatalf("ApplyPulledChunk (success): %v", err)
+	}
+
+	if got := countRelationRows(t, s, relSyncID); got != 1 {
+		t.Fatalf("memory_relations rows: want 1, got %d", got)
+	}
+	if got := countRelationDeferredRows(t, s); got != 0 {
+		t.Fatalf("orphaned deferred rows after successful apply: want 0, got %d", got)
+	}
+}
+
+// The cleanup runs inside the apply write transaction on every successful
+// relation upsert, so its cost must not grow with the dead-letter backlog. A
+// full table scan there lengthens the write-lock hold for every pulled chunk.
+func TestRelationApplyCleanup_PlanNeverScansDeferredTable(t *testing.T) {
+	s, _, _ := setupSyncApplyStore(t)
+
+	rows, err := s.db.Query(
+		"EXPLAIN QUERY PLAN "+relationApplyCleanupSQL,
+		SyncEntityRelation, "rel-planned", "rel-planned", "rel-planned",
+	)
+	if err != nil {
+		t.Fatalf("EXPLAIN QUERY PLAN: %v", err)
+	}
+	defer rows.Close()
+
+	var plan []string
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+			t.Fatalf("scan plan row: %v", err)
+		}
+		plan = append(plan, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("plan rows: %v", err)
+	}
+	if len(plan) == 0 {
+		t.Fatal("EXPLAIN QUERY PLAN returned no rows")
+	}
+
+	for _, detail := range plan {
+		if strings.Contains(detail, "SCAN sync_apply_deferred") {
+			t.Fatalf("relation apply cleanup scans sync_apply_deferred: %v", plan)
+		}
+	}
+}
+
+// A row written by the old scheme is keyed on the discarded mutation's raw
+// entity_key, so its key can name a relation its payload does not describe. The
+// migration recovers the relation it is really about, and a successful apply of
+// the relation that key names must not delete it either.
+func TestRelationApplyCleanup_LegacyEvidenceKeyedOnOtherRelationSurvives(t *testing.T) {
+	s, syncA, syncB := setupSyncApplyStore(t)
+
+	// The shape the migration leaves behind: keyed on the mutation's entity_key,
+	// with the payload's own relation identity recovered into payload_sync_id.
+	if _, err := s.db.Exec(`
+		INSERT INTO sync_apply_deferred
+			(sync_id, entity, payload, target_key, project, scope_class, entity_key, op, payload_sync_id, apply_status, retry_count, first_seen_at)
+		VALUES ('rel-applied', 'relation', ?, ?, 'proj-apply', 'scoped', '', '', 'rel-dropped', 'dead', 0, datetime('now'))
+	`, relationPayloadJSON(t, "rel-dropped", syncA, syncB), DefaultSyncTargetKey); err != nil {
+		t.Fatalf("insert legacy dead row: %v", err)
+	}
+
+	applied := SyncMutation{
+		Entity:    SyncEntityRelation,
+		EntityKey: "rel-applied",
+		Op:        SyncOpUpsert,
+		Payload:   relationPayloadJSON(t, "rel-applied", syncA, syncB),
+		Source:    SyncSourceRemote,
+		Project:   "proj-apply",
+	}
+	if err := s.ApplyPulledChunk(DefaultSyncTargetKey, "chunk-legacy-key-success", []SyncMutation{applied}); err != nil {
+		t.Fatalf("ApplyPulledChunk: %v", err)
+	}
+
+	if got := countRelationRows(t, s, "rel-applied"); got != 1 {
+		t.Fatalf("memory_relations rows for rel-applied: want 1, got %d", got)
+	}
+	got := relationDeferredPayloadIDs(t, s)
+	want := []string{"rel-dropped"}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("deferred payload identities: want %v, got %v", want, got)
+	}
+}
+
+// A database written before payload_sync_id existed carries a row's relation
+// identity only inside its payload. The migration derives it once, so the
+// success-path cleanup still reaches such a row without parsing JSON.
+func TestRelationApplyCleanup_MigrationBackfillsLegacyPayloadIdentity(t *testing.T) {
+	cfg := mustDefaultConfig(t)
+	cfg.DataDir = t.TempDir()
+	cfg.DedupeWindow = time.Hour
+
+	s, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := s.CreateSession("ses-backfill", "proj-apply", "/tmp/backfill"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	_, syncA := addTestObsSession(t, s, "ses-backfill", "Obs A backfill", "decision", "proj-apply", "project")
+	_, syncB := addTestObsSession(t, s, "ses-backfill", "Obs B backfill", "decision", "proj-apply", "project")
+	payload := relationPayloadJSON(t, "rel-backfilled", syncA, syncB)
+
+	// Return the table to the shape it had before the column existed, then write
+	// the row the old scheme would have written: keyed on a blank entity_key.
+	if _, err := s.db.Exec(`DROP INDEX idx_sad_payload_sync`); err != nil {
+		t.Fatalf("drop index: %v", err)
+	}
+	if _, err := s.db.Exec(`ALTER TABLE sync_apply_deferred DROP COLUMN payload_sync_id`); err != nil {
+		t.Fatalf("drop column: %v", err)
+	}
+	if _, err := s.db.Exec(`
+		INSERT INTO sync_apply_deferred
+			(sync_id, entity, payload, target_key, project, scope_class, entity_key, op, apply_status, retry_count, first_seen_at)
+		VALUES ('', 'relation', ?, ?, 'proj-apply', 'scoped', '', '', 'dead', 0, datetime('now'))
+	`, payload, DefaultSyncTargetKey); err != nil {
+		t.Fatalf("insert legacy dead row: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New (reopen): %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+
+	var backfilled string
+	if err := reopened.db.QueryRow(
+		`SELECT payload_sync_id FROM sync_apply_deferred WHERE entity = 'relation'`,
+	).Scan(&backfilled); err != nil {
+		t.Fatalf("read backfilled identity: %v", err)
+	}
+	if backfilled != "rel-backfilled" {
+		t.Fatalf("payload_sync_id: want %q, got %q", "rel-backfilled", backfilled)
+	}
+
+	applied := SyncMutation{
+		Entity:    SyncEntityRelation,
+		EntityKey: "rel-backfilled",
+		Op:        SyncOpUpsert,
+		Payload:   payload,
+		Source:    SyncSourceRemote,
+		Project:   "proj-apply",
+	}
+	if err := reopened.ApplyPulledChunk(DefaultSyncTargetKey, "chunk-backfill-success", []SyncMutation{applied}); err != nil {
+		t.Fatalf("ApplyPulledChunk: %v", err)
+	}
+	if got := countRelationDeferredRows(t, reopened); got != 0 {
+		t.Fatalf("backfilled legacy row after successful apply: want 0, got %d", got)
 	}
 }
 
