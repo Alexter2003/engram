@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Gentleman-Programming/engram/internal/cloud/constants"
 	"github.com/Gentleman-Programming/engram/internal/store"
 )
 
@@ -139,9 +140,9 @@ func TestSessionProjectDirectoryMismatchFinding(t *testing.T) {
 
 // TestSyncMutationRequiredFieldsSurfacesNonEnrolledCountFailure proves the
 // check fails loudly instead of reporting a clean bill of health when the
-// non-enrolled backlog query cannot run. The enrollment join target is dropped
-// after migrations so payload validation still succeeds and only
-// CountPendingNonEnrolledSyncMutations fails.
+// enrollment evidence cannot be read. The enrollment table is dropped after
+// migrations so payload validation still succeeds and only the cloud sync
+// enrollment lookup fails.
 func TestSyncMutationRequiredFieldsSurfacesNonEnrolledCountFailure(t *testing.T) {
 	s, cfg := newDiagnosticTestStoreWithConfig(t)
 
@@ -174,13 +175,72 @@ func TestSyncMutationRequiredFieldsSurfacesNonEnrolledCountFailure(t *testing.T)
 	}
 }
 
-func TestRunnerRunAllHealthyEvaluatesEveryMVPCheck(t *testing.T) {
+// TestSyncMutationRequiredFieldsIgnoresBacklogWithoutCloudEnrollment proves a
+// local-only install is never reported as blocked for a non-enrolled backlog.
+// The store journals sync mutations unconditionally, so on a device that never
+// opted into cloud sync every pending mutation belongs to a non-enrolled
+// project: that is the normal steady state, not a fault.
+func TestSyncMutationRequiredFieldsIgnoresBacklogWithoutCloudEnrollment(t *testing.T) {
 	s := newDiagnosticTestStore(t)
 	if err := s.CreateSession("manual-save-engram", "engram", "/work/engram"); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	if err := s.EnrollProject("engram"); err != nil {
+	pending, err := s.CountPendingNonEnrolledSyncMutations(store.DefaultSyncTargetKey)
+	if err != nil {
+		t.Fatalf("CountPendingNonEnrolledSyncMutations: %v", err)
+	}
+	if len(pending) == 0 {
+		t.Fatal("fixture must journal a non-enrolled pending mutation")
+	}
+
+	report, err := NewRunner().RunOne(context.Background(), Scope{Store: s, Project: "engram"}, CheckSyncMutationRequiredFields)
+	if err != nil {
+		t.Fatalf("RunOne: %v", err)
+	}
+	if report.Status != StatusOK || len(report.Checks[0].Findings) != 0 {
+		t.Fatalf("local-only install must not be blocked, got %+v", report)
+	}
+}
+
+// TestSyncMutationRequiredFieldsBlocksNonEnrolledBacklogWhenCloudSyncInUse
+// proves the issue #688 signal survives: once the device uses cloud sync, a
+// project whose pending mutations cannot be delivered is reported as blocked
+// with the enrollment guidance, while the enrolled project stays silent.
+func TestSyncMutationRequiredFieldsBlocksNonEnrolledBacklogWhenCloudSyncInUse(t *testing.T) {
+	s := newDiagnosticTestStore(t)
+	if err := s.CreateSession("manual-save-enrolled", "enrolled", "/work/enrolled"); err != nil {
+		t.Fatalf("CreateSession enrolled: %v", err)
+	}
+	if err := s.EnrollProject("enrolled"); err != nil {
 		t.Fatalf("EnrollProject: %v", err)
+	}
+	if err := s.CreateSession("manual-save-local", "local", "/work/local"); err != nil {
+		t.Fatalf("CreateSession local: %v", err)
+	}
+
+	report, err := NewRunner().RunOne(context.Background(), Scope{Store: s}, CheckSyncMutationRequiredFields)
+	if err != nil {
+		t.Fatalf("RunOne: %v", err)
+	}
+	if report.Status != StatusBlocked || len(report.Checks[0].Findings) != 1 {
+		t.Fatalf("expected one blocking finding, got %+v", report)
+	}
+	finding := report.Checks[0].Findings[0]
+	if finding.Severity != SeverityBlocking || finding.ReasonCode != constants.ReasonNonEnrolledPendingMutations {
+		t.Fatalf("unexpected finding: %+v", finding)
+	}
+	if !strings.Contains(string(finding.Evidence), `"project":"local"`) {
+		t.Fatalf("expected the non-enrolled project in evidence, got %s", finding.Evidence)
+	}
+	if !strings.Contains(finding.SafeNextStep, "engram cloud enroll <project>") {
+		t.Fatalf("expected enrollment guidance, got %q", finding.SafeNextStep)
+	}
+}
+
+func TestRunnerRunAllHealthyEvaluatesEveryMVPCheck(t *testing.T) {
+	s := newDiagnosticTestStore(t)
+	if err := s.CreateSession("manual-save-engram", "engram", "/work/engram"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
 	}
 	report, err := NewRunner().RunAll(context.Background(), Scope{
 		Store:   s,

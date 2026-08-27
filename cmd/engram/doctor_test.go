@@ -341,7 +341,6 @@ func TestCmdDoctorSyncMutationRequiredFieldsBlockedEnvelope(t *testing.T) {
 	cfg := testConfig(t)
 	seedDoctorSession(t, cfg, "manual-save-engram", "engram", "/work/engram")
 	seedDoctorPendingMutation(t, cfg, "engram", store.SyncEntityObservation, "obs-missing", store.SyncOpUpsert, `{"sync_id":"obs-missing"}`)
-	enrollDoctorProject(t, cfg, "engram")
 
 	withArgs(t, "engram", "doctor", "--json", "--project", "engram", "--check", "sync_mutation_required_fields")
 	stdout, stderr := captureOutput(t, func() { cmdDoctor(cfg) })
@@ -382,6 +381,7 @@ func TestCmdDoctorNonEnrolledPendingMutationsBlockedEnvelope(t *testing.T) {
 	cfg := testConfig(t)
 	seedDoctorSession(t, cfg, "manual-save-bootstrap", "bootstrap", "/work/bootstrap")
 	seedDoctorPendingMutation(t, cfg, "unmanaged", store.SyncEntityObservation, "obs-valid", store.SyncOpUpsert, `{"sync_id":"obs-valid","session_id":"session-valid","type":"decision","title":"Valid","content":"Pending mutation","project":"unmanaged","scope":"project"}`)
+	enrollDoctorProject(t, cfg, "cloud-synced")
 
 	withArgs(t, "engram", "doctor", "--json", "--project", "unmanaged", "--check", "sync_mutation_required_fields")
 	stdout, stderr := captureOutput(t, func() { cmdDoctor(cfg) })
@@ -424,6 +424,7 @@ func TestCmdDoctorNonEnrolledPendingMutationsRespectsProjectScope(t *testing.T) 
 	initDoctorStore(t, cfg)
 	seedDoctorPendingMutation(t, cfg, "unmanaged", store.SyncEntityObservation, "obs-unmanaged", store.SyncOpUpsert, doctorValidObservationPayload("obs-unmanaged", "unmanaged"))
 	seedDoctorPendingMutation(t, cfg, "out-of-scope", store.SyncEntityObservation, "obs-out-of-scope", store.SyncOpUpsert, doctorValidObservationPayload("obs-out-of-scope", "out-of-scope"))
+	enrollDoctorProject(t, cfg, "cloud-synced")
 
 	withArgs(t, "engram", "doctor", "--json", "--project", "unmanaged", "--check", "sync_mutation_required_fields")
 	stdout, stderr := captureOutput(t, func() { cmdDoctor(cfg) })
@@ -486,6 +487,7 @@ func TestCmdDoctorNonEnrolledPendingMutationsTextGuidance(t *testing.T) {
 	initDoctorStore(t, cfg)
 	seedDoctorPendingMutation(t, cfg, "unmanaged", store.SyncEntityObservation, "obs-one", store.SyncOpUpsert, doctorValidObservationPayload("obs-one", "unmanaged"))
 	seedDoctorPendingMutation(t, cfg, "unmanaged", store.SyncEntityObservation, "obs-two", store.SyncOpUpsert, doctorValidObservationPayload("obs-two", "unmanaged"))
+	enrollDoctorProject(t, cfg, "cloud-synced")
 
 	withArgs(t, "engram", "doctor", "--project", "unmanaged", "--check", "sync_mutation_required_fields")
 	stdout, stderr := captureOutput(t, func() { cmdDoctor(cfg) })
@@ -504,5 +506,35 @@ func TestCmdDoctorNonEnrolledPendingMutationsTextGuidance(t *testing.T) {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("doctor text missing %q\n%s", want, stdout)
 		}
+	}
+}
+
+// TestCmdDoctorLocalOnlyInstallIsNotBlockedByPendingMutations pins the local
+// only contract for issue #688: an install that never enrolled any project for
+// cloud sync keeps journaling mutations forever, so doctor must report a clean
+// bill of health instead of demanding `engram cloud enroll` for a feature the
+// user never opted into.
+func TestCmdDoctorLocalOnlyInstallIsNotBlockedByPendingMutations(t *testing.T) {
+	cfg := testConfig(t)
+	initDoctorStore(t, cfg)
+	seedDoctorPendingMutation(t, cfg, "local-only", store.SyncEntityObservation, "obs-one", store.SyncOpUpsert, doctorValidObservationPayload("obs-one", "local-only"))
+	seedDoctorPendingMutation(t, cfg, "local-only", store.SyncEntityObservation, "obs-two", store.SyncOpUpsert, doctorValidObservationPayload("obs-two", "local-only"))
+
+	withArgs(t, "engram", "doctor", "--json", "--check", "sync_mutation_required_fields")
+	stdout, stderr := captureOutput(t, func() { cmdDoctor(cfg) })
+	if stderr != "" {
+		t.Fatalf("stderr=%q", stderr)
+	}
+
+	report := decodeDoctorReport(t, stdout)
+	if report["status"] != "ok" {
+		t.Fatalf("local-only install must not be blocked, got %v", report)
+	}
+	check := report["checks"].([]any)[0].(map[string]any)
+	if check["result"] != "ok" || check["findings"] != nil {
+		t.Fatalf("unexpected check envelope: %v", check)
+	}
+	if strings.Contains(stdout, "non_enrolled_pending_mutations") || strings.Contains(stdout, "engram cloud enroll") {
+		t.Fatalf("local-only doctor must not suggest cloud enrollment: %s", stdout)
 	}
 }
