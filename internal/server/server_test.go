@@ -1848,6 +1848,60 @@ func TestHandleConflictsScan_DryRun(t *testing.T) {
 	}
 }
 
+func TestHandleConflictsScan_PageContract(t *testing.T) {
+	st, _ := conflictsTestStore(t)
+	if err := st.CreateSession("scan-page", "scan-page", "/tmp/scan-page"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := st.AddObservation(store.AddObservationParams{
+			SessionID: "scan-page",
+			Type:      "decision",
+			Title:     fmt.Sprintf("scan page %d", i),
+			Content:   "scan page",
+			Project:   "scan-page",
+			Scope:     "project",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/conflicts/scan", strings.NewReader(`{"project":"scan-page","limit":2}`))
+	rec := httptest.NewRecorder()
+	New(st, 0).Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response["inspected"] != float64(2) || response["ranked_queries"] != float64(2) || response["next_cursor"] != float64(2) {
+		t.Fatalf("page response = %#v", response)
+	}
+
+	invalid := httptest.NewRequest(http.MethodPost, "/conflicts/scan", strings.NewReader(`{"project":"scan-page","limit":0}`))
+	invalidRec := httptest.NewRecorder()
+	New(st, 0).Handler().ServeHTTP(invalidRec, invalid)
+	if invalidRec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid limit status = %d", invalidRec.Code)
+	}
+
+	cappedReq := httptest.NewRequest(http.MethodPost, "/conflicts/scan", strings.NewReader(`{"project":"scan-page","limit":2,"apply":true,"max_insert":1}`))
+	cappedRec := httptest.NewRecorder()
+	New(st, 0).Handler().ServeHTTP(cappedRec, cappedReq)
+	if cappedRec.Code != http.StatusOK {
+		t.Fatalf("capped status = %d: %s", cappedRec.Code, cappedRec.Body.String())
+	}
+	var capped map[string]any
+	if err := json.NewDecoder(cappedRec.Body).Decode(&capped); err != nil {
+		t.Fatal(err)
+	}
+	if capped["capped"] != true || capped["next_cursor"] != nil || !strings.Contains(capped["warning"].(string), "no continuation") {
+		t.Fatalf("capped response = %#v", capped)
+	}
+}
+
 func TestHandleConflictsScan_MissingProject400(t *testing.T) {
 	st, _ := conflictsTestStore(t)
 	srv := New(st, 0)
