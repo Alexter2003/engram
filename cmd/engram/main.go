@@ -1646,7 +1646,11 @@ func cmdSync(cfg store.Config) {
 		return
 	}
 
-	fmt.Printf("Created chunk %s\n", result.ChunkID)
+	if result.ChunksExported > 1 {
+		fmt.Printf("Created %d chunks (last %s)\n", result.ChunksExported, result.ChunkID)
+	} else {
+		fmt.Printf("Created chunk %s\n", result.ChunkID)
+	}
 	fmt.Printf("  Sessions:     %d\n", result.SessionsExported)
 	fmt.Printf("  Observations: %d\n", result.ObservationsExported)
 	fmt.Printf("  Prompts:      %d\n", result.PromptsExported)

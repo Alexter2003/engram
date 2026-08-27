@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Gentleman-Programming/engram/internal/timeutil"
 	sqlite "modernc.org/sqlite"
@@ -223,6 +224,13 @@ type AddPromptParams struct {
 	SessionID string `json:"session_id"`
 	Content   string `json:"content"`
 	Project   string `json:"project,omitempty"`
+}
+
+// TruncationMetadata describes storage content processing after private-tag redaction.
+type TruncationMetadata struct {
+	OriginalBytes int  `json:"original_bytes"`
+	LimitBytes    int  `json:"limit_bytes"`
+	Truncated     bool `json:"truncated"`
 }
 
 const (
@@ -2350,9 +2358,9 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 	// Normalize project name (lowercase + trim) before any persistence
 	p.Project, _ = NormalizeProject(p.Project)
 
-	// Strip <private>...</private> tags before persisting ANYTHING
+	// Strip <private>...</private> tags before persisting ANYTHING.
 	title := stripPrivateTags(p.Title)
-	content := stripPrivateTags(p.Content)
+	content, _ := s.prepareStoredContent(p.Content)
 	if title == "" {
 		return 0, ErrObservationTitleRequired
 	}
@@ -2360,9 +2368,6 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 		return 0, ErrObservationContentRequired
 	}
 
-	if len(content) > s.cfg.MaxObservationLength {
-		content = content[:s.cfg.MaxObservationLength] + "... [truncated]"
-	}
 	scope := normalizeScope(p.Scope)
 	normHash := hashNormalized(content)
 	topicKey := normalizeTopicKey(p.TopicKey)
@@ -2681,7 +2686,7 @@ func (s *Store) AddPrompt(p AddPromptParams) (int64, error) {
 	// Normalize project name before storing
 	p.Project, _ = NormalizeProject(p.Project)
 
-	content := s.preparePromptContent(p.Content)
+	content, _ := s.prepareStoredContent(p.Content)
 	if content == "" {
 		return 0, ErrPromptContentRequired
 	}
@@ -2730,7 +2735,7 @@ func (s *Store) AddPrompt(p AddPromptParams) (int64, error) {
 
 func (s *Store) AddPromptIfMissing(p AddPromptParams) (int64, bool, error) {
 	p.Project, _ = NormalizeProject(p.Project)
-	content := s.preparePromptContent(p.Content)
+	content, _ := s.prepareStoredContent(p.Content)
 	if content == "" {
 		return 0, false, ErrPromptContentRequired
 	}
@@ -2790,12 +2795,32 @@ func (s *Store) AddPromptIfMissing(p AddPromptParams) (int64, bool, error) {
 	return promptID, inserted, nil
 }
 
-func (s *Store) preparePromptContent(content string) string {
+// ContentTruncation returns the byte-based truncation metadata used by storage writes.
+func (s *Store) ContentTruncation(content string) TruncationMetadata {
+	_, metadata := s.prepareStoredContent(content)
+	return metadata
+}
+
+func (s *Store) prepareStoredContent(content string) (string, TruncationMetadata) {
 	content = stripPrivateTags(content)
-	if len(content) > s.cfg.MaxObservationLength {
-		content = content[:s.cfg.MaxObservationLength] + "... [truncated]"
+	metadata := TruncationMetadata{
+		OriginalBytes: len(content),
+		LimitBytes:    s.cfg.MaxObservationLength,
+		Truncated:     len(content) > s.cfg.MaxObservationLength,
 	}
-	return content
+	return truncateContent(content, s.cfg.MaxObservationLength), metadata
+}
+
+func truncateContent(content string, max int) string {
+	if len(content) <= max {
+		return content
+	}
+
+	end := max
+	for end > 0 && !utf8.RuneStart(content[end]) {
+		end--
+	}
+	return content[:end] + "... [truncated]"
 }
 
 func (s *Store) RecentPrompts(project string, limit int) ([]Prompt, error) {
@@ -3071,10 +3096,7 @@ func (s *Store) UpdateObservation(id int64, p UpdateObservationParams) (*Observa
 			title = stripPrivateTags(*p.Title)
 		}
 		if p.Content != nil {
-			content = stripPrivateTags(*p.Content)
-			if len(content) > s.cfg.MaxObservationLength {
-				content = content[:s.cfg.MaxObservationLength] + "... [truncated]"
-			}
+			content, _ = s.prepareStoredContent(*p.Content)
 		}
 		if p.Project != nil {
 			requestedProject, _ := NormalizeProject(*p.Project)
