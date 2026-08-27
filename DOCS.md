@@ -860,6 +860,12 @@ Exact duplicate saves are deduplicated in a rolling time window using a normaliz
 When `topic_key` is provided, `mem_save` upserts the latest observation in the same `project + scope + topic_key`, incrementing `revision_count` and attributing it to the latest writer session.
 Save responses include lifecycle metadata for the saved observation: computed `state` (`active` or `needs_review`) and `review_after` when the observation type has a review cycle.
 
+#### Candidate ranking configuration
+
+`engram mcp --bm25-max-rank 0` keeps raw FTS5 ranks at or below the supplied maximum. Smaller raw BM25 ranks are stronger matches, and `0` (the default) retains normal negative FTS5 ranks before applying the candidate limit.
+
+`--bm25-floor` is deprecated compatibility behavior for integrations that previously used the inverted minimum-rank predicate. Do not pass both options; startup rejects the ambiguous configuration. For example, a legacy host may temporarily use `engram mcp --bm25-floor -2`, while a new host should use `engram mcp --bm25-max-rank -2` to retain only ranks `<= -2`.
+
 ### mem_update
 
 Update an observation by ID. Public schema supports partial updates for `title`, `content`, `type`, `scope`, and `topic_key`. For legacy/raw MCP clients, a non-empty `project` argument is still tolerated by the handler even though it is not exposed in the schema.

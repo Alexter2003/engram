@@ -79,6 +79,21 @@ func captureOutput(t *testing.T, fn func()) (stdout string, stderr string) {
 	os.Stdout = outW
 	os.Stderr = errW
 
+	type capturedOutput struct {
+		bytes []byte
+		err   error
+	}
+	outDone := make(chan capturedOutput, 1)
+	errDone := make(chan capturedOutput, 1)
+	go func() {
+		bytes, err := io.ReadAll(outR)
+		outDone <- capturedOutput{bytes: bytes, err: err}
+	}()
+	go func() {
+		bytes, err := io.ReadAll(errR)
+		errDone <- capturedOutput{bytes: bytes, err: err}
+	}()
+
 	fn()
 
 	_ = outW.Close()
@@ -86,16 +101,16 @@ func captureOutput(t *testing.T, fn func()) (stdout string, stderr string) {
 	os.Stdout = oldOut
 	os.Stderr = oldErr
 
-	outBytes, err := io.ReadAll(outR)
-	if err != nil {
-		t.Fatalf("read stdout: %v", err)
+	out := <-outDone
+	if out.err != nil {
+		t.Fatalf("read stdout: %v", out.err)
 	}
-	errBytes, err := io.ReadAll(errR)
-	if err != nil {
-		t.Fatalf("read stderr: %v", err)
+	errOut := <-errDone
+	if errOut.err != nil {
+		t.Fatalf("read stderr: %v", errOut.err)
 	}
 
-	return string(outBytes), string(errBytes)
+	return string(out.bytes), string(errOut.bytes)
 }
 
 func mustSeedObservation(t *testing.T, cfg store.Config, sessionID, project, typ, title, content, scope string) int64 {
@@ -167,6 +182,11 @@ func TestPrintUsage(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "search <query>") || !strings.Contains(stdout, "setup [agent]") {
 		t.Fatalf("usage missing expected commands: %q", stdout)
+	}
+	for _, option := range []string{"--bm25-max-rank N", "--bm25-floor N", "Deprecated legacy ranks >= N behavior"} {
+		if !strings.Contains(stdout, option) {
+			t.Fatalf("usage missing candidate ranking option %q: %q", option, stdout)
+		}
 	}
 	for _, agent := range []string{"opencode", "pi", "claude-code", "gemini-cli", "codex", "antigravity-cli", "windsurf", "qwen", "kiro", "cursor", "vscode-copilot", "kilocode"} {
 		if !strings.Contains(stdout, agent) {

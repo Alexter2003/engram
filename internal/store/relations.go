@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -71,12 +72,17 @@ type CandidateOptions struct {
 	Type string
 	// Limit caps the number of candidates returned. Default 3 when nil or <=0.
 	Limit int
-	// BM25Floor is the minimum BM25 score (negative; closer to 0 = better match).
-	// Candidates below the floor are excluded. Default -2.0 when nil.
+	// BM25MaxRank is the largest acceptable raw FTS5 BM25 rank. FTS5 ranks
+	// smaller numbers as better matches, so candidates whose rank is greater
+	// than this value are excluded. nil uses the default 0.0, which retains all
+	// ordinary negative FTS5 ranks.
+	BM25MaxRank *float64
+	// BM25Floor preserves the legacy minimum-rank behavior. It is deprecated:
+	// use BM25MaxRank for FTS5's best-first raw rank ordering. Candidates below
+	// this value are excluded. BM25Floor and BM25MaxRank cannot both be set.
 	//
-	// Use a pointer so that an explicit 0.0 (very strict — nothing passes) is
-	// distinguishable from the zero value (which previously collided with the
-	// default sentinel). nil means "use the default (-2.0)".
+	// Use a pointer so an explicit legacy floor remains distinguishable from an
+	// omitted option.
 	BM25Floor *float64
 	// SkipInsert controls whether FindCandidates inserts pending relation rows.
 	// When true, candidates are returned but NO rows are written to memory_relations.
@@ -238,7 +244,7 @@ type Candidate struct {
 	Type string
 	// TopicKey is the candidate's topic_key (may be nil).
 	TopicKey *string
-	// Score is the FTS5 BM25 rank (negative; closer to 0 = better match).
+	// Score is the raw FTS5 BM25 rank (negative; smaller is a better match).
 	Score float64
 	// JudgmentID is the sync_id of the pending memory_relations row created
 	// for this (source, candidate) pair.
@@ -317,7 +323,8 @@ type JudgeRelationParams struct {
 // ─── FindCandidates ───────────────────────────────────────────────────────────
 
 // FindCandidates runs a post-transaction FTS5 candidate query for the given
-// savedID and returns at most opts.Limit candidates above the BM25 floor.
+// savedID and returns at most opts.Limit candidates that satisfy the configured
+// raw FTS5 rank predicate.
 //
 // For each candidate, a pending memory_relations row is inserted and the row's
 // sync_id is exposed as Candidate.JudgmentID.
@@ -330,16 +337,14 @@ func (s *Store) FindCandidates(savedID int64, opts CandidateOptions) ([]Candidat
 	if limit <= 0 {
 		limit = 3
 	}
-	// BM25Floor uses pointer semantics: nil means "use the default (-2.0)".
-	// An explicit pointer value (including 0.0) is used as-is.
-	floor := -2.0
-	if opts.BM25Floor != nil {
-		floor = *opts.BM25Floor
+	query, threshold, err := candidateRankQuery(opts)
+	if err != nil {
+		return nil, fmt.Errorf("FindCandidates: %w", err)
 	}
 
 	// Get the saved observation to build the FTS query and for project/scope filtering.
 	var title, project, scope string
-	err := s.db.QueryRow(
+	err = s.db.QueryRow(
 		`SELECT title, ifnull(project,''), scope FROM observations WHERE id = ?`, savedID,
 	).Scan(&title, &project, &scope)
 	if err == sql.ErrNoRows {
@@ -363,8 +368,9 @@ func (s *Store) FindCandidates(savedID int64, opts CandidateOptions) ([]Candidat
 	}
 
 	// FTS5 query: same project, same scope, exclude just-saved row, exclude soft-deleted.
-	// BM25 floor filtering is done in Go after scanning.
-	rows, err := s.db.Query(findCandidatesFTSQuery, ftsQuery, savedID, project, scope, limit*3) // fetch extra rows to allow floor filtering
+	// Apply the threshold in SQL before the final limit so eligible best matches
+	// are never discarded by a bounded pre-filter result.
+	rows, err := s.db.Query(query, ftsQuery, savedID, project, scope, threshold, limit)
 	if err != nil {
 		return nil, fmt.Errorf("FindCandidates: FTS5 query: %w", err)
 	}
@@ -386,15 +392,7 @@ func (s *Store) FindCandidates(savedID int64, opts CandidateOptions) ([]Candidat
 			}
 			return nil, fmt.Errorf("FindCandidates: scan: %w", err)
 		}
-		// Apply BM25 floor filter. BM25 scores are negative; closer to 0 = better.
-		// We only include rows whose score >= floor (e.g., -1.5 >= -2.0).
-		if rc.score < floor {
-			continue
-		}
 		raw = append(raw, rc)
-		if len(raw) >= limit {
-			break
-		}
 	}
 	if err := rows.Err(); err != nil {
 		if closeErr := rows.Close(); closeErr != nil {
@@ -1062,9 +1060,51 @@ const findCandidatesFTSQuery = `
 	  AND o.deleted_at IS NULL
 	  AND ifnull(o.project,'') = ifnull(?,'')
 	  AND o.scope = ?
+	  AND fts.rank <= ?
 	ORDER BY fts.rank
 	LIMIT ?
 `
+
+const findCandidatesLegacyFloorFTSQuery = `
+	SELECT o.id, ifnull(o.sync_id,'') as sync_id, o.title, o.type, o.topic_key,
+	       fts.rank
+	FROM observations_fts fts
+	CROSS JOIN observations o ON o.id = fts.rowid
+	WHERE observations_fts MATCH ?
+	  AND o.id != ?
+	  AND o.deleted_at IS NULL
+	  AND ifnull(o.project,'') = ifnull(?,'')
+	  AND o.scope = ?
+	  AND fts.rank >= ?
+	ORDER BY fts.rank
+	LIMIT ?
+`
+
+const defaultCandidateBM25MaxRank = 0.0
+
+func candidateRankQuery(opts CandidateOptions) (string, float64, error) {
+	if opts.BM25MaxRank != nil && opts.BM25Floor != nil {
+		return "", 0, fmt.Errorf("BM25MaxRank and deprecated BM25Floor cannot both be set")
+	}
+	if opts.BM25Floor != nil {
+		if !validBM25Rank(*opts.BM25Floor) {
+			return "", 0, fmt.Errorf("BM25Floor must be finite")
+		}
+		return findCandidatesLegacyFloorFTSQuery, *opts.BM25Floor, nil
+	}
+	maxRank := defaultCandidateBM25MaxRank
+	if opts.BM25MaxRank != nil {
+		maxRank = *opts.BM25MaxRank
+	}
+	if !validBM25Rank(maxRank) {
+		return "", 0, fmt.Errorf("BM25MaxRank must be finite")
+	}
+	return findCandidatesFTSQuery, maxRank, nil
+}
+
+func validBM25Rank(rank float64) bool {
+	return !math.IsNaN(rank) && !math.IsInf(rank, 0)
+}
 
 // sanitizeFTSCandidates builds an OR-based FTS5 query from a title so that
 // FindCandidates returns documents with ANY term overlap (not all terms).
