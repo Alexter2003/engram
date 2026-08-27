@@ -28,6 +28,8 @@ const ENGRAM_SELF_HEAL_INTERVAL_MS = 5000;
 const ENGRAM_SELF_HEAL_MAX_ATTEMPTS = 6;
 const ENGRAM_STARTUP_TIMEOUT_MS = 10000;
 const ENGRAM_STARTUP_POLL_MS = 100;
+const ENGRAM_STARTUP_RETRY_BASE_MS = 1000;
+const ENGRAM_STARTUP_RETRY_MAX_MS = 60000;
 
 const ENGRAM_TOOLS = [
   "mem_search",
@@ -300,7 +302,24 @@ async function ensureSessionBestEffort(sessionId: string, sessionProject = proje
   } catch {}
 }
 
+// "refused" means we saw proof that nothing is listening; "indeterminate" means the probe
+// told us nothing either way. Only "ready" is proof that a server is answering, so nothing
+// but "ready" may be read as "a server is already there".
 type EngramHealth = "ready" | "refused" | "indeterminate";
+
+// Node reports a refused localhost connection through several shapes: a bare Error whose
+// message is the refusal, a wrapper whose `cause` carries `code`, and — when the host
+// resolves to both ::1 and 127.0.0.1 — an AggregateError whose per-address `errors` carry it
+// while the aggregate itself carries none. Walk all of them, and read `code` through the
+// prototype chain, so one unmatched shape cannot silently downgrade a plain refusal.
+function hasConnectionRefusedCode(value: unknown, depth = 0): boolean {
+  if (depth > 4 || typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  if (record.code === "ECONNREFUSED") return true;
+  const errors = record.errors;
+  if (Array.isArray(errors) && errors.some((entry) => hasConnectionRefusedCode(entry, depth + 1))) return true;
+  return hasConnectionRefusedCode(record.cause, depth + 1);
+}
 
 async function probeEngramHealth(): Promise<EngramHealth> {
   try {
@@ -310,11 +329,7 @@ async function probeEngramHealth(): Promise<EngramHealth> {
     return res.ok ? "ready" : "indeterminate";
   } catch (error) {
     if (isTimeoutError(error)) return "indeterminate";
-    const cause = error instanceof Error ? (error as Error & { cause?: unknown }).cause : undefined;
-    if (
-      (error instanceof Error && error.message === "connection refused") ||
-      (typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ECONNREFUSED")
-    ) {
+    if ((error instanceof Error && error.message === "connection refused") || hasConnectionRefusedCode(error)) {
       return "refused";
     }
     return "indeterminate";
@@ -443,8 +458,9 @@ function waitCancellable(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-async function waitForEngramReadiness(signal: AbortSignal): Promise<void> {
-  const deadline = Date.now() + ENGRAM_STARTUP_TIMEOUT_MS;
+// The deadline is absolute and passed in, so a spawn attempt and the fallback wait that
+// follows it share one startup budget instead of each starting a fresh one.
+async function waitForEngramReadiness(signal: AbortSignal, deadline: number): Promise<void> {
   while (Date.now() < deadline) {
     if (signal.aborted) throw new Error(`Engram startup readiness wait for ${ENGRAM_URL} was cancelled`);
     if (await probeEngramHealth() === "ready") return;
@@ -455,7 +471,19 @@ async function waitForEngramReadiness(signal: AbortSignal): Promise<void> {
   throw new Error(`Engram server at ${ENGRAM_URL} did not become ready before startup timeout`);
 }
 
-function spawnAndWaitForEngram(): Promise<void> {
+// A child we gave up on is terminated, not merely released. Unreffing alone only detaches it
+// from our event loop: the process stays alive, detached, answering nothing — and because
+// initialization is retried, every later attempt would add another one for the life of the
+// session. Killing is best effort: on the `exit` path the child is already gone.
+function stopAbandonedChild(proc: ChildProcess | undefined): void {
+  if (proc === undefined) return;
+  try {
+    proc.kill("SIGTERM");
+  } catch {}
+  proc.unref();
+}
+
+function spawnAndWaitForEngram(deadline: number): Promise<void> {
   return new Promise((resolvePromise, rejectPromise) => {
     let proc: ChildProcess | undefined;
     let settled = false;
@@ -464,17 +492,21 @@ function spawnAndWaitForEngram(): Promise<void> {
     const readiness = new AbortController();
 
     // Every terminal path — readiness, error, exit, timeout, abort — runs this exactly once:
-    // it stops the poll, detaches the listeners, and unrefs the child. Unreffing only on
-    // success is what let a failed startup keep both the child and the poll alive.
+    // it stops the poll and detaches the listeners. Only a child that reached readiness is
+    // released to keep serving; any other outcome means we gave up on it, so it is killed.
     function settle(error?: Error): void {
       if (settled) return;
       settled = true;
       readiness.abort();
       proc?.removeListener("error", onError);
       proc?.removeListener("exit", onExit);
+      if (error) {
+        stopAbandonedChild(proc);
+        rejectPromise(error);
+        return;
+      }
       proc?.unref();
-      if (error) rejectPromise(error);
-      else resolvePromise();
+      resolvePromise();
     }
 
     const onError = (error: Error): void =>
@@ -495,7 +527,7 @@ function spawnAndWaitForEngram(): Promise<void> {
     proc.once("error", onError);
     proc.once("exit", onExit);
     proc.once("spawn", () => {
-      void waitForEngramReadiness(readiness.signal).then(
+      void waitForEngramReadiness(readiness.signal, deadline).then(
         () => settle(),
         (error) => settle(error instanceof Error ? error : new Error(String(error))),
       );
@@ -505,28 +537,67 @@ function spawnAndWaitForEngram(): Promise<void> {
 
 async function initializeEngramServer(): Promise<void> {
   if (CONFIGURED_ENGRAM_URL !== undefined) return;
+  const deadline = Date.now() + ENGRAM_STARTUP_TIMEOUT_MS;
   const health = await probeEngramHealth();
-  if (health === "refused") {
-    await spawnAndWaitForEngram();
-    return;
-  }
-  const readiness = new AbortController();
+  if (health === "ready") return;
+
+  // Only "ready" proves a server is answering. Every other outcome — a definitive refusal, an
+  // aborted probe, a DNS failure, an error shape we do not recognize — means we have no
+  // server, so launch one. Reading an inconclusive probe as "a server must be starting"
+  // instead is what let a cold machine burn the whole startup budget polling a port nobody
+  // was ever going to bind.
   try {
-    await waitForEngramReadiness(readiness.signal);
-  } finally {
-    readiness.abort();
+    await spawnAndWaitForEngram(deadline);
+  } catch (error) {
+    // An inconclusive probe leaves room for another Pi process to already own the port, which
+    // is exactly what makes our child fail. Give that instance the rest of the shared
+    // deadline before reporting failure. A definitive refusal gets no such grace: nothing was
+    // listening when we looked, so there is no other instance to wait for.
+    if (health !== "indeterminate") throw error;
+    const readiness = new AbortController();
+    try {
+      await waitForEngramReadiness(readiness.signal, deadline);
+    } catch {
+      // The spawn failure is the actionable one; a readiness timeout only restates it.
+      throw error;
+    } finally {
+      readiness.abort();
+    }
   }
 }
 
 let initialization: Promise<void> | undefined;
+let startupFailures = 0;
+let startupRetryAt = 0;
+let startupFailure: Error | undefined;
 
+function startupBackoffMs(failures: number): number {
+  return Math.min(ENGRAM_STARTUP_RETRY_MAX_MS, ENGRAM_STARTUP_RETRY_BASE_MS * 2 ** (failures - 1));
+}
+
+// A failed startup stays retryable — a transient outage must not disable memory for the rest
+// of the session — but retrying it on every caller made a persistently unhealthy provider
+// charge the full readiness budget once per tool call. Inside the backoff window the last
+// failure is replayed immediately, so the cost of an unhealthy provider is bounded by the
+// backoff rather than by how often the agent calls tools, and so is the number of children a
+// failing session can spawn. A success clears the window and is cached for the session.
 function sharedInitialization(start: () => Promise<void>): Promise<void> {
-  if (!initialization) {
-    initialization = start().catch((error) => {
+  if (initialization) return initialization;
+  if (startupFailure !== undefined && Date.now() < startupRetryAt) return Promise.reject(startupFailure);
+  initialization = start().then(
+    () => {
+      startupFailures = 0;
+      startupRetryAt = 0;
+      startupFailure = undefined;
+    },
+    (error: unknown) => {
       initialization = undefined;
-      throw error;
-    });
-  }
+      startupFailures += 1;
+      startupFailure = error instanceof Error ? error : new Error(String(error));
+      startupRetryAt = Date.now() + startupBackoffMs(startupFailures);
+      throw startupFailure;
+    },
+  );
   return initialization;
 }
 

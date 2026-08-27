@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
+import { createServer } from "node:net";
 import { test } from "node:test";
 
 const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
@@ -104,13 +105,20 @@ function buildScheduleEngramSelfHealForTest({ waitUnref, isEngramRunning, maxAtt
   return factory(waitUnref, isEngramRunning, 1, maxAttempts);
 }
 
-function buildInitializeEngramServerForTest({ configuredUrl = false, probeEngramHealth, spawnAndWaitForEngram, waitForEngramReadiness }) {
+function buildInitializeEngramServerForTest({
+  configuredUrl = false,
+  probeEngramHealth,
+  spawnAndWaitForEngram,
+  waitForEngramReadiness,
+  timeoutMs = 10000,
+}) {
   const body = extractFunctionBody("initializeEngramServer", "{\n  if (CONFIGURED_ENGRAM_URL");
   const factory = new Function(
     "CONFIGURED_ENGRAM_URL",
     "probeEngramHealth",
     "spawnAndWaitForEngram",
     "waitForEngramReadiness",
+    "ENGRAM_STARTUP_TIMEOUT_MS",
     `
     async function initializeEngramServer() {
       ${body}
@@ -118,18 +126,28 @@ function buildInitializeEngramServerForTest({ configuredUrl = false, probeEngram
     return initializeEngramServer;
     `,
   );
-  return factory(configuredUrl ? "http://configured" : undefined, probeEngramHealth, spawnAndWaitForEngram, waitForEngramReadiness);
+  return factory(
+    configuredUrl ? "http://configured" : undefined,
+    probeEngramHealth,
+    spawnAndWaitForEngram,
+    waitForEngramReadiness,
+    timeoutMs,
+  );
 }
 
 function buildProbeEngramHealthForTest({ fetch, isTimeoutError }) {
-  const body = extractFunctionBody("probeEngramHealth", "{\n  try")
-    .replace("(error as Error & { cause?: unknown }).cause", "error.cause");
+  const body = extractFunctionBody("probeEngramHealth", "{\n  try");
+  const refusedBody = extractFunctionBody("hasConnectionRefusedCode", "{\n  if (depth")
+    .replace("value as Record<string, unknown>", "value");
   const factory = new Function(
     "fetch",
     "isTimeoutError",
     "ENGRAM_URL",
     "AbortSignal",
     `
+    function hasConnectionRefusedCode(value, depth = 0) {
+      ${refusedBody}
+    }
     async function probeEngramHealth() {
       ${body}
     }
@@ -139,25 +157,47 @@ function buildProbeEngramHealthForTest({ fetch, isTimeoutError }) {
   return factory(fetch, isTimeoutError, "http://127.0.0.1:7437", { timeout: () => undefined });
 }
 
-function buildSharedInitializationForTest() {
-  const body = extractFunctionBody("sharedInitialization", "{\n  if (!initialization)");
-  const factory = new Function(`
+// The retry backoff is clock-driven, so the test owns the clock: nothing here sleeps, and a
+// backoff window is crossed by moving `clock.now` instead of by waiting for wall time.
+function buildSharedInitializationForTest({ retryBaseMs = 1000, retryMaxMs = 60000 } = {}) {
+  const clock = { now: 1_000_000 };
+  const body = extractFunctionBody("sharedInitialization", "{\n  if (initialization)")
+    .replace("(error: unknown) =>", "(error) =>");
+  const backoffBody = extractFunctionBody("startupBackoffMs", "{\n  return Math.min");
+  const factory = new Function(
+    "Date",
+    "ENGRAM_STARTUP_RETRY_BASE_MS",
+    "ENGRAM_STARTUP_RETRY_MAX_MS",
+    `
     let initialization;
+    let startupFailures = 0;
+    let startupRetryAt = 0;
+    let startupFailure;
+    function startupBackoffMs(failures) {
+      ${backoffBody}
+    }
     function sharedInitialization(start) {
       ${body}
     }
     return sharedInitialization;
-  `);
-  return factory();
+    `,
+  );
+  const sharedInitialization = factory({ now: () => clock.now }, retryBaseMs, retryMaxMs);
+  return { sharedInitialization, clock };
 }
 
-// A fake child process: an EventEmitter with the two ChildProcess members the startup
-// path touches, plus a counter so a test can prove the child was released.
+// A fake child process: an EventEmitter with the ChildProcess members the startup path
+// touches, plus counters so a test can prove the child was released or killed.
 function createFakeChild() {
   const child = new EventEmitter();
   child.unrefCalls = 0;
+  child.killCalls = 0;
   child.unref = () => {
     child.unrefCalls += 1;
+  };
+  child.kill = () => {
+    child.killCalls += 1;
+    return true;
   };
   return child;
 }
@@ -166,26 +206,31 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function buildWaitForEngramReadinessForTest({ probeEngramHealth, timeoutMs = 200, pollMs = 5 }) {
+// Deadlines are absolute, so a test that must not time out gets a far one and a test that
+// asserts the timeout gets a near one; neither depends on how loaded the runner is.
+function deadlineIn(ms) {
+  return Date.now() + ms;
+}
+
+function buildWaitForEngramReadinessForTest({ probeEngramHealth, pollMs = 5 }) {
   const factory = new Function(
     "probeEngramHealth",
     "ENGRAM_URL",
-    "ENGRAM_STARTUP_TIMEOUT_MS",
     "ENGRAM_STARTUP_POLL_MS",
     `
     function waitCancellable(ms, signal) {
       ${extractFunctionBody("waitCancellable", "{\n  return new Promise")}
     }
-    async function waitForEngramReadiness(signal) {
-      ${extractFunctionBody("waitForEngramReadiness", "{\n  const deadline")}
+    async function waitForEngramReadiness(signal, deadline) {
+      ${extractFunctionBody("waitForEngramReadiness", "{\n  while (Date.now()")}
     }
     return waitForEngramReadiness;
     `,
   );
-  return factory(probeEngramHealth, "http://127.0.0.1:7437", timeoutMs, pollMs);
+  return factory(probeEngramHealth, "http://127.0.0.1:7437", pollMs);
 }
 
-function buildSpawnAndWaitForEngramForTest({ spawn, probeEngramHealth, timeoutMs = 200, pollMs = 5 }) {
+function buildSpawnAndWaitForEngramForTest({ spawn, probeEngramHealth, pollMs = 5 }) {
   const spawnBody = extractFunctionBody("spawnAndWaitForEngram", "{\n  return new Promise")
     .replace("let proc: ChildProcess | undefined;", "let proc;")
     .replace("function settle(error?: Error): void {", "function settle(error) {")
@@ -196,22 +241,24 @@ function buildSpawnAndWaitForEngramForTest({ spawn, probeEngramHealth, timeoutMs
     "probeEngramHealth",
     "ENGRAM_BIN",
     "ENGRAM_URL",
-    "ENGRAM_STARTUP_TIMEOUT_MS",
     "ENGRAM_STARTUP_POLL_MS",
     `
     function waitCancellable(ms, signal) {
       ${extractFunctionBody("waitCancellable", "{\n  return new Promise")}
     }
-    async function waitForEngramReadiness(signal) {
-      ${extractFunctionBody("waitForEngramReadiness", "{\n  const deadline")}
+    async function waitForEngramReadiness(signal, deadline) {
+      ${extractFunctionBody("waitForEngramReadiness", "{\n  while (Date.now()")}
     }
-    function spawnAndWaitForEngram() {
+    function stopAbandonedChild(proc) {
+      ${extractFunctionBody("stopAbandonedChild", "{\n  if (proc === undefined) return;")}
+    }
+    function spawnAndWaitForEngram(deadline) {
       ${spawnBody}
     }
     return spawnAndWaitForEngram;
     `,
   );
-  return factory(spawn, probeEngramHealth, "engram", "http://127.0.0.1:7437", timeoutMs, pollMs);
+  return factory(spawn, probeEngramHealth, "engram", "http://127.0.0.1:7437", pollMs);
 }
 
 function sessionCtx(id, sink) {
@@ -257,7 +304,7 @@ test("memory protocol declares gentle-engram as the Pi-native provider", () => {
   assert.match(source, /Do not infer alternative Engram tool names from other integrations/);
 });
 
-test("a slow existing health endpoint waits for readiness without spawning", async () => {
+test("an inconclusive health probe still attempts the spawn", async () => {
   let probes = 0;
   let spawns = 0;
   let readinessWaits = 0;
@@ -272,8 +319,44 @@ test("a slow existing health endpoint waits for readiness without spawning", asy
 
   await initializeEngramServer();
   assert.equal(probes, 1);
+  assert.equal(spawns, 1, "no evidence of a live server means launch one, not wait for one");
+  assert.equal(readinessWaits, 0, "the spawned child owns its readiness result");
+});
+
+test("an already-ready health endpoint neither spawns nor waits", async () => {
+  let spawns = 0;
+  let readinessWaits = 0;
+  const initializeEngramServer = buildInitializeEngramServerForTest({
+    probeEngramHealth: async () => "ready",
+    spawnAndWaitForEngram: async () => { spawns += 1; },
+    waitForEngramReadiness: async () => { readinessWaits += 1; },
+  });
+
+  await initializeEngramServer();
   assert.equal(spawns, 0);
-  assert.equal(readinessWaits, 1, "readiness, not a timeout fallback, completes initialization");
+  assert.equal(readinessWaits, 0);
+});
+
+test("an inconclusive probe falls back to an already-starting server when our child loses the port", async () => {
+  let readinessWaits = 0;
+  const initializeEngramServer = buildInitializeEngramServerForTest({
+    probeEngramHealth: async () => "indeterminate",
+    spawnAndWaitForEngram: async () => { throw new Error("Engram server exited before readiness (code 1)"); },
+    waitForEngramReadiness: async () => { readinessWaits += 1; },
+  });
+
+  await initializeEngramServer();
+  assert.equal(readinessWaits, 1, "an inconclusive probe leaves room for another instance to be coming up");
+});
+
+test("an inconclusive probe reports the child failure when nothing becomes ready", async () => {
+  const initializeEngramServer = buildInitializeEngramServerForTest({
+    probeEngramHealth: async () => "indeterminate",
+    spawnAndWaitForEngram: async () => { throw new Error("Engram server exited before readiness (code 1)"); },
+    waitForEngramReadiness: async () => { throw new Error("did not become ready before startup timeout"); },
+  });
+
+  await assert.rejects(initializeEngramServer(), /exited before readiness/, "the spawn failure is the actionable one");
 });
 
 test("a generic connection-refused health error is a definitive refusal", async () => {
@@ -289,6 +372,55 @@ test("a nested ECONNREFUSED health error is a definitive refusal", async () => {
   const probeEngramHealth = buildProbeEngramHealthForTest({
     fetch: async () => {
       throw Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNREFUSED" } });
+    },
+    isTimeoutError: () => false,
+  });
+
+  assert.equal(await probeEngramHealth(), "refused");
+});
+
+test("an aggregate of per-address ECONNREFUSED errors is a definitive refusal", async () => {
+  const probeEngramHealth = buildProbeEngramHealthForTest({
+    fetch: async () => {
+      // What Node actually rejects with for a refused localhost that resolves to both ::1
+      // and 127.0.0.1: the code lives on the per-address errors, not on the cause itself.
+      const aggregate = new AggregateError([
+        Object.assign(new Error("connect ECONNREFUSED ::1:7437"), { code: "ECONNREFUSED" }),
+        Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:7437"), { code: "ECONNREFUSED" }),
+      ], "");
+      throw Object.assign(new TypeError("fetch failed"), { cause: aggregate });
+    },
+    isTimeoutError: () => false,
+  });
+
+  assert.equal(await probeEngramHealth(), "refused");
+});
+
+test("the refusal classifier matches what Node actually rejects with on a closed port", async () => {
+  // Exercises the real rejection shape rather than a hand-written stand-in for it: Node wraps
+  // the refusal in a `cause`, and neither the message nor the code is where the outer error is.
+  const port = await new Promise((resolve, reject) => {
+    const probe = createServer();
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", () => {
+      const { port: chosen } = probe.address();
+      probe.close(() => resolve(chosen));
+    });
+  });
+  const probeEngramHealth = buildProbeEngramHealthForTest({
+    fetch: () => globalThis.fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(2000) }),
+    isTimeoutError: (candidate) => candidate instanceof Error && (candidate.name === "TimeoutError" || candidate.name === "AbortError"),
+  });
+
+  assert.equal(await probeEngramHealth(), "refused");
+});
+
+test("an inherited ECONNREFUSED code on the cause is a definitive refusal", async () => {
+  const probeEngramHealth = buildProbeEngramHealthForTest({
+    fetch: async () => {
+      // A cause whose `code` comes from its prototype has no own `code` key, so an
+      // own-property check would misread a plain refusal as inconclusive.
+      throw Object.assign(new TypeError("fetch failed"), { cause: Object.create({ code: "ECONNREFUSED" }) });
     },
     isTimeoutError: () => false,
   });
@@ -335,7 +467,7 @@ test("a child error or bind-collision exit is a terminal initialization failure"
 });
 
 test("concurrent initialization callers share one startup and its terminal result", async () => {
-  const sharedInitialization = buildSharedInitializationForTest();
+  const { sharedInitialization } = buildSharedInitializationForTest();
   let starts = 0;
   let release;
   const gate = new Promise((resolve) => { release = resolve; });
@@ -369,7 +501,7 @@ test("ENGRAM_URL bypasses Pi readiness and automatic spawn", async () => {
   assert.equal(readinessWaits, 0);
 });
 
-test("a child that reaches readiness is unref'd and stops health polling", async () => {
+test("a child that reaches readiness is released to keep running, never killed", async () => {
   const child = createFakeChild();
   let probes = 0;
   const spawnAndWaitForEngram = buildSpawnAndWaitForEngramForTest({
@@ -383,15 +515,16 @@ test("a child that reaches readiness is unref'd and stops health polling", async
     },
   });
 
-  await spawnAndWaitForEngram();
+  await spawnAndWaitForEngram(deadlineIn(30_000));
 
   assert.equal(child.unrefCalls, 1, "a ready child is released from the event loop");
+  assert.equal(child.killCalls, 0, "the server we just started must survive initialization");
   const probesAtReadiness = probes;
   await delay(60);
   assert.equal(probes, probesAtReadiness, "readiness stops the health poll");
 });
 
-test("a child that errors before readiness is unref'd and stops health polling", async () => {
+test("a child that errors before readiness is killed and stops health polling", async () => {
   const child = createFakeChild();
   let probes = 0;
   const spawnAndWaitForEngram = buildSpawnAndWaitForEngramForTest({
@@ -405,18 +538,19 @@ test("a child that errors before readiness is unref'd and stops health polling",
     },
   });
 
-  const pending = spawnAndWaitForEngram();
+  const pending = spawnAndWaitForEngram(deadlineIn(30_000));
   await delay(20);
   child.emit("error", new Error("spawn ENOENT"));
 
   await assert.rejects(pending, /failed before readiness/);
+  assert.equal(child.killCalls, 1, "the error path does not abandon a live child");
   assert.equal(child.unrefCalls, 1, "the error path releases the child");
   const probesAtRejection = probes;
   await delay(60);
   assert.equal(probes, probesAtRejection, "the error path cancels the health poll");
 });
 
-test("a child that exits before readiness is unref'd and stops health polling", async () => {
+test("a child that exits before readiness is released and stops health polling", async () => {
   const child = createFakeChild();
   let probes = 0;
   const spawnAndWaitForEngram = buildSpawnAndWaitForEngramForTest({
@@ -430,7 +564,7 @@ test("a child that exits before readiness is unref'd and stops health polling", 
     },
   });
 
-  const pending = spawnAndWaitForEngram();
+  const pending = spawnAndWaitForEngram(deadlineIn(30_000));
   await delay(20);
   child.emit("exit", 1, null);
 
@@ -441,7 +575,7 @@ test("a child that exits before readiness is unref'd and stops health polling", 
   assert.equal(probes, probesAtRejection, "the exit path cancels the health poll");
 });
 
-test("a startup timeout unrefs the child and stops health polling", async () => {
+test("a startup timeout kills the child instead of leaving it running", async () => {
   const child = createFakeChild();
   let probes = 0;
   const spawnAndWaitForEngram = buildSpawnAndWaitForEngramForTest({
@@ -453,11 +587,11 @@ test("a startup timeout unrefs the child and stops health polling", async () => 
       probes += 1;
       return "indeterminate";
     },
-    timeoutMs: 60,
     pollMs: 5,
   });
 
-  await assert.rejects(spawnAndWaitForEngram(), /did not become ready before startup timeout/);
+  await assert.rejects(spawnAndWaitForEngram(deadlineIn(60)), /did not become ready before startup timeout/);
+  assert.equal(child.killCalls, 1, "a child we gave up on is not left running detached");
   assert.equal(child.unrefCalls, 1, "the timeout path releases the child");
   const probesAtTimeout = probes;
   await delay(60);
@@ -476,9 +610,47 @@ test("a child that cannot be spawned rejects without leaving a health poll runni
     },
   });
 
-  await assert.rejects(spawnAndWaitForEngram(), /EACCES/);
+  await assert.rejects(spawnAndWaitForEngram(deadlineIn(30_000)), /EACCES/);
   await delay(60);
   assert.equal(probes, 0, "a child that never spawned never starts a health poll");
+});
+
+test("repeated failed initializations do not accumulate live children", async () => {
+  const children = [];
+  const spawnAndWaitForEngram = buildSpawnAndWaitForEngramForTest({
+    spawn: () => {
+      const child = createFakeChild();
+      children.push(child);
+      queueMicrotask(() => {
+        child.emit("spawn");
+        // A server that starts and then never answers /health: the readiness budget, not the
+        // child, is what ends the attempt — exactly the shape that leaked orphans.
+      });
+      return child;
+    },
+    probeEngramHealth: async () => "indeterminate",
+    pollMs: 5,
+  });
+  const initializeEngramServer = buildInitializeEngramServerForTest({
+    probeEngramHealth: async () => "refused",
+    spawnAndWaitForEngram,
+    waitForEngramReadiness: async () => assert.fail("a definitive refusal has no phantom server to wait for"),
+    timeoutMs: 40,
+  });
+  const { sharedInitialization, clock } = buildSharedInitializationForTest();
+
+  for (let attempt = 0; attempt < 25; attempt += 1) {
+    await assert.rejects(sharedInitialization(() => initializeEngramServer()));
+  }
+  assert.equal(children.length, 1, "a hot retry loop must not spawn a child per call");
+
+  clock.now += 5000;
+  await assert.rejects(sharedInitialization(() => initializeEngramServer()));
+  assert.equal(children.length, 2, "once the backoff expires the startup is attempted again");
+
+  for (const child of children) {
+    assert.equal(child.killCalls, 1, "every abandoned child is killed, not left detached");
+  }
 });
 
 test("aborting the readiness wait cancels the health poll immediately", async () => {
@@ -488,12 +660,11 @@ test("aborting the readiness wait cancels the health poll immediately", async ()
       probes += 1;
       return "indeterminate";
     },
-    timeoutMs: 5000,
     pollMs: 5,
   });
 
   const controller = new AbortController();
-  const pending = waitForEngramReadiness(controller.signal);
+  const pending = waitForEngramReadiness(controller.signal, deadlineIn(30_000));
   await delay(20);
   controller.abort();
 
@@ -501,6 +672,66 @@ test("aborting the readiness wait cancels the health poll immediately", async ()
   const probesAtAbort = probes;
   await delay(60);
   assert.equal(probes, probesAtAbort, "an aborted readiness wait issues no further probes");
+});
+
+test("a failing startup backs off instead of re-running on every caller", async () => {
+  const { sharedInitialization } = buildSharedInitializationForTest({ retryBaseMs: 1000, retryMaxMs: 60000 });
+  let starts = 0;
+  const start = async () => {
+    starts += 1;
+    throw new Error("did not become ready before startup timeout");
+  };
+
+  for (let call = 0; call < 20; call += 1) {
+    await assert.rejects(sharedInitialization(start), /did not become ready/);
+  }
+
+  assert.equal(starts, 1, "callers inside the backoff window replay the failure instead of paying the budget");
+});
+
+test("the startup backoff expires so a transient failure is still retried", async () => {
+  const { sharedInitialization, clock } = buildSharedInitializationForTest({ retryBaseMs: 1000, retryMaxMs: 60000 });
+  let starts = 0;
+  const start = async () => {
+    starts += 1;
+    if (starts === 1) throw new Error("did not become ready before startup timeout");
+  };
+
+  await assert.rejects(sharedInitialization(start));
+  assert.equal(starts, 1);
+
+  clock.now += 1000;
+  await sharedInitialization(start);
+  assert.equal(starts, 2, "a transient failure recovers once its backoff window closes");
+
+  await sharedInitialization(start);
+  assert.equal(starts, 2, "a successful startup is cached, not re-run");
+});
+
+test("the startup backoff grows with consecutive failures and stays capped", async () => {
+  const { sharedInitialization, clock } = buildSharedInitializationForTest({ retryBaseMs: 1000, retryMaxMs: 4000 });
+  const start = async () => {
+    throw new Error("did not become ready before startup timeout");
+  };
+  const attemptAt = async (advanceMs) => {
+    clock.now += advanceMs;
+    let ran = false;
+    await assert.rejects(sharedInitialization(async () => {
+      ran = true;
+      await start();
+    }));
+    return ran;
+  };
+
+  assert.equal(await attemptAt(0), true, "the first failure runs the startup");
+  assert.equal(await attemptAt(999), false, "still inside the 1000ms window");
+  assert.equal(await attemptAt(1), true, "the 1000ms window has closed");
+  assert.equal(await attemptAt(1999), false, "the second failure doubled the window to 2000ms");
+  assert.equal(await attemptAt(1), true);
+  assert.equal(await attemptAt(3999), false, "the third failure doubled the window to 4000ms");
+  assert.equal(await attemptAt(1), true);
+  assert.equal(await attemptAt(3999), false, "the window is capped at 4000ms, it does not keep doubling");
+  assert.equal(await attemptAt(1), true);
 });
 
 test("native tool fetches retry transient HTTP startup failures", async () => {
