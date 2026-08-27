@@ -423,40 +423,65 @@ function spawnDetached(command: string, args: readonly string[], cwd?: string): 
   });
 }
 
-async function waitForEngramReadiness(): Promise<void> {
+// A sleep that a cancelled readiness wait can cut short: without it an abandoned poll would
+// hold a live timer — and with it the whole Pi process — until its next tick fired.
+function waitCancellable(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+async function waitForEngramReadiness(signal: AbortSignal): Promise<void> {
   const deadline = Date.now() + ENGRAM_STARTUP_TIMEOUT_MS;
   while (Date.now() < deadline) {
+    if (signal.aborted) throw new Error(`Engram startup readiness wait for ${ENGRAM_URL} was cancelled`);
     if (await probeEngramHealth() === "ready") return;
-    await wait(ENGRAM_STARTUP_POLL_MS);
+    // The probe itself can outlive the abort, so re-check before sleeping again.
+    if (signal.aborted) throw new Error(`Engram startup readiness wait for ${ENGRAM_URL} was cancelled`);
+    await waitCancellable(ENGRAM_STARTUP_POLL_MS, signal);
   }
   throw new Error(`Engram server at ${ENGRAM_URL} did not become ready before startup timeout`);
 }
 
 function spawnAndWaitForEngram(): Promise<void> {
-  return new Promise((resolvePromise, reject) => {
+  return new Promise((resolvePromise, rejectPromise) => {
     let proc: ChildProcess | undefined;
     let settled = false;
-    const cleanup = () => {
+    // One controller cancels the readiness poll from every terminal path, so a child that
+    // errors, exits, or never becomes ready cannot leave a probe loop running behind it.
+    const readiness = new AbortController();
+
+    // Every terminal path — readiness, error, exit, timeout, abort — runs this exactly once:
+    // it stops the poll, detaches the listeners, and unrefs the child. Unreffing only on
+    // success is what let a failed startup keep both the child and the poll alive.
+    function settle(error?: Error): void {
+      if (settled) return;
+      settled = true;
+      readiness.abort();
       proc?.removeListener("error", onError);
       proc?.removeListener("exit", onExit);
-    };
-    const resolve = () => {
-      if (settled) return;
-      settled = true;
-      cleanup();
       proc?.unref();
-      resolvePromise();
-    };
-    const rejectBeforeReady = (error: Error) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reject(error);
-    };
-    const onError = (error: Error) => rejectBeforeReady(new Error(`Engram server failed before readiness: ${error.message}`));
-    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
-      rejectBeforeReady(new Error(`Engram server exited before readiness (code ${code ?? "unknown"}, signal ${signal ?? "none"})`));
-    };
+      if (error) rejectPromise(error);
+      else resolvePromise();
+    }
+
+    const onError = (error: Error): void =>
+      settle(new Error(`Engram server failed before readiness: ${error.message}`));
+    const onExit = (code: number | null, signal: NodeJS.Signals | null): void =>
+      settle(new Error(`Engram server exited before readiness (code ${code ?? "unknown"}, signal ${signal ?? "none"})`));
+
     try {
       proc = spawn(ENGRAM_BIN, ["serve"], {
         windowsHide: true,
@@ -464,13 +489,16 @@ function spawnAndWaitForEngram(): Promise<void> {
         stdio: "ignore",
       });
     } catch (error) {
-      rejectBeforeReady(error instanceof Error ? error : new Error("Engram server could not start"));
+      settle(error instanceof Error ? error : new Error("Engram server could not start"));
       return;
     }
     proc.once("error", onError);
     proc.once("exit", onExit);
     proc.once("spawn", () => {
-      void waitForEngramReadiness().then(resolve, rejectBeforeReady);
+      void waitForEngramReadiness(readiness.signal).then(
+        () => settle(),
+        (error) => settle(error instanceof Error ? error : new Error(String(error))),
+      );
     });
   });
 }
@@ -482,7 +510,12 @@ async function initializeEngramServer(): Promise<void> {
     await spawnAndWaitForEngram();
     return;
   }
-  await waitForEngramReadiness();
+  const readiness = new AbortController();
+  try {
+    await waitForEngramReadiness(readiness.signal);
+  } finally {
+    readiness.abort();
+  }
 }
 
 let initialization: Promise<void> | undefined;
@@ -586,8 +619,31 @@ async function initialize(cwd: string): Promise<void> {
   }
 }
 
+// Startup failures reach the agent as prose, so give every one of them the same shape and
+// the same actionable prefix instead of leaking a raw spawn or readiness message.
+function normalizeInitializationError(error: unknown): Error {
+  const message = error instanceof Error ? error.message : String(error);
+  return new Error(
+    `gentle-engram could not initialize the Engram memory provider at ${ENGRAM_URL}: ${message}. Run mem_doctor or start Engram manually, and verify ENGRAM_URL/ENGRAM_BIN.`,
+  );
+}
+
 function initOnce(cwd: string): Promise<void> {
-  return sharedInitialization(() => initialize(cwd));
+  return sharedInitialization(() => initialize(cwd)).catch((error) => {
+    throw normalizeInitializationError(error);
+  });
+}
+
+// Session hooks have no error channel back to the agent, so a failed startup must stop here
+// rather than escape the hook. sharedInitialization already cleared its cached promise, so
+// the next mem_* tool call retries and reports the normalized failure to the model.
+async function initOnceForHook(cwd: string): Promise<boolean> {
+  try {
+    await initOnce(cwd);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function getSessionId(ctx: SessionContext): string | undefined {
@@ -901,12 +957,14 @@ function unreachableMessage(timedOutMethod: string | undefined): string {
 }
 
 async function executeMemoryTool(toolName: string, params: Record<string, unknown>, ctx: MemoryToolContext) {
-  await initOnce(ctx.cwd);
-  await refreshProjectDetection(ctx.cwd);
   const action = humanToolName(toolName);
-  ctx.ui?.setStatus?.("engram", `🧠 ${project} · ${action}…`);
 
   try {
+    // Initialization runs inside the guarded path: a rejected startup must reach the agent as
+    // a normalized tool error, not as a rejection escaping the Pi tool boundary.
+    await initOnce(ctx.cwd);
+    await refreshProjectDetection(ctx.cwd);
+    ctx.ui?.setStatus?.("engram", `🧠 ${project} · ${action}…`);
     const data = await callMemoryTool(toolName, params, ctx);
     if (data === null) {
       throw new Error(unreachableMessage(takeLastFetchTimeoutMethod()));
@@ -955,7 +1013,7 @@ function registerMemoryTools(pi: ExtensionAPI): void {
 export default function registerEngram(pi: ExtensionAPI) {
   registerMemoryTools(pi);
   pi.on("session_start", async (_event: unknown, ctx: SessionContext) => {
-    await initOnce(ctx.cwd);
+    await initOnceForHook(ctx.cwd);
   });
 
   pi.on("session_shutdown", async (_event: unknown, ctx: SessionContext) => {
@@ -967,7 +1025,7 @@ export default function registerEngram(pi: ExtensionAPI) {
   });
 
   pi.on("session_compact", async (event: unknown, ctx: SessionContext) => {
-    await initOnce(ctx.cwd);
+    if (!(await initOnceForHook(ctx.cwd))) return;
     await refreshProjectDetection(ctx.cwd);
     if (projectDetectionPending || projectResolutionError) return;
     const sessionId = getSessionId(ctx);
@@ -994,10 +1052,12 @@ export default function registerEngram(pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async (event: AgentStartEvent, ctx: SessionContext) => {
-    await initOnce(ctx.cwd);
+    let systemPrompt = event.systemPrompt.length > 0 ? `${event.systemPrompt}\n\n${MEMORY_INSTRUCTIONS}` : MEMORY_INSTRUCTIONS;
+    // The mem_* tools stay registered whether or not startup succeeded, so the agent still
+    // needs the memory protocol; only the server-backed work below is skipped.
+    if (!(await initOnceForHook(ctx.cwd))) return { systemPrompt };
     await refreshProjectDetection(ctx.cwd);
     const sessionId = getSessionId(ctx);
-    let systemPrompt = event.systemPrompt.length > 0 ? `${event.systemPrompt}\n\n${MEMORY_INSTRUCTIONS}` : MEMORY_INSTRUCTIONS;
 
     if (pendingRecoveryNotice !== undefined) {
       systemPrompt = `${systemPrompt}\n\n${pendingRecoveryNotice}`;
@@ -1025,7 +1085,7 @@ export default function registerEngram(pi: ExtensionAPI) {
     const toolName = event.toolName ?? "";
     if (ENGRAM_TOOL_NAMES.has(toolName.toLowerCase())) return;
 
-    await initOnce(ctx.cwd);
+    if (!(await initOnceForHook(ctx.cwd))) return;
     await refreshProjectDetection(ctx.cwd);
     const sessionId = getSessionId(ctx);
     if (!sessionId || projectDetectionPending || projectResolutionError) return;

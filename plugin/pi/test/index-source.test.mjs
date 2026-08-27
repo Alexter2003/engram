@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
@@ -148,6 +149,69 @@ function buildSharedInitializationForTest() {
     return sharedInitialization;
   `);
   return factory();
+}
+
+// A fake child process: an EventEmitter with the two ChildProcess members the startup
+// path touches, plus a counter so a test can prove the child was released.
+function createFakeChild() {
+  const child = new EventEmitter();
+  child.unrefCalls = 0;
+  child.unref = () => {
+    child.unrefCalls += 1;
+  };
+  return child;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function buildWaitForEngramReadinessForTest({ probeEngramHealth, timeoutMs = 200, pollMs = 5 }) {
+  const factory = new Function(
+    "probeEngramHealth",
+    "ENGRAM_URL",
+    "ENGRAM_STARTUP_TIMEOUT_MS",
+    "ENGRAM_STARTUP_POLL_MS",
+    `
+    function waitCancellable(ms, signal) {
+      ${extractFunctionBody("waitCancellable", "{\n  return new Promise")}
+    }
+    async function waitForEngramReadiness(signal) {
+      ${extractFunctionBody("waitForEngramReadiness", "{\n  const deadline")}
+    }
+    return waitForEngramReadiness;
+    `,
+  );
+  return factory(probeEngramHealth, "http://127.0.0.1:7437", timeoutMs, pollMs);
+}
+
+function buildSpawnAndWaitForEngramForTest({ spawn, probeEngramHealth, timeoutMs = 200, pollMs = 5 }) {
+  const spawnBody = extractFunctionBody("spawnAndWaitForEngram", "{\n  return new Promise")
+    .replace("let proc: ChildProcess | undefined;", "let proc;")
+    .replace("function settle(error?: Error): void {", "function settle(error) {")
+    .replace("const onError = (error: Error): void =>", "const onError = (error) =>")
+    .replace("const onExit = (code: number | null, signal: NodeJS.Signals | null): void =>", "const onExit = (code, signal) =>");
+  const factory = new Function(
+    "spawn",
+    "probeEngramHealth",
+    "ENGRAM_BIN",
+    "ENGRAM_URL",
+    "ENGRAM_STARTUP_TIMEOUT_MS",
+    "ENGRAM_STARTUP_POLL_MS",
+    `
+    function waitCancellable(ms, signal) {
+      ${extractFunctionBody("waitCancellable", "{\n  return new Promise")}
+    }
+    async function waitForEngramReadiness(signal) {
+      ${extractFunctionBody("waitForEngramReadiness", "{\n  const deadline")}
+    }
+    function spawnAndWaitForEngram() {
+      ${spawnBody}
+    }
+    return spawnAndWaitForEngram;
+    `,
+  );
+  return factory(spawn, probeEngramHealth, "engram", "http://127.0.0.1:7437", timeoutMs, pollMs);
 }
 
 function sessionCtx(id, sink) {
@@ -303,6 +367,140 @@ test("ENGRAM_URL bypasses Pi readiness and automatic spawn", async () => {
   assert.equal(spawns, 0);
   assert.equal(probes, 0);
   assert.equal(readinessWaits, 0);
+});
+
+test("a child that reaches readiness is unref'd and stops health polling", async () => {
+  const child = createFakeChild();
+  let probes = 0;
+  const spawnAndWaitForEngram = buildSpawnAndWaitForEngramForTest({
+    spawn: () => {
+      queueMicrotask(() => child.emit("spawn"));
+      return child;
+    },
+    probeEngramHealth: async () => {
+      probes += 1;
+      return probes >= 2 ? "ready" : "indeterminate";
+    },
+  });
+
+  await spawnAndWaitForEngram();
+
+  assert.equal(child.unrefCalls, 1, "a ready child is released from the event loop");
+  const probesAtReadiness = probes;
+  await delay(60);
+  assert.equal(probes, probesAtReadiness, "readiness stops the health poll");
+});
+
+test("a child that errors before readiness is unref'd and stops health polling", async () => {
+  const child = createFakeChild();
+  let probes = 0;
+  const spawnAndWaitForEngram = buildSpawnAndWaitForEngramForTest({
+    spawn: () => {
+      queueMicrotask(() => child.emit("spawn"));
+      return child;
+    },
+    probeEngramHealth: async () => {
+      probes += 1;
+      return "indeterminate";
+    },
+  });
+
+  const pending = spawnAndWaitForEngram();
+  await delay(20);
+  child.emit("error", new Error("spawn ENOENT"));
+
+  await assert.rejects(pending, /failed before readiness/);
+  assert.equal(child.unrefCalls, 1, "the error path releases the child");
+  const probesAtRejection = probes;
+  await delay(60);
+  assert.equal(probes, probesAtRejection, "the error path cancels the health poll");
+});
+
+test("a child that exits before readiness is unref'd and stops health polling", async () => {
+  const child = createFakeChild();
+  let probes = 0;
+  const spawnAndWaitForEngram = buildSpawnAndWaitForEngramForTest({
+    spawn: () => {
+      queueMicrotask(() => child.emit("spawn"));
+      return child;
+    },
+    probeEngramHealth: async () => {
+      probes += 1;
+      return "indeterminate";
+    },
+  });
+
+  const pending = spawnAndWaitForEngram();
+  await delay(20);
+  child.emit("exit", 1, null);
+
+  await assert.rejects(pending, /exited before readiness \(code 1/);
+  assert.equal(child.unrefCalls, 1, "the exit path releases the child");
+  const probesAtRejection = probes;
+  await delay(60);
+  assert.equal(probes, probesAtRejection, "the exit path cancels the health poll");
+});
+
+test("a startup timeout unrefs the child and stops health polling", async () => {
+  const child = createFakeChild();
+  let probes = 0;
+  const spawnAndWaitForEngram = buildSpawnAndWaitForEngramForTest({
+    spawn: () => {
+      queueMicrotask(() => child.emit("spawn"));
+      return child;
+    },
+    probeEngramHealth: async () => {
+      probes += 1;
+      return "indeterminate";
+    },
+    timeoutMs: 60,
+    pollMs: 5,
+  });
+
+  await assert.rejects(spawnAndWaitForEngram(), /did not become ready before startup timeout/);
+  assert.equal(child.unrefCalls, 1, "the timeout path releases the child");
+  const probesAtTimeout = probes;
+  await delay(60);
+  assert.equal(probes, probesAtTimeout, "the timeout path cancels the health poll");
+});
+
+test("a child that cannot be spawned rejects without leaving a health poll running", async () => {
+  let probes = 0;
+  const spawnAndWaitForEngram = buildSpawnAndWaitForEngramForTest({
+    spawn: () => {
+      throw new Error("EACCES");
+    },
+    probeEngramHealth: async () => {
+      probes += 1;
+      return "indeterminate";
+    },
+  });
+
+  await assert.rejects(spawnAndWaitForEngram(), /EACCES/);
+  await delay(60);
+  assert.equal(probes, 0, "a child that never spawned never starts a health poll");
+});
+
+test("aborting the readiness wait cancels the health poll immediately", async () => {
+  let probes = 0;
+  const waitForEngramReadiness = buildWaitForEngramReadinessForTest({
+    probeEngramHealth: async () => {
+      probes += 1;
+      return "indeterminate";
+    },
+    timeoutMs: 5000,
+    pollMs: 5,
+  });
+
+  const controller = new AbortController();
+  const pending = waitForEngramReadiness(controller.signal);
+  await delay(20);
+  controller.abort();
+
+  await assert.rejects(pending, /cancelled/);
+  const probesAtAbort = probes;
+  await delay(60);
+  assert.equal(probes, probesAtAbort, "an aborted readiness wait issues no further probes");
 });
 
 test("native tool fetches retry transient HTTP startup failures", async () => {
