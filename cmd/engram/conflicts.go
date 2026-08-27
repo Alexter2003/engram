@@ -547,6 +547,10 @@ func cmdConflictsDeferred(cfg store.Config) {
 		fmt.Printf("Deferred Row\n")
 		fmt.Printf("  sync_id:          %s\n", row.SyncID)
 		fmt.Printf("  entity:           %s\n", row.Entity)
+		// A quarantined row is keyed on the discarded mutation's own material, so
+		// its key does not name the mutation. Print what the mutation carried.
+		fmt.Printf("  entity_key:       %s\n", row.EntityKey)
+		fmt.Printf("  op:               %s\n", row.Op)
 		fmt.Printf("  apply_status:     %s\n", row.ApplyStatus)
 		fmt.Printf("  retry_count:      %d\n", row.RetryCount)
 		fmt.Printf("  payload_valid:    %v\n", row.PayloadValid)
@@ -582,6 +586,7 @@ func cmdConflictsDeferred(cfg store.Config) {
 	fmt.Println()
 	for _, row := range rows {
 		fmt.Printf("  sync_id:      %s\n", row.SyncID)
+		fmt.Printf("  entity_key:   %s\n", row.EntityKey)
 		fmt.Printf("  apply_status: %s\n", row.ApplyStatus)
 		fmt.Printf("  retry_count:  %d\n", row.RetryCount)
 		fmt.Printf("  first_seen_at: %s\n", row.FirstSeenAt)

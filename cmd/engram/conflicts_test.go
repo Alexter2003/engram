@@ -347,6 +347,42 @@ func TestCmdConflictsDeferred_InspectHappyPath(t *testing.T) {
 	}
 }
 
+// TestCmdConflictsDeferred_InspectShowsMutationIdentity verifies that a row keyed
+// on the discarded mutation's own material still names the mutation it holds:
+// the derived key is opaque, so the audit surface must print the entity_key and
+// op the mutation carried.
+func TestCmdConflictsDeferred_InspectShowsMutationIdentity(t *testing.T) {
+	cfg := testConfig(t)
+
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	s.Close()
+
+	db := openTestDB(t, cfg)
+	const derivedKey = "relation-dead-0123456789abcdef"
+	if _, err := db.Exec(`
+		INSERT INTO sync_apply_deferred
+			(sync_id, entity, payload, entity_key, op, retry_count, apply_status, first_seen_at)
+		VALUES (?, 'relation', ?, 'rel-carried-key', 'upsert', 0, 'dead', datetime('now'))
+	`, derivedKey, `{"sync_id":"rel-carried-key","source_id":"x","target_id":"y"}`); err != nil {
+		t.Fatalf("seed derived-key row: %v", err)
+	}
+
+	withArgs(t, "engram", "conflicts", "deferred", "--inspect", derivedKey)
+	stdout, stderr := captureOutput(t, func() { cmdConflicts(cfg) })
+	if stderr != "" {
+		t.Fatalf("unexpected stderr: %q", stderr)
+	}
+	if !strings.Contains(stdout, "rel-carried-key") {
+		t.Errorf("expected the mutation entity_key in output; got: %q", stdout)
+	}
+	if !strings.Contains(stdout, "op:") {
+		t.Errorf("expected the mutation op in output; got: %q", stdout)
+	}
+}
+
 // TestCmdConflictsShow_NotFound verifies `engram conflicts show <id>` with a
 // non-existent relation_id prints not-found and exits non-zero.
 func TestCmdConflictsShow_NotFound(t *testing.T) {
