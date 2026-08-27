@@ -65,3 +65,25 @@ func TestHandleSaveForwardsBM25MaxRank(t *testing.T) {
 		}
 	}
 }
+
+func TestHandleSaveRejectsInvalidCandidateRankingBeforeCreatingObservation(t *testing.T) {
+	s := newMCPTestStore(t)
+	h := handleSave(s, MCPConfig{BM25MaxRank: ptrBM25(math.Inf(1)), DefaultProject: "test"}, NewSessionActivity(10*time.Minute))
+
+	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"title": "must not save", "content": "invalid ranking configuration",
+	}}})
+	if err != nil {
+		t.Fatalf("handleSave: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("expected tool error, got %q", callResultText(t, res))
+	}
+	count, err := s.CountObservationsForProject("test")
+	if err != nil {
+		t.Fatalf("count observations: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("invalid ranking created %d observations, want 0", count)
+	}
+}

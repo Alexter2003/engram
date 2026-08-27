@@ -2,6 +2,8 @@ package store
 
 import (
 	"fmt"
+	"math"
+	"strings"
 	"testing"
 	"time"
 )
@@ -92,6 +94,39 @@ func TestFindCandidates_BM25MaxRankAndDeprecatedFloor(t *testing.T) {
 		t.Fatal("expected conflicting max rank and deprecated floor to be rejected")
 	}
 }
+
+func TestCandidateRankQueryUsesInclusiveMaxRank(t *testing.T) {
+	maxRank := -1.25
+	query, threshold, err := candidateRankQuery(CandidateOptions{BM25MaxRank: &maxRank})
+	if err != nil {
+		t.Fatalf("candidateRankQuery: %v", err)
+	}
+	if threshold != maxRank || !strings.Contains(query, "fts.rank <= ?") {
+		t.Fatalf("max rank query must retain ranks equal to %v: threshold=%v query=%q", maxRank, threshold, query)
+	}
+}
+
+func TestCandidateRankQueryRejectsNonFiniteRanking(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		opts CandidateOptions
+	}{
+		{name: "max rank NaN", opts: CandidateOptions{BM25MaxRank: ptrRank(math.NaN())}},
+		{name: "max rank positive infinity", opts: CandidateOptions{BM25MaxRank: ptrRank(math.Inf(1))}},
+		{name: "max rank negative infinity", opts: CandidateOptions{BM25MaxRank: ptrRank(math.Inf(-1))}},
+		{name: "floor NaN", opts: CandidateOptions{BM25Floor: ptrRank(math.NaN())}},
+		{name: "floor positive infinity", opts: CandidateOptions{BM25Floor: ptrRank(math.Inf(1))}},
+		{name: "floor negative infinity", opts: CandidateOptions{BM25Floor: ptrRank(math.Inf(-1))}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, _, err := candidateRankQuery(tt.opts); err == nil {
+				t.Fatal("expected non-finite ranking configuration to be rejected")
+			}
+		})
+	}
+}
+
+func ptrRank(value float64) *float64 { return &value }
 
 func TestFindCandidates_FiltersAndSkipInsertWithMaxRank(t *testing.T) {
 	s := setupRelationsStore(t)

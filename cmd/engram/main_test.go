@@ -113,6 +113,20 @@ func captureOutput(t *testing.T, fn func()) (stdout string, stderr string) {
 	return string(out.bytes), string(errOut.bytes)
 }
 
+func TestCaptureOutputDrainsLargeStdoutAndStderrConcurrently(t *testing.T) {
+	stdout := strings.Repeat("stdout ", 12*1024)
+	stderr := strings.Repeat("stderr ", 12*1024)
+
+	gotStdout, gotStderr := captureOutput(t, func() {
+		_, _ = fmt.Fprint(os.Stdout, stdout)
+		_, _ = fmt.Fprint(os.Stderr, stderr)
+	})
+
+	if gotStdout != stdout || gotStderr != stderr {
+		t.Fatalf("captureOutput() = (%d stdout bytes, %d stderr bytes), want exact output", len(gotStdout), len(gotStderr))
+	}
+}
+
 func mustSeedObservation(t *testing.T, cfg store.Config, sessionID, project, typ, title, content, scope string) int64 {
 	t.Helper()
 
