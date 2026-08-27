@@ -16,6 +16,7 @@ import (
 
 	"github.com/Gentleman-Programming/engram/internal/mcp"
 	"github.com/Gentleman-Programming/engram/internal/obsidian"
+	"github.com/Gentleman-Programming/engram/internal/project"
 	"github.com/Gentleman-Programming/engram/internal/setup"
 	"github.com/Gentleman-Programming/engram/internal/store"
 	engramsync "github.com/Gentleman-Programming/engram/internal/sync"
@@ -533,6 +534,164 @@ func TestCmdSaveAndSearch(t *testing.T) {
 	}
 }
 
+func TestCmdSaveResolvesConfiguredProjectWithoutFlag(t *testing.T) {
+	stubExitWithPanic(t)
+	cfg := testConfig(t)
+	cwd := t.TempDir()
+	configDir := filepath.Join(cwd, ".engram")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatalf("create project config directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(`{"project_name":"Configured-Project"}`), 0644); err != nil {
+		t.Fatalf("write project config: %v", err)
+	}
+	withCwd(t, cwd)
+	withArgs(t, "engram", "save", "resolved-title", "resolved-content")
+
+	stdout, stderr := captureOutput(t, func() { cmdSave(cfg) })
+	if stderr != "" || !strings.Contains(stdout, "Memory saved:") {
+		t.Fatalf("cmdSave output = stdout %q stderr %q", stdout, stderr)
+	}
+
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+	session, err := s.GetSession("manual-save-configured-project")
+	if err != nil || session.Project != "configured-project" {
+		t.Fatalf("resolved session = %#v, err=%v", session, err)
+	}
+	observations, err := s.RecentObservations("configured-project", "project", 10)
+	if err != nil || len(observations) != 1 || observations[0].Title != "resolved-title" {
+		t.Fatalf("resolved observations = %#v, err=%v", observations, err)
+	}
+	var mutations int
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE project = ?`, "configured-project").Scan(&mutations); err != nil || mutations != 2 {
+		t.Fatalf("resolved journal mutations = %d, err=%v, want 2", mutations, err)
+	}
+}
+
+// assertCmdSaveOwnedBy runs cmdSave and asserts the manual session and its
+// observation landed under the expected project.
+func assertCmdSaveOwnedBy(t *testing.T, cfg store.Config, rawProject, wantProject string) {
+	t.Helper()
+	stdout, stderr := captureOutput(t, func() { cmdSave(cfg) })
+	wantWarning := fmt.Sprintf("Project name normalized: %q → %q", rawProject, wantProject)
+	if !strings.Contains(stdout, "Memory saved:") || !strings.Contains(stderr, wantWarning) {
+		t.Fatalf("cmdSave output = stdout %q stderr %q, want %q", stdout, stderr, wantWarning)
+	}
+
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+	session, err := s.GetSession("manual-save-" + wantProject)
+	if err != nil || session.Project != wantProject {
+		t.Fatalf("resolved session = %#v, err=%v, want project %q", session, err, wantProject)
+	}
+	observations, err := s.RecentObservations(wantProject, "project", 10)
+	if err != nil || len(observations) != 1 || observations[0].Title != "resolved-title" {
+		t.Fatalf("resolved observations = %#v, err=%v", observations, err)
+	}
+}
+
+// seedDetectedProjectCWD points the working directory at a project whose
+// .engram/config.json names a project other than any process-level override.
+func seedDetectedProjectCWD(t *testing.T) {
+	t.Helper()
+	cwd := t.TempDir()
+	configDir := filepath.Join(cwd, ".engram")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatalf("create project config directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(`{"project_name":"Configured-Project"}`), 0644); err != nil {
+		t.Fatalf("write project config: %v", err)
+	}
+	withCwd(t, cwd)
+}
+
+func TestCmdSaveHonorsEngramProjectEnvironmentOverride(t *testing.T) {
+	stubExitWithPanic(t)
+	cfg := testConfig(t)
+	seedDetectedProjectCWD(t)
+	t.Setenv("ENGRAM_PROJECT", "Env-Project")
+	withArgs(t, "engram", "save", "resolved-title", "resolved-content")
+
+	assertCmdSaveOwnedBy(t, cfg, "Env-Project", "env-project")
+}
+
+func TestCmdSaveExplicitProjectFlagBeatsEnvironmentOverride(t *testing.T) {
+	stubExitWithPanic(t)
+	cfg := testConfig(t)
+	seedDetectedProjectCWD(t)
+	t.Setenv("ENGRAM_PROJECT", "Env-Project")
+	withArgs(t, "engram", "save", "resolved-title", "resolved-content", "--project", "Flag-Project")
+
+	assertCmdSaveOwnedBy(t, cfg, "Flag-Project", "flag-project")
+}
+
+func TestCmdSaveUsesDetectionSeamAndPrintsNormalizationWarning(t *testing.T) {
+	stubExitWithPanic(t)
+	cfg := testConfig(t)
+	cwd := t.TempDir()
+	withCwd(t, cwd)
+	withArgs(t, "engram", "save", "resolved-title", "resolved-content")
+
+	originalDetectProjectFull := detectProjectFull
+	detectProjectFull = func(gotCWD string) project.DetectionResult {
+		if gotCWD != cwd {
+			t.Fatalf("detection cwd = %q, want %q", gotCWD, cwd)
+		}
+		return project.DetectionResult{Project: " Configured--Project "}
+	}
+	t.Cleanup(func() { detectProjectFull = originalDetectProjectFull })
+
+	stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdSave(cfg) })
+	if recovered != nil || !strings.Contains(stdout, "Memory saved:") {
+		t.Fatalf("cmdSave result = stdout %q stderr %q panic %v", stdout, stderr, recovered)
+	}
+	if !strings.Contains(stderr, `Project name normalized: " Configured--Project " → "configured-project"`) {
+		t.Fatalf("normalization warning = %q", stderr)
+	}
+
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+	if _, err := s.GetSession("manual-save-configured-project"); err != nil {
+		t.Fatalf("normalized manual session: %v", err)
+	}
+}
+
+func TestCmdSaveRejectsUnresolvableProjectBeforeOpeningStore(t *testing.T) {
+	stubExitWithPanic(t)
+	cfg := testConfig(t)
+	cwd := t.TempDir()
+	configDir := filepath.Join(cwd, ".engram")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatalf("create project config directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(`{"project_name":""}`), 0644); err != nil {
+		t.Fatalf("write invalid project config: %v", err)
+	}
+	withCwd(t, cwd)
+	withArgs(t, "engram", "save", "rejected-title", "rejected-content")
+
+	_, stderr, recovered := captureOutputAndRecover(t, func() { cmdSave(cfg) })
+	if _, ok := recovered.(exitCode); !ok {
+		t.Fatalf("expected fatal exit, got %v", recovered)
+	}
+	if !strings.Contains(stderr, "cannot save without an unambiguous project identity") {
+		t.Fatalf("unexpected rejection: %q", stderr)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.DataDir, "engram.db")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unresolvable project opened store or left state: %v", err)
+	}
+}
+
 func TestCmdTimeline(t *testing.T) {
 	cfg := testConfig(t)
 	mustSeedObservation(t, cfg, "s-1", "proj", "note", "first", "first content", "project")
@@ -925,6 +1084,106 @@ func TestCmdProjectsRoutesSubcommands(t *testing.T) {
 	withArgs(t, "engram", "projects")
 	stdout2, _ := captureOutput(t, func() { cmdProjects(cfg) })
 	_ = stdout2 // just checking it doesn't crash
+}
+
+// seedLegacyNullableSession builds the shape an upgraded database has: a
+// sessions table whose project column is still nullable, carrying rows that
+// identify no project.
+func seedLegacyNullableSession(t *testing.T, cfg store.Config, sessionID string) {
+	t.Helper()
+	raw, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec(`CREATE TABLE sessions (
+		id TEXT PRIMARY KEY,
+		project TEXT,
+		directory TEXT NOT NULL,
+		started_at TEXT NOT NULL DEFAULT (datetime('now')),
+		ended_at TEXT,
+		summary TEXT
+	)`); err != nil {
+		t.Fatalf("create legacy sessions: %v", err)
+	}
+	if _, err := raw.Exec(`INSERT INTO sessions (id, project, directory) VALUES (?, NULL, ?)`, sessionID, "/tmp"); err != nil {
+		t.Fatalf("seed legacy session: %v", err)
+	}
+}
+
+// The repair for an unowned session must be reachable in a zero-config install,
+// where ENGRAM_HTTP_TOKEN is unset and the HTTP rescue endpoint answers 503.
+// This CLI path talks to the store directly and never needs server auth.
+func TestCmdProjectsRescueOwnershipWorksWithoutServerToken(t *testing.T) {
+	cfg := testConfig(t)
+	seedLegacyNullableSession(t, cfg, "legacy-session")
+	t.Setenv("ENGRAM_HTTP_TOKEN", "")
+
+	withArgs(t, "engram", "projects", "rescue-ownership", "--project", "target", "--session", "legacy-session")
+	stdout, stderr := captureOutput(t, func() { cmdProjects(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	if !strings.Contains(stdout, "target") {
+		t.Fatalf("expected the target project in output, got: %q", stdout)
+	}
+
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+	sess, err := s.GetSession("legacy-session")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if sess.Project != "target" {
+		t.Fatalf("session project = %q, want target", sess.Project)
+	}
+}
+
+// A partial rescue must say exactly what it left behind, not just a counter.
+func TestCmdProjectsRescueOwnershipReportsWhatWasLeftBehind(t *testing.T) {
+	cfg := testConfig(t)
+	seedLegacyNullableSession(t, cfg, "legacy-session")
+
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if _, err := s.DB().Exec(
+		`INSERT INTO observations (sync_id, session_id, type, title, content, project, scope) VALUES ('obs-foreign', 'legacy-session', 'note', 'foreign', 'content', 'other', 'project')`,
+	); err != nil {
+		t.Fatalf("seed foreign-owned observation: %v", err)
+	}
+	s.Close()
+
+	withArgs(t, "engram", "projects", "rescue-ownership", "--project", "target", "--session", "legacy-session")
+	stdout, _ := captureOutput(t, func() { cmdProjects(cfg) })
+	if !strings.Contains(stdout, "left behind") {
+		t.Fatalf("expected the partial outcome to be named, got: %q", stdout)
+	}
+	if !strings.Contains(stdout, "legacy-session") {
+		t.Fatalf("expected the blocked session to be listed, got: %q", stdout)
+	}
+}
+
+func TestCmdProjectsRescueOwnershipRequiresScope(t *testing.T) {
+	cfg := testConfig(t)
+
+	exited := false
+	oldExit := exitFunc
+	exitFunc = func(code int) { exited = true }
+	t.Cleanup(func() { exitFunc = oldExit })
+
+	withArgs(t, "engram", "projects", "rescue-ownership", "--project", "target")
+	_, stderr := captureOutput(t, func() { cmdProjects(cfg) })
+	if !strings.Contains(stderr, "usage:") {
+		t.Fatalf("expected usage on missing scope, got: %q", stderr)
+	}
+	if !exited {
+		t.Fatal("expected a non-zero exit when no records are selected")
+	}
 }
 
 func TestCmdProjectsConsolidateNoSimilar(t *testing.T) {

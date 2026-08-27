@@ -162,8 +162,8 @@ func seedRelationWithSessionInheritedProject(t *testing.T, s *store.Store, proje
 	if err != nil {
 		t.Fatalf("get inherited target observation: %v", err)
 	}
-	if source.Project != nil || target.Project != nil {
-		t.Fatalf("expected observations to inherit project from session, got source=%v target=%v", source.Project, target.Project)
+	if source.Project == nil || *source.Project != project || target.Project == nil || *target.Project != project {
+		t.Fatalf("expected observations to inherit project %q from session, got source=%v target=%v", project, source.Project, target.Project)
 	}
 	if _, err := s.SaveRelation(store.SaveRelationParams{SyncID: relationID, SourceID: source.SyncID, TargetID: target.SyncID}); err != nil {
 		t.Fatalf("save inherited relation: %v", err)
