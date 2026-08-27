@@ -1022,7 +1022,7 @@ func TestCmdProjectsConsolidateSingleProject(t *testing.T) {
 	if stderr != "" {
 		t.Fatalf("expected no stderr, got: %q", stderr)
 	}
-	if !strings.Contains(stdout, "Merged into") {
+	if !strings.Contains(stdout, `Merged 1 project(s) into "engram"`) {
 		t.Fatalf("expected merge result, got: %q", stdout)
 	}
 
@@ -1059,6 +1059,146 @@ func TestCmdProjectsConsolidateAllDryRun(t *testing.T) {
 	}
 	if !strings.Contains(stdout, `Would merge into "engram"`) {
 		t.Fatalf("expected normalized canonical in dry-run output, got: %q", stdout)
+	}
+}
+
+func TestCmdProjectsPrunePathsOnlyDryRun(t *testing.T) {
+	cfg := testConfig(t)
+	pathProject := `c:\workspace\orphan`
+	mustSeedSession(t, cfg, "s-path", pathProject)
+	mustSeedSession(t, cfg, "s-ordinary", "ordinary-empty")
+	mustSeedObservation(t, cfg, "s-active", "active-project", "note", "active", "content", "project")
+
+	withArgs(t, "engram", "projects", "prune", "--paths-only", "--dry-run")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsPrune(cfg) })
+	if stderr != "" {
+		t.Fatalf("stderr = %q", stderr)
+	}
+	if !strings.Contains(stdout, pathProject) || strings.Contains(stdout, "ordinary-empty") || strings.Contains(stdout, "active-project") {
+		t.Fatalf("paths-only candidates = %q", stdout)
+	}
+
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	defer s.Close()
+	stats, err := s.ListProjectsWithStats()
+	if err != nil {
+		t.Fatalf("ListProjectsWithStats: %v", err)
+	}
+	if len(stats) != 3 {
+		t.Fatalf("dry-run mutated projects: %+v", stats)
+	}
+}
+
+func TestCmdProjectsPrunePathsOnly(t *testing.T) {
+	cfg := testConfig(t)
+	forwardSlashProject := "/tmp/orphan"
+	backslashProject := `c:\workspace\orphan`
+	mustSeedPrompt(t, cfg, "s-forward-slash", forwardSlashProject)
+	mustSeedPrompt(t, cfg, "s-backslash", backslashProject)
+	mustSeedSession(t, cfg, "s-ordinary", "ordinary-empty")
+	mustSeedObservation(t, cfg, "s-active", "active-project", "note", "active", "content", "project")
+
+	oldScan := scanInputLine
+	scanInputLine = func(a ...any) (int, error) {
+		*a[0].(*string) = "all"
+		return 1, nil
+	}
+	t.Cleanup(func() { scanInputLine = oldScan })
+
+	withArgs(t, "engram", "projects", "prune", "--paths-only")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsPrune(cfg) })
+	if stderr != "" {
+		t.Fatalf("stderr = %q", stderr)
+	}
+	for _, project := range []string{forwardSlashProject, backslashProject} {
+		if !strings.Contains(stdout, project) {
+			t.Fatalf("paths-only output missing %q: %q", project, stdout)
+		}
+	}
+	if strings.Contains(stdout, "ordinary-empty") || strings.Contains(stdout, "active-project") {
+		t.Fatalf("paths-only output included a retained project: %q", stdout)
+	}
+	if !strings.Contains(stdout, "Pruned 2 project(s): 2 sessions, 2 prompts removed.") {
+		t.Fatalf("prune result = %q", stdout)
+	}
+
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	defer s.Close()
+	for _, sessionID := range []string{"s-forward-slash", "s-backslash"} {
+		if _, err := s.GetSession(sessionID); err == nil {
+			t.Fatalf("pruned session %q still exists", sessionID)
+		}
+	}
+	stats, err := s.ListProjectsWithStats()
+	if err != nil {
+		t.Fatalf("ListProjectsWithStats: %v", err)
+	}
+	remaining := make(map[string]store.ProjectStats, len(stats))
+	for _, ps := range stats {
+		remaining[ps.Name] = ps
+	}
+	if _, ok := remaining[forwardSlashProject]; ok {
+		t.Fatalf("pruned project %q still has data: %+v", forwardSlashProject, remaining[forwardSlashProject])
+	}
+	if _, ok := remaining[backslashProject]; ok {
+		t.Fatalf("pruned project %q still has data: %+v", backslashProject, remaining[backslashProject])
+	}
+	if ordinary, ok := remaining["ordinary-empty"]; !ok || ordinary.SessionCount != 1 {
+		t.Fatalf("ordinary empty project = %+v, want one retained session", ordinary)
+	}
+	if active, ok := remaining["active-project"]; !ok || active.ObservationCount != 1 || active.SessionCount != 1 {
+		t.Fatalf("active project = %+v, want one retained observation and session", active)
+	}
+}
+
+func TestCmdProjectsPruneWithoutPathsOnlyKeepsOrdinaryBehavior(t *testing.T) {
+	cfg := testConfig(t)
+	mustSeedSession(t, cfg, "s-path", `c:\workspace\orphan`)
+	mustSeedSession(t, cfg, "s-ordinary", "ordinary-empty")
+
+	withArgs(t, "engram", "projects", "prune", "--dry-run")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsPrune(cfg) })
+	if stderr != "" {
+		t.Fatalf("stderr = %q", stderr)
+	}
+	if !strings.Contains(stdout, `c:\workspace\orphan`) || !strings.Contains(stdout, "ordinary-empty") {
+		t.Fatalf("ordinary prune candidates = %q", stdout)
+	}
+}
+
+func TestCmdProjectsPruneReportsOnlySuccessfulProjects(t *testing.T) {
+	cfg := testConfig(t)
+	mustSeedSession(t, cfg, "s-success", "success-empty")
+	mustSeedSession(t, cfg, "s-failure", "failure-empty")
+
+	oldPrune := storePruneProject
+	storePruneProject = func(s *store.Store, project string) (*store.PruneResult, error) {
+		if project == "failure-empty" {
+			return nil, errors.New("forced failure")
+		}
+		return oldPrune(s, project)
+	}
+	t.Cleanup(func() { storePruneProject = oldPrune })
+	oldScan := scanInputLine
+	scanInputLine = func(a ...any) (int, error) {
+		*a[0].(*string) = "all"
+		return 1, nil
+	}
+	t.Cleanup(func() { scanInputLine = oldScan })
+
+	withArgs(t, "engram", "projects", "prune")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsPrune(cfg) })
+	if !strings.Contains(stderr, `Error pruning "failure-empty": forced failure`) {
+		t.Fatalf("stderr = %q", stderr)
+	}
+	if !strings.Contains(stdout, "Pruned 1 project(s): 1 sessions, 0 prompts removed.") {
+		t.Fatalf("stdout = %q", stdout)
 	}
 }
 
@@ -1145,6 +1285,279 @@ func TestGroupSimilarProjectsUsesNormalizationEquivalenceAndNormalizedCanonical(
 	}
 	if groups[0].Canonical != "engram" {
 		t.Fatalf("canonical = %q, want normalized group key %q", groups[0].Canonical, "engram")
+	}
+}
+
+// projectRecordCounts reports how many observations, sessions and prompts are
+// stored under an exact project spelling, so tests can compare the counts the
+// CLI printed against the records that actually moved.
+func projectRecordCounts(t *testing.T, cfg store.Config, project string) (observations, sessions, prompts int) {
+	t.Helper()
+
+	db, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer db.Close()
+
+	queries := []struct {
+		query string
+		dest  *int
+	}{
+		{`SELECT COUNT(*) FROM observations WHERE project = ? AND deleted_at IS NULL`, &observations},
+		{`SELECT COUNT(*) FROM sessions WHERE project = ?`, &sessions},
+		{`SELECT COUNT(*) FROM user_prompts WHERE project = ?`, &prompts},
+	}
+	for _, q := range queries {
+		if err := db.QueryRow(q.query, project).Scan(q.dest); err != nil {
+			t.Fatalf("count %q rows: %v", project, err)
+		}
+	}
+	return observations, sessions, prompts
+}
+
+func TestCmdProjectsConsolidateCaseOnlyVariantReportsMovedRecords(t *testing.T) {
+	cfg := testConfig(t)
+
+	// A case-only legacy spelling must actually move its records, and the
+	// printed counts must match what moved.
+	mustSeedObservation(t, cfg, "s-eng", "engram", "note", "eng note", "content", "project")
+	mustSeedObservation(t, cfg, "s-legacy", "legacy-source", "note", "legacy note", "content", "project")
+	mustSeedPrompt(t, cfg, "s-legacy", "legacy-source")
+	rewriteLegacyProjectName(t, cfg, "legacy-source", "ENGRAM")
+
+	old := detectProject
+	detectProject = func(string) string { return "engram" }
+	t.Cleanup(func() { detectProject = old })
+
+	oldScan := scanInputLine
+	t.Cleanup(func() { scanInputLine = oldScan })
+	scanInputLine = func(a ...any) (int, error) {
+		if ptr, ok := a[0].(*string); ok {
+			*ptr = "all"
+		}
+		return 1, nil
+	}
+
+	withArgs(t, "engram", "projects", "consolidate")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+
+	for _, want := range []string{
+		`Done! Merged 1 project(s) into "engram"`,
+		"Observations: 1",
+		"Sessions:     1",
+		"Prompts:      1",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("expected %q in merge report, got: %q", want, stdout)
+		}
+	}
+
+	// The reported counts must match the records that actually moved.
+	if obs, sessions, prompts := projectRecordCounts(t, cfg, "ENGRAM"); obs+sessions+prompts != 0 {
+		t.Fatalf("legacy spelling still holds records: obs=%d sessions=%d prompts=%d", obs, sessions, prompts)
+	}
+	obs, sessions, prompts := projectRecordCounts(t, cfg, "engram")
+	if obs != 2 || sessions != 2 || prompts != 1 {
+		t.Fatalf("canonical records = obs:%d sessions:%d prompts:%d, want 2/2/1", obs, sessions, prompts)
+	}
+}
+
+func TestCmdProjectsConsolidateReportsNothingMergedWhenNoRecordsMove(t *testing.T) {
+	cfg := testConfig(t)
+
+	// " engram " normalizes to the canonical name, so it is offered as a
+	// candidate, but the store fail-closes on it because its trimmed spelling
+	// is the canonical name itself. The CLI must not announce completion.
+	mustSeedObservation(t, cfg, "s-legacy", "legacy-source", "note", "legacy note", "content", "project")
+	rewriteLegacyProjectName(t, cfg, "legacy-source", " engram ")
+
+	old := detectProject
+	detectProject = func(string) string { return "engram" }
+	t.Cleanup(func() { detectProject = old })
+
+	oldScan := scanInputLine
+	t.Cleanup(func() { scanInputLine = oldScan })
+	scanInputLine = func(a ...any) (int, error) {
+		if ptr, ok := a[0].(*string); ok {
+			*ptr = "all"
+		}
+		return 1, nil
+	}
+
+	withArgs(t, "engram", "projects", "consolidate")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	if strings.Contains(stdout, "Done!") {
+		t.Fatalf("completion reported without moving records: %q", stdout)
+	}
+	if !strings.Contains(stdout, "Nothing merged") {
+		t.Fatalf("expected an honest no-op report, got: %q", stdout)
+	}
+
+	// The records must still be reachable under their original spelling.
+	if obs, sessions, _ := projectRecordCounts(t, cfg, " engram "); obs != 1 || sessions != 1 {
+		t.Fatalf("legacy records lost: obs=%d sessions=%d", obs, sessions)
+	}
+}
+
+func TestCmdProjectsConsolidateAllCaseOnlyVariantReportsMovedRecords(t *testing.T) {
+	cfg := testConfig(t)
+
+	mustSeedObservation(t, cfg, "s-eng", "engram", "note", "eng note", "content", "project")
+	mustSeedObservation(t, cfg, "s-legacy", "legacy-source", "note", "legacy note", "content", "project")
+	mustSeedPrompt(t, cfg, "s-legacy", "legacy-source")
+	rewriteLegacyProjectName(t, cfg, "legacy-source", "ENGRAM")
+
+	oldScan := scanInputLine
+	t.Cleanup(func() { scanInputLine = oldScan })
+	scanInputLine = func(a ...any) (int, error) {
+		if ptr, ok := a[0].(*string); ok {
+			*ptr = "all"
+		}
+		return 1, nil
+	}
+
+	withArgs(t, "engram", "projects", "consolidate", "--all")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	if !strings.Contains(stdout, "Merged: 1 obs, 1 sessions, 1 prompts") {
+		t.Fatalf("expected counts matching the moved records, got: %q", stdout)
+	}
+	if obs, sessions, prompts := projectRecordCounts(t, cfg, "ENGRAM"); obs+sessions+prompts != 0 {
+		t.Fatalf("legacy spelling still holds records: obs=%d sessions=%d prompts=%d", obs, sessions, prompts)
+	}
+	obs, sessions, prompts := projectRecordCounts(t, cfg, "engram")
+	if obs != 2 || sessions != 2 || prompts != 1 {
+		t.Fatalf("canonical records = obs:%d sessions:%d prompts:%d, want 2/2/1", obs, sessions, prompts)
+	}
+}
+
+func TestCmdProjectsConsolidateAllReportsNothingMergedWhenNoRecordsMove(t *testing.T) {
+	cfg := testConfig(t)
+
+	mustSeedObservation(t, cfg, "s-eng", "engram", "note", "eng note", "content", "project")
+	mustSeedObservation(t, cfg, "s-legacy", "legacy-source", "note", "legacy note", "content", "project")
+	rewriteLegacyProjectName(t, cfg, "legacy-source", " engram ")
+
+	oldScan := scanInputLine
+	t.Cleanup(func() { scanInputLine = oldScan })
+	scanInputLine = func(a ...any) (int, error) {
+		if ptr, ok := a[0].(*string); ok {
+			*ptr = "all"
+		}
+		return 1, nil
+	}
+
+	withArgs(t, "engram", "projects", "consolidate", "--all")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	if strings.Contains(stdout, "Merged:") {
+		t.Fatalf("merge reported without moving records: %q", stdout)
+	}
+	if !strings.Contains(stdout, "Nothing merged") {
+		t.Fatalf("expected an honest no-op report, got: %q", stdout)
+	}
+	if obs, sessions, _ := projectRecordCounts(t, cfg, " engram "); obs != 1 || sessions != 1 {
+		t.Fatalf("legacy records lost: obs=%d sessions=%d", obs, sessions)
+	}
+}
+
+func TestCmdProjectsConsolidateAllNamesSourcesTheStoreLeftUntouched(t *testing.T) {
+	cfg := testConfig(t)
+
+	// "ENGRAM" moves; " engram " is fail-closed by the store because its
+	// trimmed spelling is the canonical name. A partial merge must say so.
+	mustSeedObservation(t, cfg, "s-eng", "engram", "note", "eng note", "content", "project")
+	mustSeedObservation(t, cfg, "s-upper", "upper-source", "note", "upper note", "content", "project")
+	mustSeedObservation(t, cfg, "s-padded", "padded-source", "note", "padded note", "content", "project")
+	rewriteLegacyProjectName(t, cfg, "upper-source", "ENGRAM")
+	rewriteLegacyProjectName(t, cfg, "padded-source", " engram ")
+
+	oldScan := scanInputLine
+	t.Cleanup(func() { scanInputLine = oldScan })
+	scanInputLine = func(a ...any) (int, error) {
+		if ptr, ok := a[0].(*string); ok {
+			*ptr = "all"
+		}
+		return 1, nil
+	}
+
+	withArgs(t, "engram", "projects", "consolidate", "--all")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	if !strings.Contains(stdout, "Merged: 1 obs, 1 sessions, 0 prompts") {
+		t.Fatalf("expected counts for the single moved source, got: %q", stdout)
+	}
+	if !strings.Contains(stdout, "Not merged (no records moved):  engram ") {
+		t.Fatalf("expected the untouched source to be named, got: %q", stdout)
+	}
+	if obs, sessions, _ := projectRecordCounts(t, cfg, " engram "); obs != 1 || sessions != 1 {
+		t.Fatalf("untouched source lost records: obs=%d sessions=%d", obs, sessions)
+	}
+}
+
+func TestCmdProjectsConsolidateLeavesFuzzyMatchesUnmerged(t *testing.T) {
+	// Substring and Levenshtein neighbours are not normalization-equivalent, so
+	// neither cleanup route may merge them or touch their records.
+	tests := []struct {
+		name      string
+		canonical string
+		candidate string
+	}{
+		{name: "substring", canonical: "engram", candidate: "engram-memory"},
+		{name: "levenshtein", canonical: "engram", candidate: "engramm"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, args := range [][]string{
+				{"engram", "projects", "consolidate"},
+				{"engram", "projects", "consolidate", "--all"},
+			} {
+				cfg := testConfig(t)
+				mustSeedObservation(t, cfg, "s-canonical", tt.canonical, "note", "canonical", "content", "project")
+				mustSeedObservation(t, cfg, "s-candidate", tt.candidate, "note", "candidate", "content", "project")
+
+				old := detectProject
+				detectProject = func(string) string { return tt.canonical }
+				t.Cleanup(func() { detectProject = old })
+
+				oldScan := scanInputLine
+				t.Cleanup(func() { scanInputLine = oldScan })
+				scanInputLine = func(a ...any) (int, error) {
+					if ptr, ok := a[0].(*string); ok {
+						*ptr = "all"
+					}
+					return 1, nil
+				}
+
+				withArgs(t, args...)
+				stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
+				if stderr != "" {
+					t.Fatalf("%v: expected no stderr, got: %q", args, stderr)
+				}
+				if !strings.Contains(stdout, "No similar") {
+					t.Fatalf("%v: fuzzy candidate offered for merge: %q", args, stdout)
+				}
+				for _, project := range []string{tt.canonical, tt.candidate} {
+					if obs, sessions, _ := projectRecordCounts(t, cfg, project); obs != 1 || sessions != 1 {
+						t.Fatalf("%v: %q records changed: obs=%d sessions=%d", args, project, obs, sessions)
+					}
+				}
+			}
+		})
 	}
 }
 
