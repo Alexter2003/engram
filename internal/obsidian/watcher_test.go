@@ -36,7 +36,10 @@ func (f *fakeExporter) Export() (*ExportResult, error) {
 	defer f.mu.Unlock()
 	f.callCount++
 	if f.calls != nil {
-		f.calls <- f.callCount
+		select {
+		case f.calls <- f.callCount:
+		default:
+		}
 	}
 	f.graphConfigs = append(f.graphConfigs, f.config.GraphConfig)
 	if err, ok := f.errOnCycle[f.callCount]; ok {
