@@ -6206,9 +6206,37 @@ func (s *Store) applyPulledMutationTx(tx *sql.Tx, mutation SyncMutation) error {
 	}
 }
 
+// pulledSessionDeadLetterSyncID derives the identity of a quarantined pulled
+// session mutation from the mutation itself, never from its position in the pull.
+//
+// The row it identifies is the only record that remote data was discarded, and
+// the insert resolves conflicts with ON CONFLICT(sync_id) DO UPDATE, so the
+// identity carries two obligations at once. Two different dropped mutations must
+// land on different rows, or the second silently erases the first and
+// skip-plus-evidence degrades into the silent drop it exists to prevent. One
+// dropped mutation redelivered must land on the same row, or a single discarded
+// session accumulates an evidence row per delivery and overstates the loss.
+//
+// The pull sequence satisfies neither obligation. ApplyPulledChunk overwrites it
+// with the local cursor position, so it describes when a mutation was applied
+// rather than what was applied: two unrelated mutations can carry the same value
+// (including zero), and one mutation redelivered inside a differently hashed
+// chunk carries a new one. The mutation's own entity, key, operation and payload
+// are what actually distinguish dropped data, so they are what the identity
+// hashes. Each field is length-prefixed so no field content can imitate a
+// separator and forge a collision.
+func pulledSessionDeadLetterSyncID(targetKey string, mutation SyncMutation) string {
+	digest := sha256.New()
+	for _, field := range []string{targetKey, mutation.Entity, mutation.EntityKey, mutation.Op, mutation.Payload} {
+		digest.Write([]byte(strconv.Itoa(len(field))))
+		digest.Write([]byte(":"))
+		digest.Write([]byte(field))
+	}
+	return "pulled-session-" + hex.EncodeToString(digest.Sum(nil))
+}
+
 func (s *Store) deadLetterPulledSessionIdentityTx(tx *sql.Tx, targetKey string, mutation SyncMutation) error {
-	keyHash := sha256.Sum256([]byte(targetKey + "\x00" + strconv.FormatInt(mutation.Seq, 10)))
-	syncID := "pulled-session-" + hex.EncodeToString(keyHash[:])
+	syncID := pulledSessionDeadLetterSyncID(targetKey, mutation)
 	project := strings.TrimSpace(mutation.Project)
 	if project == "" {
 		var payload syncSessionPayload

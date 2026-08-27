@@ -424,6 +424,44 @@ func TestInvalidSessionIdentityCheckReportsQuarantinedPulledSessions(t *testing.
 	}
 }
 
+// TestInvalidSessionIdentityCheckReportsEveryQuarantinedPulledSession proves the
+// doctor surface scales with the number of dropped mutations. A chunk carrying
+// several blank identities must produce one finding per dropped mutation: the
+// quarantine rows are the only record that remote data was discarded, so a
+// report that collapses them would hide part of the loss it exists to expose.
+func TestInvalidSessionIdentityCheckReportsEveryQuarantinedPulledSession(t *testing.T) {
+	s := newDiagnosticTestStore(t)
+	mutations := []store.SyncMutation{
+		{Entity: store.SyncEntitySession, EntityKey: "\t", Op: store.SyncOpUpsert, Payload: `{"id":"","project":"engram","directory":"/first"}`},
+		{Entity: store.SyncEntitySession, EntityKey: "\n", Op: store.SyncOpUpsert, Payload: `{"id":"","project":"engram","directory":"/second"}`},
+	}
+	if err := s.ApplyPulledChunk(store.DefaultSyncTargetKey, "blank-identities", mutations); err != nil {
+		t.Fatalf("ApplyPulledChunk: %v", err)
+	}
+
+	report, err := NewRunner().RunOne(context.Background(), Scope{Store: s, Project: "engram"}, CheckInvalidSessionIdentity)
+	if err != nil {
+		t.Fatalf("RunOne: %v", err)
+	}
+	if len(report.Checks) != 1 || len(report.Checks[0].Findings) != 2 {
+		t.Fatalf("report=%+v, want one finding per dropped mutation", report)
+	}
+	seen := map[string]string{}
+	for _, finding := range report.Checks[0].Findings {
+		var evidence store.QuarantinedPulledSessionEvidence
+		if err := json.Unmarshal(finding.Evidence, &evidence); err != nil {
+			t.Fatalf("decode evidence: %v", err)
+		}
+		if previous, duplicated := seen[evidence.SyncID]; duplicated {
+			t.Fatalf("sync_id %q reported twice (%q and %q)", evidence.SyncID, previous, evidence.EntityKey)
+		}
+		seen[evidence.SyncID] = evidence.EntityKey
+	}
+	if len(seen) != 2 {
+		t.Fatalf("distinct quarantined sync ids=%v, want 2", seen)
+	}
+}
+
 // TestRepairPlanReportsQuarantinedPulledSessionsAsSkipped keeps repair honest:
 // doctor reports the quarantined mutation, so the repair plan must name it as
 // unrepairable instead of returning a bare noop.

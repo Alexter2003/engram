@@ -5648,6 +5648,126 @@ func TestApplyPulledSessionInvalidIdentityDoesNotBlockLaterMutations(t *testing.
 	}
 }
 
+// TestPulledSessionDeadLetterKeepsDistinctMutationsWithEqualSequence pins the
+// dead-letter row identity to the mutation itself rather than to its position in
+// the pull.
+//
+// The evidence row is the only record that remote data was discarded, so two
+// different dropped mutations must never share one sync_id: the insert uses
+// ON CONFLICT(sync_id) DO UPDATE, which would silently overwrite the first row
+// and turn skip-plus-evidence back into a silent drop. Sequence numbers do not
+// distinguish mutations on their own — ApplyPulledChunk replaces the remote
+// sequence with the local cursor position, so a mutation carries whatever
+// sequence the cursor happened to be at, including zero.
+func TestPulledSessionDeadLetterKeepsDistinctMutationsWithEqualSequence(t *testing.T) {
+	for _, seq := range []int64{0, 7} {
+		t.Run(fmt.Sprintf("seq_%d", seq), func(t *testing.T) {
+			s := newTestStore(t)
+			mutations := []SyncMutation{
+				{Seq: seq, Entity: SyncEntitySession, EntityKey: " ", Op: SyncOpUpsert, Payload: `{"id":"","project":"engram","directory":"/first"}`},
+				{Seq: seq, Entity: SyncEntitySession, EntityKey: "\t", Op: SyncOpUpsert, Payload: `{"id":"","project":"engram","directory":"/second"}`},
+			}
+			if err := s.withTx(func(tx *sql.Tx) error {
+				for _, mutation := range mutations {
+					if err := s.deadLetterPulledSessionIdentityTx(tx, DefaultSyncTargetKey, mutation); err != nil {
+						return err
+					}
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("dead letter: %v", err)
+			}
+
+			rows, err := s.ListDeferred(ListDeferredOptions{Status: "dead", Limit: 50})
+			if err != nil {
+				t.Fatalf("ListDeferred: %v", err)
+			}
+			if len(rows) != 2 {
+				t.Fatalf("dead rows=%d, want 2; distinct dropped mutations collapsed onto one sync_id: %+v", len(rows), rows)
+			}
+			payloads := map[string]bool{}
+			for _, row := range rows {
+				payloads[row.PayloadRaw] = true
+			}
+			for _, mutation := range mutations {
+				if !payloads[mutation.Payload] {
+					t.Fatalf("payload %q lost from dead-letter evidence: %+v", mutation.Payload, rows)
+				}
+			}
+
+			evidence, err := s.ListQuarantinedPulledSessionEvidence("engram")
+			if err != nil {
+				t.Fatalf("ListQuarantinedPulledSessionEvidence: %v", err)
+			}
+			if len(evidence) != 2 {
+				t.Fatalf("quarantine evidence=%+v, want both dropped mutations reported", evidence)
+			}
+		})
+	}
+}
+
+// TestPulledSessionDeadLetterIsIdempotentAcrossRedelivery keeps the evidence
+// honest in the other direction: one dropped remote mutation must stay one row.
+//
+// Chunks are deduplicated by a hash of their contents, so the same invalid
+// session redelivered beside different companions arrives under a new chunk id
+// and applies again at a later cursor position. Identity derived from that
+// position would accumulate a fresh row per redelivery and overstate how much
+// remote data was actually discarded.
+func TestPulledSessionDeadLetterIsIdempotentAcrossRedelivery(t *testing.T) {
+	s := newTestStore(t)
+	invalid := SyncMutation{Entity: SyncEntitySession, EntityKey: " ", Op: SyncOpUpsert, Payload: `{"id":"","project":"engram","directory":"/bad"}`}
+	first := SyncMutation{Entity: SyncEntitySession, EntityKey: "first", Op: SyncOpUpsert, Payload: `{"id":"first","project":"engram","directory":"/first"}`}
+	second := SyncMutation{Entity: SyncEntitySession, EntityKey: "second", Op: SyncOpUpsert, Payload: `{"id":"second","project":"engram","directory":"/second"}`}
+
+	if err := s.ApplyPulledChunk(DefaultSyncTargetKey, "chunk-one", []SyncMutation{invalid, first}); err != nil {
+		t.Fatalf("ApplyPulledChunk chunk-one: %v", err)
+	}
+	if err := s.ApplyPulledChunk(DefaultSyncTargetKey, "chunk-two", []SyncMutation{invalid, second}); err != nil {
+		t.Fatalf("ApplyPulledChunk chunk-two: %v", err)
+	}
+
+	rows, err := s.ListDeferred(ListDeferredOptions{Status: "dead", Limit: 50})
+	if err != nil {
+		t.Fatalf("ListDeferred: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("dead rows=%d, want 1; one dropped mutation must not accumulate evidence per redelivery: %+v", len(rows), rows)
+	}
+	if rows[0].PayloadRaw != invalid.Payload {
+		t.Fatalf("dead row payload=%q, want %q", rows[0].PayloadRaw, invalid.Payload)
+	}
+	for _, id := range []string{"first", "second"} {
+		if _, err := s.GetSession(id); err != nil {
+			t.Fatalf("valid session %q missing after redelivery: %v", id, err)
+		}
+	}
+}
+
+// TestApplyPulledChunkRetainsEveryInvalidSessionInOneChunk proves the evidence
+// survives the public apply path when a single chunk carries more than one
+// invalid session, which is the shape no earlier test covered.
+func TestApplyPulledChunkRetainsEveryInvalidSessionInOneChunk(t *testing.T) {
+	s := newTestStore(t)
+	mutations := []SyncMutation{
+		{Entity: SyncEntitySession, EntityKey: " ", Op: SyncOpUpsert, Payload: `{"id":"","project":"engram","directory":"/a"}`},
+		{Entity: SyncEntitySession, EntityKey: "\t", Op: SyncOpUpsert, Payload: `{"id":"","project":"engram","directory":"/b"}`},
+	}
+	if err := s.ApplyPulledChunk(DefaultSyncTargetKey, "two-invalid-sessions", mutations); err != nil {
+		t.Fatalf("ApplyPulledChunk: %v", err)
+	}
+	evidence, err := s.ListQuarantinedPulledSessionEvidence("engram")
+	if err != nil {
+		t.Fatalf("ListQuarantinedPulledSessionEvidence: %v", err)
+	}
+	if len(evidence) != 2 {
+		t.Fatalf("quarantine evidence=%+v, want one row per dropped mutation", evidence)
+	}
+	if evidence[0].SyncID == evidence[1].SyncID {
+		t.Fatalf("dropped mutations share sync_id %q", evidence[0].SyncID)
+	}
+}
+
 func TestApplyPulledChunkSkipsInvalidSessionButMalformedPayloadFailsClosed(t *testing.T) {
 	valid := SyncMutation{Entity: SyncEntitySession, EntityKey: "valid", Op: SyncOpUpsert, Payload: `{"id":"valid","project":"engram","directory":"/good"}`}
 	invalid := SyncMutation{Entity: SyncEntitySession, EntityKey: " ", Op: SyncOpUpsert, Payload: `{"id":"","project":"engram","directory":"/bad"}`}
