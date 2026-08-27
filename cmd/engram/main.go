@@ -73,6 +73,8 @@ var (
 
 	// detectProject is injectable for testing; wraps project.DetectProject.
 	detectProject = project.DetectProject
+	// detectProjectFull is injectable for commands that require unambiguous identity.
+	detectProjectFull = project.DetectProjectFull
 
 	newTUIModel   = func(s *store.Store) tui.Model { return tui.New(s, version) }
 	newTeaProgram = tea.NewProgram
@@ -785,8 +787,8 @@ func cmdServe(cfg store.Config) {
 }
 
 func resolveServeSyncStatusProject() string {
-	projectName := strings.TrimSpace(os.Getenv("ENGRAM_PROJECT"))
-	if projectName == "" {
+	projectName, ok := project.ProcessOverride("")
+	if !ok {
 		if cwd, err := os.Getwd(); err == nil {
 			projectName = detectProject(cwd)
 		}
@@ -848,7 +850,9 @@ func tryStartAutosync(ctx context.Context, s *store.Store, cfg store.Config) (au
 
 func cmdMCP(cfg store.Config) {
 	toolsFilter := ""
-	projectOverride := strings.TrimSpace(os.Getenv("ENGRAM_PROJECT"))
+	// The --project flag below is the explicit process argument of the shared
+	// override rule; project.ProcessOverride supplies the ENGRAM_PROJECT step.
+	projectOverride, _ := project.ProcessOverride("")
 	for i := 2; i < len(os.Args); i++ {
 		if strings.HasPrefix(os.Args[i], "--tools=") {
 			toolsFilter = strings.TrimPrefix(os.Args[i], "--tools=")
@@ -1005,7 +1009,7 @@ func cmdSave(cfg store.Config) {
 	title := os.Args[2]
 	content := os.Args[3]
 	typ := "manual"
-	project := ""
+	projectName := ""
 	scope := "project"
 	topicKey := ""
 
@@ -1018,7 +1022,7 @@ func cmdSave(cfg store.Config) {
 			}
 		case "--project":
 			if i+1 < len(os.Args) {
-				project = os.Args[i+1]
+				projectName = os.Args[i+1]
 				i++
 			}
 		case "--scope":
@@ -1041,21 +1045,48 @@ func cmdSave(cfg store.Config) {
 		return
 	}
 
+	cwd, err := os.Getwd()
+	if err != nil {
+		fatal(err)
+		return
+	}
+	// Identity precedence is the one process-level rule shared with the MCP and
+	// HTTP entry points: the explicit --project flag, then the process override
+	// (project.ProcessOverride reads ENGRAM_PROJECT), then cwd detection.
+	if strings.TrimSpace(projectName) == "" {
+		if override, ok := project.ProcessOverride(""); ok {
+			projectName = override
+		} else {
+			resolved := detectProjectFull(cwd)
+			if resolved.Error != nil || strings.TrimSpace(resolved.Project) == "" {
+				if resolved.Error != nil {
+					fatal(fmt.Errorf("cannot save without an unambiguous project identity: %w; use --project <name>", resolved.Error))
+				} else {
+					fatal(errors.New("cannot save without an unambiguous project identity; use --project <name>"))
+				}
+				return
+			}
+			projectName = resolved.Project
+		}
+	}
+	var warning string
+	projectName, warning = store.NormalizeProject(projectName)
+	if warning != "" {
+		fmt.Fprintln(os.Stderr, warning)
+	}
+	if strings.TrimSpace(projectName) == "" {
+		fatal(errors.New("cannot save without an unambiguous project identity; use --project <name>"))
+		return
+	}
+
 	s, err := storeNew(cfg)
 	if err != nil {
 		fatal(err)
 	}
 	defer s.Close()
 
-	sessionID := "manual-save"
-	if project != "" {
-		sessionID = "manual-save-" + project
-	}
-	cwd, err := os.Getwd()
-	if err != nil {
-		fatal(err)
-	}
-	if err := s.CreateSession(sessionID, project, cwd); err != nil {
+	sessionID := "manual-save-" + projectName
+	if err := s.CreateSession(sessionID, projectName, cwd); err != nil {
 		fatal(err)
 	}
 	id, err := storeAddObservation(s, store.AddObservationParams{
@@ -1063,7 +1094,7 @@ func cmdSave(cfg store.Config) {
 		Type:      typ,
 		Title:     title,
 		Content:   content,
-		Project:   project,
+		Project:   projectName,
 		Scope:     scope,
 		TopicKey:  topicKey,
 	})
@@ -1856,14 +1887,110 @@ func cmdProjects(cfg store.Config) {
 		cmdProjectsConsolidate(cfg)
 	case "prune":
 		cmdProjectsPrune(cfg)
+	case "rescue-ownership":
+		cmdProjectsRescueOwnership(cfg)
 	case "list", "":
 		cmdProjectsList(cfg)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown projects subcommand: %s\n", subCmd)
-		fmt.Fprintln(os.Stderr, "usage: engram projects list")
-		fmt.Fprintln(os.Stderr, "       engram projects consolidate [--all] [--dry-run]")
-		fmt.Fprintln(os.Stderr, "       engram projects prune [--dry-run] [--paths-only]")
+		printProjectsUsage()
 		exitFunc(1)
+	}
+}
+
+func printProjectsUsage() {
+	fmt.Fprintln(os.Stderr, "usage: engram projects list")
+	fmt.Fprintln(os.Stderr, "       engram projects consolidate [--all] [--dry-run]")
+	fmt.Fprintln(os.Stderr, "       engram projects prune [--dry-run] [--paths-only]")
+	fmt.Fprintln(os.Stderr, "       engram projects rescue-ownership --project <name> [--session <id>]... [--observation <id>]... [--prompt <id>]...")
+}
+
+// cmdProjectsRescueOwnership assigns explicit ownership to legacy rows that
+// carry none. It reaches the local store directly, so it is available in a
+// zero-config install where ENGRAM_HTTP_TOKEN is unset and the HTTP rescue
+// endpoint is not served. Every ownership error names this command.
+func cmdProjectsRescueOwnership(cfg store.Config) {
+	params := store.ProjectRescueParams{}
+	for i := 3; i < len(os.Args); i++ {
+		next := func() (string, bool) {
+			if i+1 >= len(os.Args) {
+				return "", false
+			}
+			i++
+			return os.Args[i], true
+		}
+		switch os.Args[i] {
+		case "--project":
+			if value, ok := next(); ok {
+				params.TargetProject = value
+			}
+		case "--session":
+			if value, ok := next(); ok {
+				params.SessionIDs = append(params.SessionIDs, value)
+			}
+		case "--observation":
+			if value, ok := next(); ok {
+				id, err := strconv.ParseInt(value, 10, 64)
+				if err != nil {
+					fatal(fmt.Errorf("invalid --observation id %q: %w", value, err))
+					return
+				}
+				params.ObservationIDs = append(params.ObservationIDs, id)
+			}
+		case "--prompt":
+			if value, ok := next(); ok {
+				id, err := strconv.ParseInt(value, 10, 64)
+				if err != nil {
+					fatal(fmt.Errorf("invalid --prompt id %q: %w", value, err))
+					return
+				}
+				params.PromptIDs = append(params.PromptIDs, id)
+			}
+		}
+	}
+
+	if strings.TrimSpace(params.TargetProject) == "" {
+		fmt.Fprintln(os.Stderr, "--project <name> is required")
+		printProjectsUsage()
+		exitFunc(1)
+		return
+	}
+	if len(params.SessionIDs) == 0 && len(params.ObservationIDs) == 0 && len(params.PromptIDs) == 0 {
+		fmt.Fprintln(os.Stderr, "select at least one --session, --observation, or --prompt to rescue")
+		printProjectsUsage()
+		exitFunc(1)
+		return
+	}
+
+	s, err := storeNew(cfg)
+	if err != nil {
+		fatal(err)
+		return
+	}
+	defer s.Close()
+
+	result, err := s.RescueNullProjectOwnership(params)
+	if err != nil {
+		fatal(err)
+		return
+	}
+
+	fmt.Printf("Rescued ownership into %q: %d sessions, %d observations, %d prompts\n",
+		params.TargetProject, result.RescuedSessions, result.RescuedObservations, result.RescuedPrompts)
+	if result.Complete {
+		fmt.Println("Everything selected now belongs to the target project.")
+	} else {
+		fmt.Printf("%d selected item(s) were left behind:\n", len(result.Blocked))
+		for _, blocked := range result.Blocked {
+			owner := blocked.OwnedBy
+			if owner == "" {
+				owner = "-"
+			}
+			fmt.Printf("  %-11s %-24s %s (owner: %s)\n", blocked.Kind, blocked.ID, blocked.Reason, owner)
+		}
+	}
+	if result.Journaled {
+		fmt.Println("Local sync journal updated; autosync reports reconciliation state.")
 	}
 }
 
@@ -2750,15 +2877,21 @@ Commands:
 Environment:
   ENGRAM_DATA_DIR    Override data directory (default: ~/.engram)
   ENGRAM_PORT        Override HTTP server port (default: 7437)
-  ENGRAM_PROJECT     Process-level default project override.
+  ENGRAM_PROJECT     Process-level default project override, applied by every entry point
+                     with one precedence rule: explicit request project (engram save --project,
+                     an MCP tool project argument) > process override (engram mcp --project,
+                     then ENGRAM_PROJECT) > cwd detection.
+                     For "engram save": owns the observation when --project is omitted.
                      For "engram serve": fallback for GET /sync/status with no project param.
                      For "engram mcp": sets DefaultProject, overriding cwd detection for all tools.
   ENGRAM_HTTP_TOKEN  Optional Bearer auth for local HTTP server (engram serve).
                      When set, the following routes require Authorization: Bearer <token>:
                        DELETE /sessions/{id}, DELETE /observations/{id}, DELETE /prompts/{id},
-                       GET /export, POST /import, POST /projects/migrate
+                       GET /export, POST /import
+                     POST /projects/rescue-ownership and deprecated alias POST /projects/migrate
+                       always require a configured token and matching Bearer credential; unset returns 503.
                      Comparison is constant-time. Token is read per-request (no restart needed).
-                     When unset, all routes are open (zero-config default).
+                     Other routes remain open when unset (zero-config default).
   ENGRAM_TIMEZONE    Timezone for timestamp display in TUI and cloud dashboard.
                      Accepts any IANA zone name (e.g. America/New_York, Europe/Berlin).
                      Falls back to system local time when unset or invalid.
