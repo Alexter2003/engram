@@ -31,7 +31,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-const sourceProcessOverride = "process_override"
+const sourceProcessOverride = projectpkg.SourceProcessOverride
 
 // MCPConfig holds configuration for the MCP server.
 type MCPConfig struct {
@@ -384,7 +384,7 @@ Examples:
 					mcp.Description("New topic key (normalized internally)"),
 				),
 			),
-			queuedWriteHandler(writeQueue, handleUpdate(s)),
+			queuedWriteHandler(writeQueue, handleUpdate(s, cfg)),
 		)
 	}
 
@@ -1181,6 +1181,13 @@ func handleSave(s *store.Store, cfg MCPConfig, activity *SessionActivity) server
 		if strings.TrimSpace(content) == "" {
 			return mcp.NewToolResultError("content is required for mem_save (use content, or observation for backward-compatible clients)"), nil
 		}
+		// Reject titleless saves before any project resolution or session
+		// creation, so a rejected mem_save leaves no session behind (#459). The
+		// store applies the same rule as a backstop, and this message keeps the
+		// "Failed to save" prefix so callers read one wording either way.
+		if err := store.ValidateObservationTitle(title); err != nil {
+			return mcp.NewToolResultError("Failed to save: " + err.Error()), nil
+		}
 		typ, _ := req.GetArguments()["type"].(string)
 		sessionID, _ := req.GetArguments()["session_id"].(string)
 		scope, _ := req.GetArguments()["scope"].(string)
@@ -1371,7 +1378,7 @@ func handleSuggestTopicKey() server.ToolHandlerFunc {
 	}
 }
 
-func handleUpdate(s *store.Store) server.ToolHandlerFunc {
+func handleUpdate(s *store.Store, cfg MCPConfig) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		id := int64(intArg(req, "id", 0))
 		if id == 0 {
@@ -1399,13 +1406,33 @@ func handleUpdate(s *store.Store) server.ToolHandlerFunc {
 			return mcp.NewToolResultError("provide at least one field to update"), nil
 		}
 
+		detRes, err := resolveWriteProjectWithProcessOverride(cfg.DefaultProject)
+		if err != nil {
+			return writeProjectErrorResult(nil, "", detRes, err), nil
+		}
+		obs, err := s.GetObservation(id)
+		if err != nil {
+			return mcp.NewToolResultError("Failed to update memory: " + err.Error()), nil
+		}
+		resolvedProject, _ := store.NormalizeProject(detRes.Project)
+		storedProject := ""
+		if obs.Project != nil {
+			storedProject, _ = store.NormalizeProject(*obs.Project)
+		}
+		if storedProject == "" {
+			return errorWithMeta("project_required", "The stored observation has no project identity", knownWriteProjects(s, detRes)), nil
+		}
+		if storedProject != resolvedProject {
+			return errorWithMeta("project_mismatch", "The current project does not own this observation", knownWriteProjects(s, detRes)), nil
+		}
+
 		var truncation *store.TruncationMetadata
 		if update.Content != nil {
 			metadata := s.ContentTruncation(*update.Content)
 			truncation = &metadata
 		}
 
-		obs, err := s.UpdateObservation(id, update)
+		obs, err = s.UpdateObservation(id, update)
 		if err != nil {
 			return mcp.NewToolResultError("Failed to update memory: " + err.Error()), nil
 		}
@@ -1417,12 +1444,6 @@ func handleUpdate(s *store.Store) server.ToolHandlerFunc {
 			extra["truncation"] = *truncation
 		}
 
-		// Auto-detect for envelope; tolerant — don't fail update on resolution error
-		detRes, detErr := resolveWriteProject()
-		if detErr != nil {
-			// Still return success for the update itself.
-			return mcp.NewToolResultText(msg), nil
-		}
 		return respondWithProject(detRes, msg, extra), nil
 	}
 }
@@ -2311,9 +2332,12 @@ func resolveWriteProject() (projectpkg.DetectionResult, error) {
 	return res, nil
 }
 
-func processProjectResult(project string) (projectpkg.DetectionResult, bool) {
-	project = strings.TrimSpace(project)
-	if project == "" {
+// processProjectResult applies the single process-level override rule
+// (projectpkg.ProcessOverride): the trusted MCPConfig.DefaultProject first, then
+// ENGRAM_PROJECT, and only then cwd detection by the caller.
+func processProjectResult(defaultProject string) (projectpkg.DetectionResult, bool) {
+	project, ok := projectpkg.ProcessOverride(defaultProject)
+	if !ok {
 		return projectpkg.DetectionResult{}, false
 	}
 	normalized, warning := store.NormalizeProject(project)
@@ -2924,6 +2948,10 @@ func errorWithMeta(code, msg string, availableProjects []string) *mcp.CallToolRe
 		envelope["hint"] = "Start the session first, omit session_id, or retry with an existing session_id."
 	case "session_project_mismatch":
 		envelope["hint"] = "Use a project that matches the existing session, or omit session_id and write to a different project."
+	case "project_required":
+		envelope["hint"] = "Use ownership rescue before updating this historical record, then retry the field update."
+	case "project_mismatch":
+		envelope["hint"] = "Switch to the observation's owning project, then retry the field update."
 	}
 	out, _ := jsonMarshal(envelope)
 	result := mcp.NewToolResultText(string(out))

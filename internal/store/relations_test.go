@@ -1136,7 +1136,7 @@ func TestJudgeRelation_RejectsCrossProject(t *testing.T) {
 }
 
 // C.1e — When the source observation is missing, JudgeRelation must enqueue a
-// mutation with project='' (empty string, not an error).
+// mutation with project=” (empty string, not an error).
 func TestJudgeRelation_MissingSource_EnqueuesEmptyProject(t *testing.T) {
 	s := setupEnrolledStore(t)
 
