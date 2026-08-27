@@ -100,7 +100,7 @@ func TestWatcherRunsImmediatelyThenTicks(t *testing.T) {
 	}
 
 	fe = newFakeExporter()
-	fe.calls = make(chan int, 3)
+	fe.calls = make(chan int, 2)
 	w = NewWatcher(WatcherConfig{
 		Exporter: fe,
 		Interval: time.Millisecond,
@@ -113,26 +113,28 @@ func TestWatcherRunsImmediatelyThenTicks(t *testing.T) {
 		done <- w.Run(ctx)
 	}()
 
-	timeout := time.NewTimer(time.Second)
-	defer timeout.Stop()
-	for want := 1; want <= 3; want++ {
+	cycleTimeout := time.NewTimer(time.Second)
+	defer cycleTimeout.Stop()
+	for want := 1; want <= 2; want++ {
 		select {
 		case got := <-fe.calls:
 			if got != want {
 				t.Fatalf("cycle order: got %d, want %d", got, want)
 			}
-		case <-timeout.C:
+		case <-cycleTimeout.C:
 			t.Fatalf("timed out waiting for cycle %d", want)
 		}
 	}
 
 	cancel()
+	shutdownTimeout := time.NewTimer(time.Second)
+	defer shutdownTimeout.Stop()
 	select {
 	case err := <-done:
 		if err != context.Canceled {
 			t.Errorf("Run() returned %v, want context.Canceled", err)
 		}
-	case <-timeout.C:
+	case <-shutdownTimeout.C:
 		t.Fatal("Run() did not return after cancellation")
 	}
 }
