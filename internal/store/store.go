@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/Gentleman-Programming/engram/internal/timeutil"
@@ -4520,6 +4521,19 @@ func (s *Store) MarkSyncPending(targetKey string) error {
 	})
 }
 
+// ApplyPulledMutation applies one remote mutation and advances the pull cursor.
+//
+// Session-identity semantics are skip-plus-evidence, not fail-closed. A blank
+// or inconsistent session identity in a pulled mutation is quarantined through
+// deadLetterPulledSessionIdentityTx and the cursor still advances past it.
+// Failing closed here would be a permanent retry loop: servers that predate the
+// identity rule hold historical chunks with blank session IDs, and no local
+// action can ever make such a mutation valid, so halting would pin the cursor
+// forever and block every later mutation behind it. Quarantining keeps the
+// dropped data visible — `engram doctor --check invalid_session_identity`
+// reports it and `engram conflicts deferred` lists the raw row.
+//
+// Every other apply failure keeps its existing fail-closed behavior.
 func (s *Store) ApplyPulledMutation(targetKey string, mutation SyncMutation) error {
 	targetKey = normalizeSyncTargetKey(targetKey)
 	return s.withTx(func(tx *sql.Tx) error {
@@ -4612,6 +4626,13 @@ func (s *Store) recordRelationApplyFailureTx(tx *sql.Tx, targetKey string, mutat
 // ApplyPulledChunk atomically applies all mutations contained in a pulled chunk
 // and records the chunk as synced in the same transaction. This guarantees
 // retry safety: a failed chunk import leaves no partial semantic mutations.
+//
+// It shares ApplyPulledMutation's skip-plus-evidence rule for invalid session
+// identities: such a mutation is quarantined and the rest of the chunk still
+// applies, so one historical blank identity cannot block the chunk forever.
+// A payload that does not even decode stays fail-closed and rolls back the
+// whole chunk, because an undecodable payload is a transport-level fault rather
+// than known-corrupt historical data.
 func (s *Store) ApplyPulledChunk(targetKey, chunkID string, mutations []SyncMutation) error {
 	targetKey = normalizeSyncTargetKey(targetKey)
 	chunkTargetKey := normalizeChunkTargetKey(targetKey)
@@ -5399,14 +5420,19 @@ func (s *Store) projectNeedsBackfill(project string) (bool, error) {
 	}
 	queries := []countQuery{
 		{
+			// Blank source identities can never be enqueued (enqueueSyncMutationTx
+			// rejects them), so counting them here would make every open of an
+			// affected store run a backfill transaction that can only fail or
+			// no-op. The predicate must stay identical to the one in
+			// backfillSessionSyncMutationsTx and to isBlankSessionID.
 			q: `SELECT COUNT(*) FROM sessions
 			    WHERE project = ?
-			      AND trim(id) != ''
+			      AND ` + sqlSessionIDNotBlank("id") + `
 			      AND NOT EXISTS (
 			        SELECT 1 FROM sync_mutations sm
 			        WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = sessions.id AND sm.source = ?
 			      )`,
-			args: []any{project, DefaultSyncTargetKey, SyncEntitySession, SyncSourceLocal},
+			args: []any{project, sqlWhitespaceTrimSet, DefaultSyncTargetKey, SyncEntitySession, SyncSourceLocal},
 		},
 		{
 			q: `SELECT COUNT(*) FROM observations o
@@ -5556,11 +5582,15 @@ func (s *Store) repairEnrolledProjectSyncMutations() error {
 }
 
 func (s *Store) backfillSessionSyncMutationsTx(tx *sql.Tx, project string) error {
+	// Blank source identities are skipped, not enqueued: enqueueSyncMutationTx
+	// rejects them and a single corrupt row would otherwise roll back the whole
+	// backfill transaction. The predicate must stay identical to the COUNT in
+	// projectNeedsBackfill and to isBlankSessionID.
 	rows, err := s.queryItHook(tx, `
 		SELECT id, project, directory, started_at, ended_at, summary
 		FROM sessions
 		WHERE project = ?
-		  AND trim(id) != ''
+		  AND `+sqlSessionIDNotBlank("id")+`
 		  AND NOT EXISTS (
 			SELECT 1
 			FROM sync_mutations sm
@@ -5570,7 +5600,7 @@ func (s *Store) backfillSessionSyncMutationsTx(tx *sql.Tx, project string) error
 			  AND sm.source = ?
 		  )
 		ORDER BY started_at ASC, id ASC`,
-		project, DefaultSyncTargetKey, SyncEntitySession, SyncSourceLocal,
+		project, sqlWhitespaceTrimSet, DefaultSyncTargetKey, SyncEntitySession, SyncSourceLocal,
 	)
 	if err != nil {
 		return err
@@ -6347,11 +6377,57 @@ func (s *Store) applySessionDeleteTx(tx *sql.Tx, payload syncSessionPayload) err
 	return err
 }
 
+// isBlankSessionID is the single authority on what "blank session identity"
+// means. Everything else — the Go guards and the SQL predicates built from
+// sqlWhitespaceTrimSet — must agree with it byte for byte.
+func isBlankSessionID(id string) bool {
+	return strings.TrimSpace(id) == ""
+}
+
 func validateSessionID(id string) error {
-	if strings.TrimSpace(id) == "" {
+	if isBlankSessionID(id) {
 		return ErrSessionIDRequired
 	}
 	return nil
+}
+
+// sqlWhitespaceTrimSet holds every rune strings.TrimSpace strips, so a SQL
+// predicate can express exactly the rule isBlankSessionID applies in Go.
+//
+// SQLite's one-argument trim(X) only strips U+0020. Relying on it split the
+// blank rule in two: a tab-, newline-, or CR-only legacy identity looked
+// non-blank to SQL and blank to Go, so doctor's source-row scan skipped the
+// corrupt row while the backfill SELECT kept it and enqueueSyncMutationTx then
+// aborted the whole transaction, rolling back every valid session batched with
+// it. Pass this value as the second argument of SQLite's trim(X, Y) — see
+// sqlSessionIDBlank / sqlSessionIDNotBlank — to keep both sides on one rule.
+var sqlWhitespaceTrimSet = buildSQLWhitespaceTrimSet()
+
+func buildSQLWhitespaceTrimSet() string {
+	var b strings.Builder
+	appendRange := func(lo, hi, stride rune) {
+		for r := lo; r <= hi; r += stride {
+			b.WriteRune(r)
+		}
+	}
+	for _, r := range unicode.White_Space.R16 {
+		appendRange(rune(r.Lo), rune(r.Hi), rune(r.Stride))
+	}
+	for _, r := range unicode.White_Space.R32 {
+		appendRange(rune(r.Lo), rune(r.Hi), rune(r.Stride))
+	}
+	return b.String()
+}
+
+// sqlSessionIDBlank and sqlSessionIDNotBlank render the blank-identity
+// predicate for a session-identity column. Both expect sqlWhitespaceTrimSet to
+// be bound as the next positional argument of the enclosing statement.
+func sqlSessionIDBlank(column string) string {
+	return "trim(" + column + ", ?) = ''"
+}
+
+func sqlSessionIDNotBlank(column string) string {
+	return "trim(" + column + ", ?) != ''"
 }
 
 func validateSessionMutationIdentity(payloadID, entityKey string) error {

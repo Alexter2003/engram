@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	_ "modernc.org/sqlite"
@@ -5539,7 +5540,7 @@ func TestEndSessionRejectsRawBlankIDWithoutMutation(t *testing.T) {
 		t.Fatalf("corrupt session ended_at=%+v summary=%+v err=%v", endedAt, summary, err)
 	}
 	var mutations int
-	if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations WHERE entity = ? AND trim(entity_key) = ''`, SyncEntitySession).Scan(&mutations); err != nil || mutations != 0 {
+	if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations WHERE entity = ? AND `+sqlSessionIDBlank("entity_key"), SyncEntitySession, sqlWhitespaceTrimSet).Scan(&mutations); err != nil || mutations != 0 {
 		t.Fatalf("blank session mutations=%d, err=%v", mutations, err)
 	}
 }
@@ -5564,7 +5565,7 @@ func TestDeleteSessionRejectsRawBlankIDsWithoutMutation(t *testing.T) {
 			if err := s.DB().QueryRow(`SELECT count(*) FROM sessions WHERE id = ?`, tc.id).Scan(&sessions); err != nil {
 				t.Fatalf("count corrupt session: %v", err)
 			}
-			if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations WHERE entity = ? AND trim(entity_key) = ''`, SyncEntitySession).Scan(&mutations); err != nil || sessions != 1 || mutations != 0 {
+			if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations WHERE entity = ? AND `+sqlSessionIDBlank("entity_key"), SyncEntitySession, sqlWhitespaceTrimSet).Scan(&mutations); err != nil || sessions != 1 || mutations != 0 {
 				t.Fatalf("sessions=%d blank mutations=%d err=%v", sessions, mutations, err)
 			}
 		})
@@ -5586,7 +5587,7 @@ func TestEnqueueSessionMutationRejectsBlankKeyAndRollsBack(t *testing.T) {
 	if err := s.DB().QueryRow(`SELECT count(*) FROM sessions WHERE id = 'prior-write'`).Scan(&sessions); err != nil {
 		t.Fatalf("count preceding write: %v", err)
 	}
-	if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations WHERE entity = ? AND trim(entity_key) = ''`, SyncEntitySession).Scan(&mutations); err != nil || sessions != 0 || mutations != 0 {
+	if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations WHERE entity = ? AND `+sqlSessionIDBlank("entity_key"), SyncEntitySession, sqlWhitespaceTrimSet).Scan(&mutations); err != nil || sessions != 0 || mutations != 0 {
 		t.Fatalf("sessions=%d blank mutations=%d err=%v", sessions, mutations, err)
 	}
 }
@@ -5739,27 +5740,174 @@ func TestBackfillSkipsInvalidSourceAndBackfillsValidSession(t *testing.T) {
 	}
 }
 
-func TestProjectNeedsBackfillIgnoresBlankSessions(t *testing.T) {
+// blankSessionIDCases enumerates source identities that strings.TrimSpace
+// reduces to the empty string. SQLite's bare trim() only strips U+0020, so
+// every non-space case here proves the SQL predicates share the Go blank rule
+// instead of falling back to the SQLite default.
+var blankSessionIDCases = []struct {
+	name string
+	id   string
+}{
+	{name: "empty", id: ""},
+	{name: "space only", id: " "},
+	{name: "tab only", id: "\t"},
+	{name: "newline only", id: "\n"},
+	{name: "carriage return only", id: "\r"},
+	{name: "vertical tab only", id: "\v"},
+	{name: "form feed only", id: "\f"},
+	{name: "mixed whitespace", id: " \t\r\n\v\f "},
+	{name: "unicode space only", id: "  "},
+}
+
+// TestSQLSessionIDBlankPredicateMatchesGoRule is the contract test for the one
+// blank rule: whatever isBlankSessionID answers in Go, the SQL predicate built
+// from sqlWhitespaceTrimSet must answer the same inside SQLite.
+func TestSQLSessionIDBlankPredicateMatchesGoRule(t *testing.T) {
 	s := newTestStore(t)
-	if _, err := s.DB().Exec(`INSERT INTO sessions (id, project, directory) VALUES (' ', 'engram', '/tmp')`); err != nil {
-		t.Fatalf("seed blank session: %v", err)
+	candidates := []string{
+		"", " ", "\t", "\n", "\r", "\v", "\f", " \t\r\n\v\f ",
+		"", " ", " ", " ", " ", " ", " ", " ", " ", "　",
+		"  ", "session", " session ", "\tsession", "session\n", "-", "0",
 	}
-	if err := s.EnrollProject("engram"); err != nil {
-		t.Fatalf("EnrollProject: %v", err)
+	for _, id := range candidates {
+		var sqlBlank, sqlNotBlank bool
+		if err := s.DB().QueryRow(`SELECT `+sqlSessionIDBlank("?")+`, `+sqlSessionIDNotBlank("?"), id, sqlWhitespaceTrimSet, id, sqlWhitespaceTrimSet).Scan(&sqlBlank, &sqlNotBlank); err != nil {
+			t.Fatalf("evaluate predicate for %q: %v", id, err)
+		}
+		goBlank := isBlankSessionID(id)
+		if sqlBlank != goBlank || sqlNotBlank == goBlank {
+			t.Fatalf("id=%q sql blank=%t not-blank=%t, go blank=%t", id, sqlBlank, sqlNotBlank, goBlank)
+		}
 	}
-	needs, err := s.projectNeedsBackfill("engram")
-	if err != nil || needs {
-		t.Fatalf("blank-only projectNeedsBackfill = %v, %v", needs, err)
+}
+
+// TestSQLWhitespaceTrimSetCoversEveryTrimSpaceRune keeps the generated trim set
+// exhaustive: strings.TrimSpace strips exactly unicode.IsSpace runes, so every
+// one of them must appear in the set handed to SQLite.
+func TestSQLWhitespaceTrimSetCoversEveryTrimSpaceRune(t *testing.T) {
+	inSet := make(map[rune]bool, len(sqlWhitespaceTrimSet))
+	for _, r := range sqlWhitespaceTrimSet {
+		if !unicode.IsSpace(r) {
+			t.Fatalf("trim set contains non-whitespace rune %U", r)
+		}
+		inSet[r] = true
 	}
-	if _, err := s.DB().Exec(`INSERT INTO sessions (id, project, directory) VALUES ('valid', 'engram', '/tmp')`); err != nil {
-		t.Fatalf("seed valid session: %v", err)
+	for r := rune(0); r <= unicode.MaxRune; r++ {
+		if unicode.IsSpace(r) && !inSet[r] {
+			t.Fatalf("trim set is missing whitespace rune %U", r)
+		}
 	}
-	if err := s.repairEnrolledProjectSyncMutations(); err != nil {
-		t.Fatalf("backfill mixed sessions: %v", err)
+}
+
+func TestProjectNeedsBackfillIgnoresBlankSessions(t *testing.T) {
+	for _, tc := range blankSessionIDCases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStore(t)
+			if _, err := s.DB().Exec(`INSERT INTO sessions (id, project, directory) VALUES (?, 'engram', '/tmp')`, tc.id); err != nil {
+				t.Fatalf("seed blank session: %v", err)
+			}
+			if err := s.EnrollProject("engram"); err != nil {
+				t.Fatalf("EnrollProject: %v", err)
+			}
+			needs, err := s.projectNeedsBackfill("engram")
+			if err != nil || needs {
+				t.Fatalf("blank-only projectNeedsBackfill = %v, %v", needs, err)
+			}
+			if _, err := s.DB().Exec(`INSERT INTO sessions (id, project, directory) VALUES ('valid', 'engram', '/tmp')`); err != nil {
+				t.Fatalf("seed valid session: %v", err)
+			}
+			if err := s.repairEnrolledProjectSyncMutations(); err != nil {
+				t.Fatalf("backfill mixed sessions: %v", err)
+			}
+			var mutations int
+			if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations WHERE entity = ?`, SyncEntitySession).Scan(&mutations); err != nil || mutations != 1 {
+				t.Fatalf("session mutations=%d, err=%v; want only valid session", mutations, err)
+			}
+			var blankMutations int
+			if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations WHERE entity = ? AND entity_key = ?`, SyncEntitySession, tc.id).Scan(&blankMutations); err != nil || blankMutations != 0 {
+				t.Fatalf("blank session mutations=%d, err=%v", blankMutations, err)
+			}
+		})
 	}
-	var mutations int
-	if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations WHERE entity = ?`, SyncEntitySession).Scan(&mutations); err != nil || mutations != 1 {
-		t.Fatalf("session mutations=%d, err=%v; want only valid session", mutations, err)
+}
+
+// TestBackfillSessionSyncMutationsSkipsBlankSourceRows proves the SELECT that
+// feeds the backfill uses the same blank rule as enqueueSyncMutationTx. A
+// source row the SELECT keeps but the enqueue guard rejects aborts the whole
+// transaction and rolls back every valid session backfilled alongside it.
+func TestBackfillSessionSyncMutationsSkipsBlankSourceRows(t *testing.T) {
+	for _, tc := range blankSessionIDCases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStore(t)
+			if _, err := s.DB().Exec(`INSERT INTO sessions (id, project, directory) VALUES (?, 'engram', '/tmp/blank')`, tc.id); err != nil {
+				t.Fatalf("seed blank session: %v", err)
+			}
+			if _, err := s.DB().Exec(`INSERT INTO sessions (id, project, directory) VALUES ('valid-session', 'engram', '/tmp/valid')`); err != nil {
+				t.Fatalf("seed valid session: %v", err)
+			}
+			if err := s.withTx(func(tx *sql.Tx) error { return s.backfillSessionSyncMutationsTx(tx, "engram") }); err != nil {
+				t.Fatalf("backfill: %v", err)
+			}
+			var valid, blank int
+			if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations WHERE entity = ? AND entity_key = 'valid-session'`, SyncEntitySession).Scan(&valid); err != nil {
+				t.Fatalf("count valid mutations: %v", err)
+			}
+			if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations WHERE entity = ? AND entity_key = ?`, SyncEntitySession, tc.id).Scan(&blank); err != nil {
+				t.Fatalf("count blank mutations: %v", err)
+			}
+			if valid != 1 || blank != 0 {
+				t.Fatalf("valid mutations=%d blank mutations=%d", valid, blank)
+			}
+		})
+	}
+}
+
+// TestListInvalidSessionIdentityEvidenceDetectsEveryBlankSourceRow proves the
+// doctor source-row scan cannot be bypassed by a legacy identity built from
+// whitespace SQLite's trim() does not strip.
+func TestListInvalidSessionIdentityEvidenceDetectsEveryBlankSourceRow(t *testing.T) {
+	for _, tc := range blankSessionIDCases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStore(t)
+			if _, err := s.DB().Exec(`INSERT INTO sessions (id, project, directory) VALUES (?, 'engram', '/tmp/blank')`, tc.id); err != nil {
+				t.Fatalf("seed blank session: %v", err)
+			}
+			if _, err := s.DB().Exec(`INSERT INTO sessions (id, project, directory) VALUES ('valid-session', 'engram', '/tmp/valid')`); err != nil {
+				t.Fatalf("seed valid session: %v", err)
+			}
+			evidence, err := s.ListInvalidSessionIdentityEvidence("engram")
+			if err != nil {
+				t.Fatalf("ListInvalidSessionIdentityEvidence: %v", err)
+			}
+			if len(evidence) != 1 || evidence[0].SessionID != tc.id {
+				t.Fatalf("evidence=%+v, want the single blank source row %q", evidence, tc.id)
+			}
+		})
+	}
+}
+
+// TestSessionIdentityPreservesWhitespacePaddedIdentities guards the other
+// direction: identities that merely contain whitespace are not blank, stay
+// byte-exact, and are never reported as corrupt.
+func TestSessionIdentityPreservesWhitespacePaddedIdentities(t *testing.T) {
+	for _, id := range []string{"\tsession", "session\n", " \r session \v ", " session "} {
+		t.Run(fmt.Sprintf("%q", id), func(t *testing.T) {
+			s := newTestStore(t)
+			if err := s.CreateSession(id, "engram", "/tmp"); err != nil {
+				t.Fatalf("CreateSession: %v", err)
+			}
+			evidence, err := s.ListInvalidSessionIdentityEvidence("engram")
+			if err != nil || len(evidence) != 0 {
+				t.Fatalf("evidence=%+v, err=%v; want no invalid identity", evidence, err)
+			}
+			var entityKey string
+			if err := s.DB().QueryRow(`SELECT entity_key FROM sync_mutations WHERE entity = ?`, SyncEntitySession).Scan(&entityKey); err != nil {
+				t.Fatalf("load session mutation: %v", err)
+			}
+			if entityKey != id {
+				t.Fatalf("entity_key=%q, want byte-exact %q", entityKey, id)
+			}
+		})
 	}
 }
 
@@ -10171,5 +10319,45 @@ func TestSanitizeFTS(t *testing.T) {
 				t.Errorf("sanitizeFTS(%q) = %q, want %q", tc.input, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestListQuarantinedPulledSessionEvidenceScopesByProject proves the doctor
+// surface for skipped pull mutations is project-scoped and reports the remote
+// coordinates an operator needs to locate the dropped data.
+func TestListQuarantinedPulledSessionEvidenceScopesByProject(t *testing.T) {
+	s := newTestStore(t)
+	mutations := []SyncMutation{
+		{Seq: 1, Entity: SyncEntitySession, EntityKey: "\t", Op: SyncOpUpsert, Payload: `{"id":"","project":"engram","directory":"/a"}`},
+		{Seq: 2, Entity: SyncEntitySession, EntityKey: "\n", Op: SyncOpUpsert, Payload: `{"id":"","project":"other","directory":"/b"}`},
+	}
+	for _, mutation := range mutations {
+		if err := s.ApplyPulledMutation(DefaultSyncTargetKey, mutation); err != nil {
+			t.Fatalf("ApplyPulledMutation seq=%d: %v", mutation.Seq, err)
+		}
+	}
+
+	scoped, err := s.ListQuarantinedPulledSessionEvidence("engram")
+	if err != nil {
+		t.Fatalf("ListQuarantinedPulledSessionEvidence: %v", err)
+	}
+	if len(scoped) != 1 || scoped[0].RemoteSeq != 1 || scoped[0].EntityKey != "\t" || scoped[0].Project != "engram" {
+		t.Fatalf("scoped evidence=%+v", scoped)
+	}
+	if scoped[0].ReasonCode != SyncSessionIdentityInvalidReasonCode || scoped[0].TargetKey != DefaultSyncTargetKey || scoped[0].Op != SyncOpUpsert {
+		t.Fatalf("scoped evidence=%+v", scoped)
+	}
+
+	all, err := s.ListQuarantinedPulledSessionEvidence("")
+	if err != nil || len(all) != 2 {
+		t.Fatalf("unscoped evidence=%+v, err=%v", all, err)
+	}
+	if all[0].RemoteSeq != 1 || all[1].RemoteSeq != 2 {
+		t.Fatalf("unscoped evidence is not ordered by remote seq: %+v", all)
+	}
+
+	state, err := s.GetSyncState(DefaultSyncTargetKey)
+	if err != nil || state.LastPulledSeq != 2 {
+		t.Fatalf("sync state=%+v, err=%v; cursor must advance past quarantined mutations", state, err)
 	}
 }

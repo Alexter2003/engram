@@ -41,6 +41,21 @@ type InvalidSessionIdentityEvidence struct {
 	InvalidJournalCount int64  `json:"invalid_journal_count"`
 }
 
+// QuarantinedPulledSessionEvidence describes a pulled session mutation that was
+// skipped because its identity is blank or inconsistent. The pull cursor
+// advances past such a mutation instead of halting, so this row is the only
+// record that remote data was dropped.
+type QuarantinedPulledSessionEvidence struct {
+	SyncID      string `json:"sync_id"`
+	TargetKey   string `json:"target_key"`
+	Project     string `json:"project"`
+	EntityKey   string `json:"entity_key"`
+	Op          string `json:"op"`
+	RemoteSeq   int64  `json:"remote_seq"`
+	ReasonCode  string `json:"reason_code"`
+	FirstSeenAt string `json:"first_seen_at"`
+}
+
 // SQLiteLockSnapshot captures conservative SQLite lock/contention indicators.
 // wal_checkpoint(PASSIVE) is an observational probe for this diagnostic surface;
 // callers must not interpret it as a repair action.
@@ -108,13 +123,17 @@ func (s *Store) ListPendingProjectMutations(project string) ([]SyncMutation, err
 	return s.listPendingProjectMutationsTxLike(s.db, project)
 }
 
-// ListInvalidSessionIdentityEvidence reports empty source session IDs together
+// ListInvalidSessionIdentityEvidence reports blank source session IDs together
 // with affected references and invalid session journal entries. It is read-only.
+//
+// The source-row predicate uses the shared whitespace trim set rather than
+// SQLite's bare trim(), so a legacy identity made of tabs, newlines or carriage
+// returns cannot bypass the scan while still being rejected by the Go guards.
 func (s *Store) ListInvalidSessionIdentityEvidence(project string) ([]InvalidSessionIdentityEvidence, error) {
 	project, _ = NormalizeProject(project)
 	project = strings.TrimSpace(project)
-	query := `SELECT id, project FROM sessions WHERE trim(id) = ''`
-	args := []any{}
+	query := `SELECT id, project FROM sessions WHERE ` + sqlSessionIDBlank("id")
+	args := []any{sqlWhitespaceTrimSet}
 	if project != "" {
 		query += ` AND project = ?`
 		args = append(args, project)
@@ -211,6 +230,44 @@ func (s *Store) ListInvalidSessionIdentityEvidence(project string) ([]InvalidSes
 		}
 	}
 	return evidence, nil
+}
+
+// ListQuarantinedPulledSessionEvidence returns the pulled session mutations the
+// apply path skipped because their identity is blank or inconsistent.
+//
+// The pull deliberately does not fail closed on these mutations: halting would
+// pin the cursor forever on a historical chunk written before the identity rule
+// existed. Instead each one is quarantined here so doctor can report exactly
+// what remote data was dropped. It is read-only.
+func (s *Store) ListQuarantinedPulledSessionEvidence(project string) ([]QuarantinedPulledSessionEvidence, error) {
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	query := `SELECT sync_id, target_key, ifnull(project, ''), entity_key, op, remote_seq, reason_code, ifnull(first_seen_at, '')
+		FROM sync_apply_deferred
+		WHERE entity = ? AND reason_code = ?`
+	args := []any{SyncEntitySession, SyncSessionIdentityInvalidReasonCode}
+	if project != "" {
+		query += ` AND project = ?`
+		args = append(args, project)
+	}
+	query += ` ORDER BY target_key ASC, remote_seq ASC, sync_id ASC`
+
+	rows, err := s.queryItHook(s.db, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	quarantined := make([]QuarantinedPulledSessionEvidence, 0)
+	for rows.Next() {
+		var item QuarantinedPulledSessionEvidence
+		if err := rows.Scan(&item.SyncID, &item.TargetKey, &item.Project, &item.EntityKey, &item.Op, &item.RemoteSeq, &item.ReasonCode, &item.FirstSeenAt); err != nil {
+			return nil, closeRowsWithError(rows, err)
+		}
+		quarantined = append(quarantined, item)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return quarantined, rows.Err()
 }
 
 type rowQuerier interface {

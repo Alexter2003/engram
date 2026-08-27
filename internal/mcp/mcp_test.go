@@ -3543,7 +3543,7 @@ func TestSessionEndRejectsBlankIDsWithoutMutation(t *testing.T) {
 				t.Fatalf("valid session changed: %+v, %v", session, err)
 			}
 			var mutations int
-			if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations WHERE entity = 'session' AND trim(entity_key) = ''`).Scan(&mutations); err != nil || mutations != 0 {
+			if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations WHERE entity = 'session' AND entity_key = ?`, id).Scan(&mutations); err != nil || mutations != 0 {
 				t.Fatalf("blank session mutations=%d, err=%v", mutations, err)
 			}
 		})
