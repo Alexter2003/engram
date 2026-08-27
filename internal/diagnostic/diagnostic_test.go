@@ -10,11 +10,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Gentleman-Programming/engram/internal/cloud/constants"
 	"github.com/Gentleman-Programming/engram/internal/store"
 	_ "modernc.org/sqlite"
 )
 
 func newDiagnosticTestStore(t *testing.T) *store.Store {
+	t.Helper()
+	s, _ := newDiagnosticTestStoreWithConfig(t)
+	return s
+}
+
+func newDiagnosticTestStoreWithConfig(t *testing.T) (*store.Store, store.Config) {
 	t.Helper()
 	cfg, err := store.DefaultConfig()
 	if err != nil {
@@ -26,7 +33,7 @@ func newDiagnosticTestStore(t *testing.T) *store.Store {
 		t.Fatalf("store.New: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	return s
+	return s, cfg
 }
 
 func TestSQLiteLockContentionBranches(t *testing.T) {
@@ -130,6 +137,105 @@ func TestSessionProjectDirectoryMismatchFinding(t *testing.T) {
 	}
 	if report.Status != StatusWarning || len(report.Checks[0].Findings) != 1 {
 		t.Fatalf("report=%+v", report)
+	}
+}
+
+// TestSyncMutationRequiredFieldsSurfacesNonEnrolledCountFailure proves the
+// check fails loudly instead of reporting a clean bill of health when the
+// enrollment evidence cannot be read. The enrollment table is dropped after
+// migrations so payload validation still succeeds and only the cloud sync
+// enrollment lookup fails.
+func TestSyncMutationRequiredFieldsSurfacesNonEnrolledCountFailure(t *testing.T) {
+	s, cfg := newDiagnosticTestStoreWithConfig(t)
+
+	db, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE sync_enrolled_projects`); err != nil {
+		db.Close()
+		t.Fatalf("drop sync_enrolled_projects: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close probe db: %v", err)
+	}
+
+	report, err := NewRunner().RunOne(context.Background(), Scope{Store: s, Project: "engram"}, CheckSyncMutationRequiredFields)
+	if err == nil {
+		t.Fatalf("expected non-enrolled count failure, got report=%+v", report)
+	}
+	if !strings.Contains(err.Error(), "sync_enrolled_projects") {
+		t.Fatalf("expected error naming the enrollment table, got %v", err)
+	}
+
+	errReport := ErrorReport("engram", err)
+	if errReport.Status != StatusError || errReport.Summary.Errors != 1 {
+		t.Fatalf("expected error report, got %+v", errReport)
+	}
+	if errReport.Checks[0].ReasonCode != "diagnostic_error" || !strings.Contains(errReport.Checks[0].Message, "sync_enrolled_projects") {
+		t.Fatalf("expected surfaced query failure, got %+v", errReport.Checks[0])
+	}
+}
+
+// TestSyncMutationRequiredFieldsIgnoresBacklogWithoutCloudEnrollment proves a
+// local-only install is never reported as blocked for a non-enrolled backlog.
+// The store journals sync mutations unconditionally, so on a device that never
+// opted into cloud sync every pending mutation belongs to a non-enrolled
+// project: that is the normal steady state, not a fault.
+func TestSyncMutationRequiredFieldsIgnoresBacklogWithoutCloudEnrollment(t *testing.T) {
+	s := newDiagnosticTestStore(t)
+	if err := s.CreateSession("manual-save-engram", "engram", "/work/engram"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	pending, err := s.CountPendingNonEnrolledSyncMutations(store.DefaultSyncTargetKey)
+	if err != nil {
+		t.Fatalf("CountPendingNonEnrolledSyncMutations: %v", err)
+	}
+	if len(pending) == 0 {
+		t.Fatal("fixture must journal a non-enrolled pending mutation")
+	}
+
+	report, err := NewRunner().RunOne(context.Background(), Scope{Store: s, Project: "engram"}, CheckSyncMutationRequiredFields)
+	if err != nil {
+		t.Fatalf("RunOne: %v", err)
+	}
+	if report.Status != StatusOK || len(report.Checks[0].Findings) != 0 {
+		t.Fatalf("local-only install must not be blocked, got %+v", report)
+	}
+}
+
+// TestSyncMutationRequiredFieldsBlocksNonEnrolledBacklogWhenCloudSyncInUse
+// proves the issue #688 signal survives: once the device uses cloud sync, a
+// project whose pending mutations cannot be delivered is reported as blocked
+// with the enrollment guidance, while the enrolled project stays silent.
+func TestSyncMutationRequiredFieldsBlocksNonEnrolledBacklogWhenCloudSyncInUse(t *testing.T) {
+	s := newDiagnosticTestStore(t)
+	if err := s.CreateSession("manual-save-enrolled", "enrolled", "/work/enrolled"); err != nil {
+		t.Fatalf("CreateSession enrolled: %v", err)
+	}
+	if err := s.EnrollProject("enrolled"); err != nil {
+		t.Fatalf("EnrollProject: %v", err)
+	}
+	if err := s.CreateSession("manual-save-local", "local", "/work/local"); err != nil {
+		t.Fatalf("CreateSession local: %v", err)
+	}
+
+	report, err := NewRunner().RunOne(context.Background(), Scope{Store: s}, CheckSyncMutationRequiredFields)
+	if err != nil {
+		t.Fatalf("RunOne: %v", err)
+	}
+	if report.Status != StatusBlocked || len(report.Checks[0].Findings) != 1 {
+		t.Fatalf("expected one blocking finding, got %+v", report)
+	}
+	finding := report.Checks[0].Findings[0]
+	if finding.Severity != SeverityBlocking || finding.ReasonCode != constants.ReasonNonEnrolledPendingMutations {
+		t.Fatalf("unexpected finding: %+v", finding)
+	}
+	if !strings.Contains(string(finding.Evidence), `"project":"local"`) {
+		t.Fatalf("expected the non-enrolled project in evidence, got %s", finding.Evidence)
+	}
+	if !strings.Contains(finding.SafeNextStep, "engram cloud enroll <project>") {
+		t.Fatalf("expected enrollment guidance, got %q", finding.SafeNextStep)
 	}
 }
 

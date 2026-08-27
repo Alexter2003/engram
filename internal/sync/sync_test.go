@@ -3833,3 +3833,169 @@ func TestChunkTrackingTargetKeyScopesBySyncTarget(t *testing.T) {
 		t.Fatalf("expected explicit normalized cloud project target key, got %q", got)
 	}
 }
+
+// TestCloudSyncPreservesPiPromptIdentityUnderProjectScope proves the second half of #706: a prompt
+// saved through the Pi plugin's wire shape does not stop at the local database. It must enqueue a
+// sync mutation under its own project scope and survive the cloud push/pull round trip with the
+// identity the dashboard addresses it by — its sync_id — intact.
+//
+// The dashboard resolves a prompt by sync_id (see TestPromptDetailURLUsesSyncID), so a prompt that
+// arrives without its sync_id, or under the wrong project, is a prompt the dashboard reports as
+// absent even though the local save succeeded.
+func TestCloudSyncPreservesPiPromptIdentityUnderProjectScope(t *testing.T) {
+	const (
+		targetProject = "paidosdep"
+		otherProject  = "skill-registry"
+		promptContent = "preserve this exact user prompt about auth token rotation"
+	)
+
+	// The Pi plugin derives a stable per-project session id when the caller names a project.
+	targetSession := "manual-save-" + targetProject
+	otherSession := "manual-save-" + otherProject
+
+	srcStore := newTestStore(t)
+	if err := srcStore.CreateSession(targetSession, targetProject, "/tmp/"+targetProject); err != nil {
+		t.Fatalf("create target session: %v", err)
+	}
+	if err := srcStore.CreateSession(otherSession, otherProject, "/tmp/"+otherProject); err != nil {
+		t.Fatalf("create other session: %v", err)
+	}
+
+	if _, err := srcStore.AddPrompt(store.AddPromptParams{
+		SessionID: targetSession,
+		Content:   promptContent,
+		Project:   targetProject,
+	}); err != nil {
+		t.Fatalf("add prompt: %v", err)
+	}
+	// A prompt in a neighbouring project keeps the scope assertions honest.
+	if _, err := srcStore.AddPrompt(store.AddPromptParams{
+		SessionID: otherSession,
+		Content:   "an unrelated prompt that must stay in its own project",
+		Project:   otherProject,
+	}); err != nil {
+		t.Fatalf("add other prompt: %v", err)
+	}
+
+	srcPrompts, err := srcStore.RecentPrompts(targetProject, 10)
+	if err != nil {
+		t.Fatalf("recent prompts: %v", err)
+	}
+	if len(srcPrompts) != 1 {
+		t.Fatalf("expected exactly one prompt in %q, got %d", targetProject, len(srcPrompts))
+	}
+	saved := srcPrompts[0]
+	if strings.TrimSpace(saved.SyncID) == "" {
+		t.Fatal("expected the saved prompt to carry a sync_id")
+	}
+
+	// The mutation the prompt enqueues must be filed under the prompt's own project, keyed by the
+	// sync_id, and carry the project inside the payload the cloud will materialize from.
+	pending, err := srcStore.ListPendingProjectMutations(targetProject)
+	if err != nil {
+		t.Fatalf("list pending mutations: %v", err)
+	}
+	var promptMutation *store.SyncMutation
+	for i := range pending {
+		if pending[i].Entity == store.SyncEntityPrompt && pending[i].EntityKey == saved.SyncID {
+			promptMutation = &pending[i]
+			break
+		}
+	}
+	if promptMutation == nil {
+		t.Fatalf("no pending prompt mutation for sync_id %q under project %q", saved.SyncID, targetProject)
+	}
+	if promptMutation.Op != store.SyncOpUpsert {
+		t.Fatalf("expected upsert op, got %q", promptMutation.Op)
+	}
+	if promptMutation.Project != targetProject {
+		t.Fatalf("expected mutation project %q, got %q", targetProject, promptMutation.Project)
+	}
+	var payload struct {
+		SyncID    string  `json:"sync_id"`
+		SessionID string  `json:"session_id"`
+		Content   string  `json:"content"`
+		Project   *string `json:"project"`
+	}
+	if err := json.Unmarshal([]byte(promptMutation.Payload), &payload); err != nil {
+		t.Fatalf("decode prompt mutation payload: %v", err)
+	}
+	if payload.SyncID != saved.SyncID || payload.Content != promptContent || payload.SessionID != targetSession {
+		t.Fatalf("prompt mutation payload does not describe the saved prompt: %+v", payload)
+	}
+	if payload.Project == nil || *payload.Project != targetProject {
+		t.Fatalf("expected payload project %q, got %v", targetProject, payload.Project)
+	}
+
+	// The neighbouring project must not have picked up this prompt's mutation.
+	otherPending, err := srcStore.ListPendingProjectMutations(otherProject)
+	if err != nil {
+		t.Fatalf("list other pending mutations: %v", err)
+	}
+	for _, m := range otherPending {
+		if m.EntityKey == saved.SyncID {
+			t.Fatalf("prompt mutation %q leaked into project %q", saved.SyncID, otherProject)
+		}
+	}
+
+	// Push the enrolled project to the cloud and pull it into a clean store.
+	if err := srcStore.EnrollProject(targetProject); err != nil {
+		t.Fatalf("enroll src project: %v", err)
+	}
+	transport := newFakeCloudTransport()
+	exportResult, err := NewCloudWithTransport(srcStore, transport, targetProject).Export("alice", targetProject)
+	if err != nil {
+		t.Fatalf("cloud export: %v", err)
+	}
+	if exportResult.IsEmpty {
+		t.Fatal("expected a non-empty cloud export carrying the prompt")
+	}
+
+	dstStore := newTestStore(t)
+	if err := dstStore.EnrollProject(targetProject); err != nil {
+		t.Fatalf("enroll dst project: %v", err)
+	}
+	importResult, err := NewCloudWithTransport(dstStore, transport, targetProject).Import()
+	if err != nil {
+		t.Fatalf("cloud import: %v", err)
+	}
+	if importResult.ChunksImported == 0 {
+		t.Fatalf("expected at least one imported chunk, got %+v", importResult)
+	}
+
+	// The pulled prompt keeps the identity the dashboard addresses it by.
+	pulled, err := dstStore.RecentPrompts(targetProject, 10)
+	if err != nil {
+		t.Fatalf("recent prompts after pull: %v", err)
+	}
+	var arrived *store.Prompt
+	for i := range pulled {
+		if pulled[i].SyncID == saved.SyncID {
+			arrived = &pulled[i]
+			break
+		}
+	}
+	if arrived == nil {
+		t.Fatalf("prompt %q did not survive the cloud round trip into project %q (got %d prompts)", saved.SyncID, targetProject, len(pulled))
+	}
+	if arrived.Content != promptContent {
+		t.Fatalf("pulled prompt content changed: %q", arrived.Content)
+	}
+	if arrived.Project != targetProject {
+		t.Fatalf("expected pulled prompt project %q, got %q", targetProject, arrived.Project)
+	}
+	if arrived.SessionID != targetSession {
+		t.Fatalf("expected pulled prompt session %q, got %q", targetSession, arrived.SessionID)
+	}
+
+	// The round trip must not have widened the prompt's scope.
+	strayed, err := dstStore.RecentPrompts(otherProject, 10)
+	if err != nil {
+		t.Fatalf("recent prompts for other project after pull: %v", err)
+	}
+	for _, p := range strayed {
+		if p.SyncID == saved.SyncID {
+			t.Fatalf("prompt %q strayed into project %q after the round trip", saved.SyncID, otherProject)
+		}
+	}
+}
