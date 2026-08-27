@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
@@ -761,7 +762,12 @@ func (cs *CloudStore) ListProjectGrants(ctx context.Context, principalID string)
 	if cs == nil || cs.db == nil {
 		return nil, fmt.Errorf("cloudstore: not initialized")
 	}
-	rows, err := cs.db.QueryContext(ctx, `SELECT principal_id::text, project, COALESCE(granted_by_principal_id::text, ''), created_at FROM cloud_project_grants WHERE principal_id = $1 ORDER BY project ASC`, strings.TrimSpace(principalID))
+	principalID = strings.TrimSpace(principalID)
+	numericPrincipalID, err := strconv.ParseInt(principalID, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("cloudstore: parse principal id: %w", err)
+	}
+	rows, err := cs.db.QueryContext(ctx, `SELECT principal_id::text, project, COALESCE(granted_by_principal_id::text, ''), created_at FROM cloud_project_grants WHERE principal_id = $1 ORDER BY project ASC`, numericPrincipalID)
 	if err != nil {
 		return nil, fmt.Errorf("cloudstore: list project grants: %w", err)
 	}
