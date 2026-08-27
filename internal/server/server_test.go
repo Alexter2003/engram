@@ -169,7 +169,7 @@ func TestClaudeSaveNudgeCompatibilityRoutes(t *testing.T) {
 	}
 }
 
-func TestHandleMigrateProjectRequiresConfirmedBoundedRescue(t *testing.T) {
+func TestHandleRescueProjectOwnershipRequiresConfirmedBoundedRescue(t *testing.T) {
 	const token = "rescue-token"
 	t.Setenv("ENGRAM_HTTP_TOKEN", token)
 	h := New(newServerTestStore(t), 0).Handler()
@@ -178,7 +178,7 @@ func TestHandleMigrateProjectRequiresConfirmedBoundedRescue(t *testing.T) {
 		`{"target_project":"target","confirmed":true}`,
 		`{"confirmed":true,"observation_ids":[1]}`,
 	} {
-		req := httptest.NewRequest(http.MethodPost, "/projects/migrate", strings.NewReader(body))
+		req := httptest.NewRequest(http.MethodPost, "/projects/rescue-ownership", strings.NewReader(body))
 		req.Header.Set("Authorization", "Bearer "+token)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -188,7 +188,7 @@ func TestHandleMigrateProjectRequiresConfirmedBoundedRescue(t *testing.T) {
 	}
 }
 
-func TestHandleMigrateProjectRescuesNullOwnershipAndReportsLocalJournal(t *testing.T) {
+func TestHandleRescueProjectOwnershipRescuesNullOwnershipAndReportsLocalJournal(t *testing.T) {
 	const token = "rescue-token"
 	t.Setenv("ENGRAM_HTTP_TOKEN", token)
 	st := newServerTestStore(t)
@@ -209,7 +209,7 @@ func TestHandleMigrateProjectRescuesNullOwnershipAndReportsLocalJournal(t *testi
 	var writes int32
 	srv.SetOnWrite(func() { atomic.AddInt32(&writes, 1) })
 	body := fmt.Sprintf(`{"target_project":"target","confirmed":true,"observation_ids":[%d]}`, id)
-	req := httptest.NewRequest(http.MethodPost, "/projects/migrate", strings.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/projects/rescue-ownership", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, req)
@@ -242,7 +242,7 @@ func TestHandleMigrateProjectRescuesNullOwnershipAndReportsLocalJournal(t *testi
 	}
 }
 
-func TestHandleMigrateProjectRejectsUnauthorizedRescueWithoutSideEffects(t *testing.T) {
+func TestHandleRescueProjectOwnershipRejectsUnauthorizedRequestsOnCanonicalAndAliasRoutes(t *testing.T) {
 	tests := []struct {
 		name          string
 		serverToken   string
@@ -276,21 +276,23 @@ func TestHandleMigrateProjectRejectsUnauthorizedRescueWithoutSideEffects(t *test
 			var writes int32
 			srv.SetOnWrite(func() { atomic.AddInt32(&writes, 1) })
 			body := fmt.Sprintf(`{"target_project":"target","confirmed":true,"observation_ids":[%d]}`, id)
-			req := httptest.NewRequest(http.MethodPost, "/projects/migrate", strings.NewReader(body))
-			if tt.authorization != "" {
-				req.Header.Set("Authorization", tt.authorization)
-			}
-			rec := httptest.NewRecorder()
-			srv.Handler().ServeHTTP(rec, req)
-			if rec.Code != tt.wantStatus {
-				t.Fatalf("rejected rescue returned %d, want %d: %s", rec.Code, tt.wantStatus, rec.Body.String())
-			}
-			var response map[string]string
-			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
-				t.Fatalf("decode rejection response: %v", err)
-			}
-			if response["error"] != tt.wantError {
-				t.Fatalf("rejection error = %q, want %q", response["error"], tt.wantError)
+			for _, path := range []string{"/projects/rescue-ownership", "/projects/migrate"} {
+				req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+				if tt.authorization != "" {
+					req.Header.Set("Authorization", tt.authorization)
+				}
+				rec := httptest.NewRecorder()
+				srv.Handler().ServeHTTP(rec, req)
+				if rec.Code != tt.wantStatus {
+					t.Fatalf("%s rejected rescue returned %d, want %d: %s", path, rec.Code, tt.wantStatus, rec.Body.String())
+				}
+				var response map[string]string
+				if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+					t.Fatalf("decode %s rejection response: %v", path, err)
+				}
+				if response["error"] != tt.wantError {
+					t.Fatalf("%s rejection error = %q, want %q", path, response["error"], tt.wantError)
+				}
 			}
 
 			var project sql.NullString
@@ -312,6 +314,70 @@ func TestHandleMigrateProjectRejectsUnauthorizedRescueWithoutSideEffects(t *test
 			}
 		})
 	}
+}
+
+func TestHandleRescueProjectOwnershipNotifiesForMissingJournalWithoutRescue(t *testing.T) {
+	const token = "rescue-token"
+	t.Setenv("ENGRAM_HTTP_TOKEN", token)
+	st := newServerTestStore(t)
+	if err := st.CreateSession("owned-session", "target", "/tmp"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	id, err := st.AddObservation(store.AddObservationParams{SessionID: "owned-session", Type: "note", Title: "owned", Content: "content", Project: "target"})
+	if err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+	if _, err := st.DB().Exec(`DELETE FROM sync_mutations WHERE entity_key = (SELECT sync_id FROM observations WHERE id = ?)`, id); err != nil {
+		t.Fatalf("clear observation mutation: %v", err)
+	}
+	srv := New(st, 0)
+	var writes int32
+	srv.SetOnWrite(func() { atomic.AddInt32(&writes, 1) })
+	req := httptest.NewRequest(http.MethodPost, "/projects/rescue-ownership", strings.NewReader(fmt.Sprintf(`{"target_project":"target","confirmed":true,"observation_ids":[%d]}`, id)))
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("rescue returned %d: %s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode rescue response: %v", err)
+	}
+	if response["rescued_observations"] != float64(0) || response["journaled_local"] != true {
+		t.Fatalf("unexpected rescue response: %#v", response)
+	}
+	if atomic.LoadInt32(&writes) != 1 {
+		t.Fatalf("autosync notification count = %d, want 1", writes)
+	}
+}
+
+func TestHandleRescueProjectOwnershipClassifiesValidationAndInfrastructureErrors(t *testing.T) {
+	const token = "rescue-token"
+	t.Setenv("ENGRAM_HTTP_TOKEN", token)
+	t.Run("validation", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/projects/rescue-ownership", strings.NewReader(`{"target_project":"target","confirmed":true,"prompt_ids":[0]}`))
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		New(newServerTestStore(t), 0).Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "positive record ID") {
+			t.Fatalf("validation response = %d: %s", rec.Code, rec.Body.String())
+		}
+	})
+	t.Run("infrastructure", func(t *testing.T) {
+		st := newServerTestStore(t)
+		srv := New(st, 0)
+		if err := st.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/projects/rescue-ownership", strings.NewReader(`{"target_project":"target","confirmed":true,"prompt_ids":[1]}`))
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusInternalServerError || strings.Contains(rec.Body.String(), "database is closed") {
+			t.Fatalf("infrastructure response = %d: %s", rec.Code, rec.Body.String())
+		}
+	})
 }
 
 func TestHandleSearchForwardsMatchModeAndAllProjects(t *testing.T) {

@@ -65,7 +65,87 @@ func TestProjectIdentityAdmissionRejectsEmptyWritesWithoutJournalState(t *testin
 	if _, err := s.AddPrompt(AddPromptParams{SessionID: "missing-project", Content: "content"}); !errors.Is(err, ErrProjectRequired) {
 		t.Fatalf("AddPrompt error = %v, want ErrProjectRequired", err)
 	}
+	if _, _, err := s.AddPromptIfMissing(AddPromptParams{SessionID: "missing-project", Content: "content"}); !errors.Is(err, ErrProjectRequired) {
+		t.Fatalf("AddPromptIfMissing error = %v, want ErrProjectRequired", err)
+	}
 	assertCounts(0, 0, 0, 0)
+}
+
+func newTestStoreWithNullableLegacySessions(t *testing.T, sessions ...struct{ id, project string }) *Store {
+	t.Helper()
+	cfg := mustDefaultConfig(t)
+	cfg.DataDir = t.TempDir()
+	raw, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE sessions (
+		id TEXT PRIMARY KEY,
+		project TEXT,
+		directory TEXT NOT NULL,
+		started_at TEXT NOT NULL DEFAULT (datetime('now')),
+		ended_at TEXT,
+		summary TEXT
+	)`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("create legacy sessions: %v", err)
+	}
+	for _, session := range sessions {
+		var project any = session.project
+		if session.project == "<NULL>" {
+			project = nil
+		}
+		if _, err := raw.Exec(`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)`, session.id, project, "/tmp"); err != nil {
+			_ = raw.Close()
+			t.Fatalf("seed legacy session %q: %v", session.id, err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close legacy database: %v", err)
+	}
+	s, err := New(cfg)
+	if err != nil {
+		t.Fatalf("open migrated legacy database: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+func TestProjectIdentityAdmissionRejectsNullableLegacySessionProjects(t *testing.T) {
+	type legacySession struct{ id, project string }
+	s := newTestStoreWithNullableLegacySessions(t,
+		legacySession{"null-session", "<NULL>"},
+		legacySession{"blank-session", " "},
+	)
+
+	tests := []struct {
+		name string
+		run  func(string) error
+	}{
+		{"observation with NULL project", func(sessionID string) error {
+			_, err := s.AddObservation(AddObservationParams{SessionID: sessionID, Type: "note", Title: "title", Content: "content"})
+			return err
+		}},
+		{"prompt with blank project", func(sessionID string) error {
+			_, err := s.AddPrompt(AddPromptParams{SessionID: sessionID, Content: "content"})
+			return err
+		}},
+		{"deduplicated prompt with NULL project", func(sessionID string) error {
+			_, _, err := s.AddPromptIfMissing(AddPromptParams{SessionID: sessionID, Content: "content"})
+			return err
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sessionID := "null-session"
+			if strings.Contains(tt.name, "blank") {
+				sessionID = "blank-session"
+			}
+			if err := tt.run(sessionID); !errors.Is(err, ErrProjectRequired) {
+				t.Fatalf("error = %v, want ErrProjectRequired", err)
+			}
+		})
+	}
 }
 
 func TestProjectIdentityAdmissionAllowsOwnedWritesAndRejectsReassignment(t *testing.T) {
@@ -99,11 +179,38 @@ func TestProjectIdentityAdmissionAllowsOwnedWritesAndRejectsReassignment(t *test
 
 func TestRescueNullProjectOwnershipRequiresExplicitScope(t *testing.T) {
 	s := newTestStore(t)
-	if _, err := s.RescueNullProjectOwnership(ProjectRescueParams{TargetProject: "target"}); err == nil {
-		t.Fatal("expected empty rescue scope to fail")
+	if _, err := s.RescueNullProjectOwnership(ProjectRescueParams{TargetProject: "target"}); !errors.Is(err, ErrProjectRescueInvalidRequest) {
+		t.Fatalf("empty rescue scope error = %v, want ErrProjectRescueInvalidRequest", err)
 	}
 	if _, err := s.RescueNullProjectOwnership(ProjectRescueParams{ObservationIDs: []int64{1}}); !errors.Is(err, ErrProjectRequired) {
 		t.Fatalf("missing target error = %v, want ErrProjectRequired", err)
+	}
+	if _, err := s.RescueNullProjectOwnership(ProjectRescueParams{TargetProject: "target", PromptIDs: []int64{0}}); !errors.Is(err, ErrProjectRescueInvalidRequest) {
+		t.Fatalf("invalid record id error = %v, want ErrProjectRescueInvalidRequest", err)
+	}
+	if _, err := s.RescueNullProjectOwnership(ProjectRescueParams{TargetProject: "target", SessionIDs: []string{" "}}); !errors.Is(err, ErrProjectRescueInvalidRequest) {
+		t.Fatalf("blank session id error = %v, want ErrProjectRescueInvalidRequest", err)
+	}
+}
+
+func TestRescueNullProjectOwnershipRescuesLegacyNullableSessionAndJournalsOnce(t *testing.T) {
+	type legacySession struct{ id, project string }
+	s := newTestStoreWithNullableLegacySessions(t, legacySession{"legacy-session", "<NULL>"})
+
+	result, err := s.RescueNullProjectOwnership(ProjectRescueParams{TargetProject: "target", SessionIDs: []string{"legacy-session"}})
+	if err != nil {
+		t.Fatalf("RescueNullProjectOwnership: %v", err)
+	}
+	if result.RescuedSessions != 1 || result.Rescued() != 1 || !result.Journaled {
+		t.Fatalf("rescue result = %#v, want one rescued journaled session", result)
+	}
+	var project string
+	if err := s.DB().QueryRow(`SELECT project FROM sessions WHERE id = ?`, "legacy-session").Scan(&project); err != nil || project != "target" {
+		t.Fatalf("rescued session project = %q, err=%v, want target", project, err)
+	}
+	var mutations int
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE entity = ? AND entity_key = ? AND project = ? AND acked_at IS NULL`, SyncEntitySession, "legacy-session", "target").Scan(&mutations); err != nil || mutations != 1 {
+		t.Fatalf("canonical session mutations = %d, err=%v, want 1", mutations, err)
 	}
 }
 

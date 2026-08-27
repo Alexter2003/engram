@@ -73,6 +73,8 @@ var (
 
 	// detectProject is injectable for testing; wraps project.DetectProject.
 	detectProject = project.DetectProject
+	// detectProjectFull is injectable for commands that require unambiguous identity.
+	detectProjectFull = project.DetectProjectFull
 
 	newTUIModel   = func(s *store.Store) tui.Model { return tui.New(s, version) }
 	newTeaProgram = tea.NewProgram
@@ -1039,7 +1041,7 @@ func cmdSave(cfg store.Config) {
 		return
 	}
 	if strings.TrimSpace(projectName) == "" {
-		resolved := project.DetectProjectFull(cwd)
+		resolved := detectProjectFull(cwd)
 		if resolved.Error != nil || strings.TrimSpace(resolved.Project) == "" {
 			if resolved.Error != nil {
 				fatal(fmt.Errorf("cannot save without an unambiguous project identity: %w; use --project <name>", resolved.Error))
@@ -1050,7 +1052,11 @@ func cmdSave(cfg store.Config) {
 		}
 		projectName = resolved.Project
 	}
-	projectName, _ = store.NormalizeProject(projectName)
+	var warning string
+	projectName, warning = store.NormalizeProject(projectName)
+	if warning != "" {
+		fmt.Fprintln(os.Stderr, warning)
+	}
 	if strings.TrimSpace(projectName) == "" {
 		fatal(errors.New("cannot save without an unambiguous project identity; use --project <name>"))
 		return
@@ -1062,10 +1068,7 @@ func cmdSave(cfg store.Config) {
 	}
 	defer s.Close()
 
-	sessionID := "manual-save"
-	if projectName != "" {
-		sessionID = "manual-save-" + projectName
-	}
+	sessionID := "manual-save-" + projectName
 	if err := s.CreateSession(sessionID, projectName, cwd); err != nil {
 		fatal(err)
 	}

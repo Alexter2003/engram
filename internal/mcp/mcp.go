@@ -1431,10 +1431,10 @@ func handleUpdate(s *store.Store) server.ToolHandlerFunc {
 			storedProject, _ = store.NormalizeProject(*obs.Project)
 		}
 		if storedProject == "" {
-			return mcp.NewToolResultError("Failed to update memory: " + store.ErrProjectRequired.Error()), nil
+			return errorWithMeta("project_required", "The stored observation has no project identity", knownWriteProjects(s, detRes)), nil
 		}
 		if storedProject != resolvedProject {
-			return mcp.NewToolResultError("Failed to update memory: resolved project does not match the observation project"), nil
+			return errorWithMeta("project_mismatch", "The current project does not own this observation", knownWriteProjects(s, detRes)), nil
 		}
 
 		var contentLen int
@@ -2951,6 +2951,10 @@ func errorWithMeta(code, msg string, availableProjects []string) *mcp.CallToolRe
 		envelope["hint"] = "Start the session first, omit session_id, or retry with an existing session_id."
 	case "session_project_mismatch":
 		envelope["hint"] = "Use a project that matches the existing session, or omit session_id and write to a different project."
+	case "project_required":
+		envelope["hint"] = "Use ownership rescue before updating this historical record, then retry the field update."
+	case "project_mismatch":
+		envelope["hint"] = "Switch to the observation's owning project, then retry the field update."
 	}
 	out, _ := jsonMarshal(envelope)
 	result := mcp.NewToolResultText(string(out))

@@ -54,6 +54,7 @@ var (
 	ErrPromptNotFound              = errors.New("prompt not found")
 	ErrProjectNotFound             = errors.New("project not found")
 	ErrProjectRequired             = errors.New("project identity is required")
+	ErrProjectRescueInvalidRequest = errors.New("project rescue request is invalid")
 	ErrObservationProjectImmutable = errors.New("observation project cannot be reassigned")
 	ErrObservationTitleRequired    = errors.New("observation title is required")
 	ErrObservationContentRequired  = errors.New("observation content is required")
@@ -2369,16 +2370,10 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 	var observationID int64
 	err := s.withTx(func(tx *sql.Tx) error {
 		if strings.TrimSpace(p.Project) == "" {
-			var sessionProject string
-			if err := tx.QueryRow(`SELECT project FROM sessions WHERE id = ?`, p.SessionID).Scan(&sessionProject); err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					return ErrProjectRequired
-				}
+			var err error
+			p.Project, err = requiredSessionProjectTx(tx, p.SessionID)
+			if err != nil {
 				return err
-			}
-			p.Project, _ = NormalizeProject(sessionProject)
-			if strings.TrimSpace(p.Project) == "" {
-				return ErrProjectRequired
 			}
 		}
 		var obs *Observation
@@ -2694,15 +2689,10 @@ func (s *Store) AddPrompt(p AddPromptParams) (int64, error) {
 	var promptID int64
 	err := s.withTx(func(tx *sql.Tx) error {
 		if strings.TrimSpace(p.Project) == "" {
-			if err := tx.QueryRow(`SELECT project FROM sessions WHERE id = ?`, p.SessionID).Scan(&p.Project); err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					return ErrProjectRequired
-				}
+			var err error
+			p.Project, err = requiredSessionProjectTx(tx, p.SessionID)
+			if err != nil {
 				return err
-			}
-			p.Project, _ = NormalizeProject(p.Project)
-			if strings.TrimSpace(p.Project) == "" {
-				return ErrProjectRequired
 			}
 		}
 		syncID := newSyncID("prompt")
@@ -2749,15 +2739,10 @@ func (s *Store) AddPromptIfMissing(p AddPromptParams) (int64, bool, error) {
 	inserted := false
 	err := s.withTx(func(tx *sql.Tx) error {
 		if strings.TrimSpace(p.Project) == "" {
-			if err := tx.QueryRow(`SELECT project FROM sessions WHERE id = ?`, p.SessionID).Scan(&p.Project); err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					return ErrProjectRequired
-				}
+			var err error
+			p.Project, err = requiredSessionProjectTx(tx, p.SessionID)
+			if err != nil {
 				return err
-			}
-			p.Project, _ = NormalizeProject(p.Project)
-			if strings.TrimSpace(p.Project) == "" {
-				return ErrProjectRequired
 			}
 		}
 		err := tx.QueryRow(
@@ -4765,8 +4750,9 @@ type ProjectRescueParams struct {
 	PromptIDs      []int64
 }
 
-// ProjectRescueResult reports local ownership recovery. Journaled means local
-// canonical mutations were enqueued; it does not imply a cloud acknowledgement.
+// ProjectRescueResult reports local ownership recovery. Journaled means a
+// canonical pending local mutation exists after the call, whether newly
+// inserted or already pending; it does not imply a cloud acknowledgement.
 type ProjectRescueResult struct {
 	RescuedObservations int64 `json:"rescued_observations"`
 	RescuedSessions     int64 `json:"rescued_sessions"`
@@ -4788,28 +4774,28 @@ func (s *Store) RescueNullProjectOwnership(p ProjectRescueParams) (*ProjectRescu
 		return nil, ErrProjectRequired
 	}
 	if len(p.ObservationIDs) == 0 && len(p.SessionIDs) == 0 && len(p.PromptIDs) == 0 {
-		return nil, fmt.Errorf("project rescue requires at least one record id")
+		return nil, fmt.Errorf("%w: at least one record id is required", ErrProjectRescueInvalidRequest)
 	}
 	for _, id := range append(append([]int64{}, p.ObservationIDs...), p.PromptIDs...) {
 		if id <= 0 {
-			return nil, fmt.Errorf("project rescue record ids must be positive")
+			return nil, fmt.Errorf("%w: record ids must be positive", ErrProjectRescueInvalidRequest)
 		}
 	}
 	for _, id := range p.SessionIDs {
 		if strings.TrimSpace(id) == "" {
-			return nil, fmt.Errorf("project rescue session ids must not be blank")
+			return nil, fmt.Errorf("%w: session ids must not be blank", ErrProjectRescueInvalidRequest)
 		}
 	}
 
 	result := &ProjectRescueResult{}
 	err := s.withTx(func(tx *sql.Tx) error {
 		var err error
-		result.RescuedObservations, result.ConflictingRecords, result.SkippedRecords, err = rescueNullProjectIDsTx(tx, "observations", "id", p.ObservationIDs, target)
+		result.RescuedObservations, result.ConflictingRecords, result.SkippedRecords, err = rescueNullProjectIDsTx(tx, rescueObservationQuery, p.ObservationIDs, target)
 		if err != nil {
 			return err
 		}
 		var conflicts, skipped int64
-		result.RescuedPrompts, conflicts, skipped, err = rescueNullProjectIDsTx(tx, "user_prompts", "id", p.PromptIDs, target)
+		result.RescuedPrompts, conflicts, skipped, err = rescueNullProjectIDsTx(tx, rescuePromptQuery, p.PromptIDs, target)
 		if err != nil {
 			return err
 		}
@@ -4835,10 +4821,26 @@ func (s *Store) RescueNullProjectOwnership(p ProjectRescueParams) (*ProjectRescu
 	return result, nil
 }
 
-func rescueNullProjectIDsTx(tx *sql.Tx, table, idColumn string, ids []int64, target string) (rescued, conflicts, skipped int64, err error) {
+type rescueRecordQuery struct {
+	selectProject string
+	updateProject string
+}
+
+var (
+	rescueObservationQuery = rescueRecordQuery{
+		selectProject: `SELECT project FROM observations WHERE id = ?`,
+		updateProject: `UPDATE observations SET project = ? WHERE id = ? AND project IS NULL`,
+	}
+	rescuePromptQuery = rescueRecordQuery{
+		selectProject: `SELECT project FROM user_prompts WHERE id = ?`,
+		updateProject: `UPDATE user_prompts SET project = ? WHERE id = ? AND project IS NULL`,
+	}
+)
+
+func rescueNullProjectIDsTx(tx *sql.Tx, query rescueRecordQuery, ids []int64, target string) (rescued, conflicts, skipped int64, err error) {
 	for _, id := range ids {
 		var project sql.NullString
-		err = tx.QueryRow(`SELECT project FROM `+table+` WHERE `+idColumn+` = ?`, id).Scan(&project)
+		err = tx.QueryRow(query.selectProject, id).Scan(&project)
 		if errors.Is(err, sql.ErrNoRows) {
 			skipped++
 			continue
@@ -4855,7 +4857,7 @@ func rescueNullProjectIDsTx(tx *sql.Tx, table, idColumn string, ids []int64, tar
 			}
 			continue
 		}
-		res, execErr := tx.Exec(`UPDATE `+table+` SET project = ? WHERE `+idColumn+` = ? AND project IS NULL`, target, id)
+		res, execErr := tx.Exec(query.updateProject, target, id)
 		if execErr != nil {
 			err = execErr
 			return
@@ -6198,6 +6200,25 @@ func (s *Store) resolveSessionProjectTx(tx *sql.Tx, sessionID string) (string, e
 	}
 	project, _ = NormalizeProject(strings.TrimSpace(project))
 	return project, nil
+}
+
+func requiredSessionProjectTx(tx *sql.Tx, sessionID string) (string, error) {
+	var project sql.NullString
+	err := tx.QueryRow(`SELECT project FROM sessions WHERE id = ?`, sessionID).Scan(&project)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrProjectRequired
+	}
+	if err != nil {
+		return "", err
+	}
+	if !project.Valid {
+		return "", ErrProjectRequired
+	}
+	normalized, _ := NormalizeProject(project.String)
+	if strings.TrimSpace(normalized) == "" {
+		return "", ErrProjectRequired
+	}
+	return normalized, nil
 }
 
 func (s *Store) applyPulledMutationTx(tx *sql.Tx, mutation SyncMutation) error {

@@ -14,6 +14,7 @@ import (
 
 	"github.com/Gentleman-Programming/engram/internal/mcp"
 	"github.com/Gentleman-Programming/engram/internal/obsidian"
+	"github.com/Gentleman-Programming/engram/internal/project"
 	"github.com/Gentleman-Programming/engram/internal/setup"
 	"github.com/Gentleman-Programming/engram/internal/store"
 	engramsync "github.com/Gentleman-Programming/engram/internal/sync"
@@ -487,6 +488,7 @@ func TestCmdSaveAndSearch(t *testing.T) {
 }
 
 func TestCmdSaveResolvesConfiguredProjectWithoutFlag(t *testing.T) {
+	stubExitWithPanic(t)
 	cfg := testConfig(t)
 	cwd := t.TempDir()
 	configDir := filepath.Join(cwd, ".engram")
@@ -520,6 +522,40 @@ func TestCmdSaveResolvesConfiguredProjectWithoutFlag(t *testing.T) {
 	var mutations int
 	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE project = ?`, "configured-project").Scan(&mutations); err != nil || mutations != 2 {
 		t.Fatalf("resolved journal mutations = %d, err=%v, want 2", mutations, err)
+	}
+}
+
+func TestCmdSaveUsesDetectionSeamAndPrintsNormalizationWarning(t *testing.T) {
+	stubExitWithPanic(t)
+	cfg := testConfig(t)
+	cwd := t.TempDir()
+	withCwd(t, cwd)
+	withArgs(t, "engram", "save", "resolved-title", "resolved-content")
+
+	originalDetectProjectFull := detectProjectFull
+	detectProjectFull = func(gotCWD string) project.DetectionResult {
+		if gotCWD != cwd {
+			t.Fatalf("detection cwd = %q, want %q", gotCWD, cwd)
+		}
+		return project.DetectionResult{Project: " Configured--Project "}
+	}
+	t.Cleanup(func() { detectProjectFull = originalDetectProjectFull })
+
+	stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdSave(cfg) })
+	if recovered != nil || !strings.Contains(stdout, "Memory saved:") {
+		t.Fatalf("cmdSave result = stdout %q stderr %q panic %v", stdout, stderr, recovered)
+	}
+	if !strings.Contains(stderr, `Project name normalized: " Configured--Project " → "configured-project"`) {
+		t.Fatalf("normalization warning = %q", stderr)
+	}
+
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+	if _, err := s.GetSession("manual-save-configured-project"); err != nil {
+		t.Fatalf("normalized manual session: %v", err)
 	}
 }
 

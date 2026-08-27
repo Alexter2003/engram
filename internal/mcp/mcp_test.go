@@ -1604,7 +1604,6 @@ func TestHandleUpdateAcceptsAllOptionalFields(t *testing.T) {
 		"title":     "Updated",
 		"content":   "Updated content",
 		"type":      "architecture",
-		"project":   "engram",
 		"scope":     "personal",
 		"topic_key": "architecture/auth-model",
 	}}})
@@ -1613,6 +1612,100 @@ func TestHandleUpdateAcceptsAllOptionalFields(t *testing.T) {
 	}
 	if res.IsError {
 		t.Fatalf("unexpected update error: %s", callResultText(t, res))
+	}
+}
+
+func TestHandleUpdateRejectsFieldOnlyUpdateFromDifferentDetectedProject(t *testing.T) {
+	s := newMCPTestStore(t)
+	if err := s.CreateSession("s-stored-project", "stored-project", "/tmp/stored-project"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	id, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s-stored-project",
+		Type:      "note",
+		Title:     "Original",
+		Content:   "Original content",
+		Project:   "stored-project",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	cwd := t.TempDir()
+	if err := os.Mkdir(filepath.Join(cwd, ".engram"), 0755); err != nil {
+		t.Fatalf("create detected-project configuration: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, ".engram", "config.json"), []byte(`{"project_name":"different-project"}`), 0644); err != nil {
+		t.Fatalf("write detected-project configuration: %v", err)
+	}
+	t.Chdir(cwd)
+
+	res, err := handleUpdate(s)(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"id":    float64(id),
+		"title": "Updated from another project",
+	}}})
+	if err != nil {
+		t.Fatalf("update handler error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("expected field-only update from another project to fail")
+	}
+	envelope := callResultJSON(t, res)
+	if envelope["error_code"] != "project_mismatch" {
+		t.Fatalf("error code = %v, want project_mismatch", envelope["error_code"])
+	}
+	if _, ok := envelope["available_projects"].([]any); !ok {
+		t.Fatalf("available_projects = %#v, want array", envelope["available_projects"])
+	}
+	if hint, _ := envelope["hint"].(string); !strings.Contains(hint, "owning project") {
+		t.Fatalf("hint = %q, want owning-project guidance", hint)
+	}
+	updated, err := s.GetObservation(id)
+	if err != nil || updated.Title != "Original" {
+		t.Fatalf("updated observation = %#v, err=%v", updated, err)
+	}
+}
+
+func TestHandleUpdateRejectsNullOwnedObservationWithStructuredMetadata(t *testing.T) {
+	s := newMCPTestStore(t)
+	if err := s.CreateSession("s-owned", "owned-project", "/tmp/owned-project"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	id, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s-owned",
+		Type:      "note",
+		Title:     "Original",
+		Content:   "Original content",
+		Project:   "owned-project",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+	if _, err := s.DB().Exec(`UPDATE observations SET project = NULL WHERE id = ?`, id); err != nil {
+		t.Fatalf("clear observation project: %v", err)
+	}
+
+	res, err := handleUpdate(s)(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"id":    float64(id),
+		"title": "Updated",
+	}}})
+	if err != nil {
+		t.Fatalf("update handler error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("expected NULL-owned observation update to fail")
+	}
+	envelope := callResultJSON(t, res)
+	if envelope["error_code"] != "project_required" {
+		t.Fatalf("error code = %v, want project_required", envelope["error_code"])
+	}
+	if _, ok := envelope["available_projects"].([]any); !ok {
+		t.Fatalf("available_projects = %#v, want array", envelope["available_projects"])
+	}
+	if hint, _ := envelope["hint"].(string); !strings.Contains(hint, "ownership rescue") {
+		t.Fatalf("hint = %q, want ownership rescue guidance", hint)
 	}
 }
 

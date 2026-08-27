@@ -238,9 +238,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /stats", s.handleStats)
 	s.mux.HandleFunc("GET /doctor", s.handleDoctor)
 
-	// Project detection / migration
+	// Project detection / ownership rescue
 	s.mux.HandleFunc("GET /project/current", s.handleCurrentProject)
-	s.mux.HandleFunc("POST /projects/migrate", requireConfiguredAuth(s.handleMigrateProject))
+	s.mux.HandleFunc("POST /projects/rescue-ownership", requireConfiguredAuth(s.handleRescueProjectOwnership))
+	// Deprecated compatibility alias for older clients.
+	s.mux.HandleFunc("POST /projects/migrate", requireConfiguredAuth(s.handleRescueProjectOwnership))
 
 	// Sync status (degraded-state visibility for autosync)
 	s.mux.HandleFunc("GET /sync/status", s.handleSyncStatus)
@@ -970,9 +972,9 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ─── Project Migration ───────────────────────────────────────────────────────
+// ─── Project Ownership Rescue ─────────────────────────────────────────────────
 
-func (s *Server) handleMigrateProject(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleRescueProjectOwnership(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 8<<10) // 8 KB max
 	var body struct {
 		TargetProject  string   `json:"target_project"`
@@ -1001,11 +1003,15 @@ func (s *Server) handleMigrateProject(w http.ResponseWriter, r *http.Request) {
 		PromptIDs:      body.PromptIDs,
 	})
 	if err != nil {
+		if errors.Is(err, store.ErrProjectRequired) || errors.Is(err, store.ErrProjectRescueInvalidRequest) {
+			jsonError(w, http.StatusBadRequest, "invalid ownership rescue request: provide a target project and at least one positive record ID or non-blank session ID")
+			return
+		}
 		log.Printf("[engram] project ownership rescue failed: %v", err)
-		jsonError(w, http.StatusBadRequest, err.Error())
+		jsonError(w, http.StatusInternalServerError, "project ownership rescue is temporarily unavailable")
 		return
 	}
-	if result.Rescued() > 0 {
+	if result.Rescued() > 0 || result.Journaled {
 		s.notifyWrite()
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{
