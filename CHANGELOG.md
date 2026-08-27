@@ -23,7 +23,7 @@ Breaking changes are always marked with a `type:breaking-change` label and docum
 
 ### Memory core
 
-- **fix(store):** reject empty or whitespace-only observation titles at write time (`engram save`, `mem_save`, `POST /observations`, `store.AddObservation`). Persisting a titleless observation also enqueued a cloud upsert that sync validators reject, which blocked every later mutation for the project.
+- **fix(store):** reject empty or whitespace-only observation titles consistently on create and update, before any side effect. `engram save` and `mem_save` now refuse a titleless write before opening the store or creating a session, `POST /observations` validates the title before the session lookup so a bad session or project can no longer mask the documented `400`, and `PATCH /observations/{id}` answers `400` rather than `404`. Persisting a titleless observation also enqueues a cloud upsert that the sync validators reject, which blocks every later mutation for the project.
 
 ### Cloud sync
 

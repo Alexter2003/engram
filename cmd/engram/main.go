@@ -232,6 +232,7 @@ func (a *mutationTransportAdapter) PullMutations(sinceSeq int64, limit int) (*au
 	for i, m := range resp.Mutations {
 		mutations[i] = autosync.PulledMutation{
 			Seq:        m.Seq,
+			Project:    m.Project,
 			Entity:     m.Entity,
 			EntityKey:  m.EntityKey,
 			Op:         m.Op,
@@ -1528,7 +1529,7 @@ func cmdSync(cfg store.Config) {
 		markCloudHealthy()
 	}
 
-	sy = engramsync.NewLocal(s, syncDir)
+	sy = engramsync.NewLocalWithProject(s, syncDir, project)
 	if cloudEnabled {
 		cc, err := preflightCloudSync(s, cfg, project, !doStatus)
 		if err != nil {
@@ -1581,6 +1582,7 @@ func cmdSync(cfg store.Config) {
 			if result.ChunksSkipped > 0 {
 				fmt.Printf("  (%d chunks already imported)\n", result.ChunksSkipped)
 			}
+			printImportRelationCounts(result)
 			return
 		}
 
@@ -1595,6 +1597,7 @@ func cmdSync(cfg store.Config) {
 		if result.ChunksSkipped > 0 {
 			fmt.Printf("  Skipped:      %d (already imported)\n", result.ChunksSkipped)
 		}
+		printImportRelationCounts(result)
 		return
 	}
 
@@ -1628,7 +1631,11 @@ func cmdSync(cfg store.Config) {
 		return
 	}
 
-	fmt.Printf("Created chunk %s\n", result.ChunkID)
+	if result.ChunksExported > 1 {
+		fmt.Printf("Created %d chunks (last %s)\n", result.ChunksExported, result.ChunkID)
+	} else {
+		fmt.Printf("Created chunk %s\n", result.ChunkID)
+	}
 	fmt.Printf("  Sessions:     %d\n", result.SessionsExported)
 	fmt.Printf("  Observations: %d\n", result.ObservationsExported)
 	fmt.Printf("  Prompts:      %d\n", result.PromptsExported)
@@ -1642,6 +1649,12 @@ func cmdSync(cfg store.Config) {
 	fmt.Println()
 	fmt.Println("Add to git:")
 	fmt.Printf("  git add .engram/ && git commit -m \"sync engram memories\"\n")
+}
+
+func printImportRelationCounts(result *engramsync.ImportResult) {
+	fmt.Printf("  Relations replayed: %d\n", result.RelationsReplayed)
+	fmt.Printf("  Relations deferred: %d\n", result.RelationsDeferred)
+	fmt.Printf("  Relations dead:     %d\n", result.RelationsDead)
 }
 
 func printSyncUsage() {

@@ -11,27 +11,33 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Gentleman-Programming/engram/internal/project"
 	"github.com/Gentleman-Programming/engram/internal/store"
 	mcppkg "github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 )
 
 func newMCPTestStore(t *testing.T) *store.Store {
-	t.Helper()
+	return newMCPTestStoreWithMaxContentLength(t, 0)
+}
+
+func newMCPTestStoreWithMaxContentLength(t *testing.T, maxContentLength int) *store.Store {
 	cfg, err := store.DefaultConfig()
 	if err != nil {
 		t.Fatalf("DefaultConfig: %v", err)
 	}
 	cfg.DataDir = t.TempDir()
+	if maxContentLength > 0 {
+		cfg.MaxObservationLength = maxContentLength
+	}
 
 	s, err := store.New(cfg)
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
-	t.Cleanup(func() {
-		_ = s.Close()
-	})
+	t.Cleanup(func() { _ = s.Close() })
 	return s
 }
 
@@ -87,6 +93,160 @@ func countPromptUpsertSyncMutations(t *testing.T, s *store.Store) int {
 		}
 	}
 	return count
+}
+
+func assertTruncationMetadata(t *testing.T, body map[string]any, originalBytes, limitBytes int, truncated bool) {
+	metadata, ok := body["truncation"].(map[string]any)
+	if !ok || metadata["original_bytes"] != float64(originalBytes) || metadata["limit_bytes"] != float64(limitBytes) || metadata["truncated"] != truncated {
+		t.Fatalf("truncation metadata = %v, want bytes=%d/%d truncated=%v", metadata, originalBytes, limitBytes, truncated)
+	}
+}
+
+func TestMCPWriteToolsReportByteTruncation(t *testing.T) {
+	const (
+		content = "a😀z"
+		limit   = 5
+		want    = "a😀... [truncated]"
+	)
+
+	tests := []struct {
+		name  string
+		write func(*testing.T, *store.Store) (*mcppkg.CallToolResult, string)
+	}{
+		{
+			name: "mem_save",
+			write: func(t *testing.T, s *store.Store) (*mcppkg.CallToolResult, string) {
+				res, err := handleSave(s, MCPConfig{}, nil)(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"title": "UTF-8 save", "content": content, "project": "engram"}}})
+				if err != nil {
+					t.Fatalf("mem_save: %v", err)
+				}
+				observations, err := s.RecentObservations("engram", "project", 1)
+				if err != nil {
+					t.Fatalf("recent observations: %v", err)
+				}
+				return res, observations[0].Content
+			},
+		},
+		{
+			name: "mem_update",
+			write: func(t *testing.T, s *store.Store) (*mcppkg.CallToolResult, string) {
+				if err := s.CreateSession("s1", "engram", "/tmp/engram"); err != nil {
+					t.Fatalf("create session: %v", err)
+				}
+				id, err := s.AddObservation(store.AddObservationParams{SessionID: "s1", Type: "bugfix", Title: "Before", Content: "before", Project: "engram", Scope: "project"})
+				if err != nil {
+					t.Fatalf("seed observation: %v", err)
+				}
+				res, err := handleUpdate(s)(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"id": float64(id), "content": content}}})
+				if err != nil {
+					t.Fatalf("mem_update: %v", err)
+				}
+				observation, err := s.GetObservation(id)
+				if err != nil {
+					t.Fatalf("get observation: %v", err)
+				}
+				return res, observation.Content
+			},
+		},
+		{
+			name: "mem_save_prompt",
+			write: func(t *testing.T, s *store.Store) (*mcppkg.CallToolResult, string) {
+				res, err := handleSavePrompt(s, MCPConfig{}, nil)(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"content": content, "project": "engram"}}})
+				if err != nil {
+					t.Fatalf("mem_save_prompt: %v", err)
+				}
+				prompts, err := s.RecentPrompts("engram", 1)
+				if err != nil {
+					t.Fatalf("recent prompts: %v", err)
+				}
+				return res, prompts[0].Content
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newMCPTestStoreWithMaxContentLength(t, limit)
+			res, persisted := tc.write(t, s)
+			if persisted != want || !utf8.ValidString(persisted) {
+				t.Fatalf("persisted content = %q, want valid UTF-8 %q", persisted, want)
+			}
+			body := callResultJSON(t, res)
+			assertTruncationMetadata(t, body, len(content), limit, true)
+			result, _ := body["result"].(string)
+			if !strings.Contains(result, "from 6 to 5 bytes") || strings.Contains(result, "chars") {
+				t.Fatalf("expected byte warning, got %q", result)
+			}
+		})
+	}
+}
+
+func TestMCPTruncationUsesRedactedByteCounts(t *testing.T) {
+	const redacted = "ok[REDACTED]"
+	content := "ok<private>" + strings.Repeat("secret", 10) + "</private>"
+
+	for _, tc := range []struct {
+		name  string
+		write func(*testing.T, *store.Store) *mcppkg.CallToolResult
+	}{
+		{
+			name: "mem_save",
+			write: func(t *testing.T, s *store.Store) *mcppkg.CallToolResult {
+				res, err := handleSave(s, MCPConfig{}, nil)(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"title": "Redacted save", "content": content, "project": "engram"}}})
+				if err != nil {
+					t.Fatalf("mem_save: %v", err)
+				}
+				return res
+			},
+		},
+		{
+			name: "mem_update",
+			write: func(t *testing.T, s *store.Store) *mcppkg.CallToolResult {
+				if err := s.CreateSession("s1", "engram", "/tmp/engram"); err != nil {
+					t.Fatalf("create session: %v", err)
+				}
+				id, err := s.AddObservation(store.AddObservationParams{SessionID: "s1", Type: "bugfix", Title: "Before", Content: "before", Project: "engram", Scope: "project"})
+				if err != nil {
+					t.Fatalf("seed observation: %v", err)
+				}
+				res, err := handleUpdate(s)(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"id": float64(id), "content": content}}})
+				if err != nil {
+					t.Fatalf("mem_update: %v", err)
+				}
+				return res
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newMCPTestStoreWithMaxContentLength(t, len(redacted))
+			res := tc.write(t, s)
+			body := callResultJSON(t, res)
+			assertTruncationMetadata(t, body, len(redacted), len(redacted), false)
+			if result, _ := body["result"].(string); strings.Contains(result, "WARNING") {
+				t.Fatalf("redacted content below limit must not warn: %q", result)
+			}
+		})
+	}
+}
+
+func TestMCPTruncationMetadataKeepsSchemasAndNormalResponsesCompatible(t *testing.T) {
+	s := newMCPTestStore(t)
+	srv := NewServer(s)
+	for toolName, field := range map[string]string{"mem_save": "observation", "mem_update": "topic_key", "mem_save_prompt": "project"} {
+		props := srv.GetTool(toolName).Tool.InputSchema.Properties
+		if _, ok := props[field]; !ok {
+			t.Errorf("%s schema lost %q", toolName, field)
+		}
+		if _, ok := props["truncation"]; ok {
+			t.Errorf("%s must not add truncation to its input schema", toolName)
+		}
+	}
+	res, err := handleSave(s, MCPConfig{}, nil)(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"title": "Normal", "content": "short", "project": "engram"}}})
+	if err != nil || res.IsError {
+		t.Fatalf("normal mem_save failed: err=%v result=%q", err, callResultText(t, res))
+	}
+	body := callResultJSON(t, res)
+	assertTruncationMetadata(t, body, len("short"), s.MaxObservationLength(), false)
 }
 
 func TestNewServerRegistersTools(t *testing.T) {
@@ -292,6 +452,71 @@ func TestHandleSaveRejectsMissingContent(t *testing.T) {
 	}
 	if len(obs) != 0 {
 		t.Fatalf("expected no observation to be written, got %#v", obs)
+	}
+}
+
+func TestSaveHandlersExposeStoreAdmissionErrors(t *testing.T) {
+	tests := []struct {
+		name      string
+		handler   server.ToolHandlerFunc
+		arguments map[string]any
+		wantError string
+		countRows func(*store.Store) (int, error)
+	}{
+		{
+			name:      "observation title",
+			arguments: map[string]any{"title": " \t\n ", "content": "valid content", "project": "engram"},
+			wantError: "Failed to save: observation title is required",
+			countRows: func(s *store.Store) (int, error) {
+				var count int
+				err := s.DB().QueryRow(`SELECT count(*) FROM observations`).Scan(&count)
+				return count, err
+			},
+		},
+		{
+			name:      "prompt content",
+			arguments: map[string]any{"content": " \t\n ", "project": "engram"},
+			wantError: "Failed to save prompt: prompt content is required",
+			countRows: func(s *store.Store) (int, error) {
+				var count int
+				err := s.DB().QueryRow(`SELECT count(*) FROM user_prompts`).Scan(&count)
+				return count, err
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newMCPTestStore(t)
+			if tc.name == "observation title" {
+				tc.handler = handleSave(s, MCPConfig{}, nil)
+			} else {
+				tc.handler = handleSavePrompt(s, MCPConfig{}, nil)
+			}
+
+			before, err := tc.countRows(s)
+			if err != nil {
+				t.Fatalf("count rows before invalid write: %v", err)
+			}
+			res, err := tc.handler(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: tc.arguments}})
+			if err != nil {
+				t.Fatalf("handler error: %v", err)
+			}
+			if !res.IsError {
+				t.Fatalf("expected tool error, got %q", callResultText(t, res))
+			}
+			if got := callResultText(t, res); got != tc.wantError {
+				t.Fatalf("expected error %q, got %q", tc.wantError, got)
+			}
+
+			after, err := tc.countRows(s)
+			if err != nil {
+				t.Fatalf("count rows after invalid write: %v", err)
+			}
+			if after != before {
+				t.Fatalf("invalid write persisted a primary row: %d->%d", before, after)
+			}
+		})
 	}
 }
 
@@ -918,6 +1143,41 @@ func TestHandleSearchAndCRUDHandlers(t *testing.T) {
 	}
 }
 
+func TestHandleSearch_PropagatesCanceledContext(t *testing.T) {
+	s := newMCPTestStore(t)
+	if err := s.CreateSession("s-canceled-search", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s-canceled-search",
+		Type:      "decision",
+		Title:     "Canceled search must stop",
+		Content:   "Search cancellation is observable at the handler boundary.",
+		Project:   "engram",
+		Scope:     "project",
+	}); err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result, err := handleSearch(s, MCPConfig{}, NewSessionActivity(10*time.Minute))(ctx, mcppkg.CallToolRequest{
+		Params: mcppkg.CallToolParams{Arguments: map[string]any{
+			"query":   "canceled search",
+			"project": "engram",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("handle search: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("expected canceled search to be a tool error, got %s", callResultText(t, result))
+	}
+	if !strings.Contains(callResultText(t, result), context.Canceled.Error()) {
+		t.Fatalf("expected cancellation error, got %s", callResultText(t, result))
+	}
+}
+
 func TestHandleSaveReturnsLifecycleState(t *testing.T) {
 	s := newMCPTestStore(t)
 	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
@@ -1161,6 +1421,43 @@ func TestHandlePromptContextStatsTimelineAndSessionHandlers(t *testing.T) {
 	}
 	if endRes.IsError {
 		t.Fatalf("unexpected session end error: %s", callResultText(t, endRes))
+	}
+}
+
+func TestMemContextRemainsProjectScopedAcrossSessions(t *testing.T) {
+	s := newMCPTestStore(t)
+	for _, sessionID := range []string{"manual-a", "manual-b"} {
+		if err := s.CreateSession(sessionID, "engram", "/tmp/engram"); err != nil {
+			t.Fatalf("create %s: %v", sessionID, err)
+		}
+		if _, err := s.AddObservation(store.AddObservationParams{
+			SessionID: sessionID,
+			Type:      "decision",
+			Title:     sessionID,
+			Content:   "content-" + sessionID,
+			Project:   "engram",
+			Scope:     "project",
+		}); err != nil {
+			t.Fatalf("add %s observation: %v", sessionID, err)
+		}
+	}
+
+	h := handleContext(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"project": "engram",
+		"scope":   "project",
+	}}})
+	if err != nil {
+		t.Fatalf("mem_context handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected mem_context error: %s", callResultText(t, res))
+	}
+	context := callResultText(t, res)
+	for _, value := range []string{"manual-a", "manual-b"} {
+		if !strings.Contains(context, value) {
+			t.Fatalf("manual mem_context must remain project-scoped and include %q:\n%s", value, context)
+		}
 	}
 }
 
@@ -7376,7 +7673,7 @@ func seedMCPMatchModeFixture(t *testing.T, s *store.Store) {
 		t.Fatalf("create session: %v", err)
 	}
 	obs := []store.AddObservationParams{
-		{SessionID: "s-mcp-matchmode", Type: "decision", Title: "Auth session middleware", Content: "", Project: "engram", Scope: "project"},
+		{SessionID: "s-mcp-matchmode", Type: "decision", Title: "Auth session middleware", Content: "request routing layer", Project: "engram", Scope: "project"},
 		{SessionID: "s-mcp-matchmode", Type: "decision", Title: "Compliance audit notes", Content: "session policy", Project: "engram", Scope: "project"},
 		{SessionID: "s-mcp-matchmode", Type: "decision", Title: "OAuth tokens", Content: "auth and compliance", Project: "engram", Scope: "project"},
 	}
