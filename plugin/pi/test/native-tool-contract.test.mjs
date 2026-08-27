@@ -310,3 +310,63 @@ test("shared registration failure rejects parallel writes and a later call retri
     await rm(NODE_MODULES, { recursive: true, force: true });
   }
 });
+
+test("an opaque runtime session ID stays byte-identical through registration, compaction, and cleanup", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalUrl = process.env.ENGRAM_URL;
+  process.env.ENGRAM_URL = "http://127.0.0.1:17437";
+  // Pi hands out an opaque session ID. Surrounding whitespace is part of that
+  // identity, so normalizing it anywhere would split registration from
+  // compaction and strand the cache entry that shutdown tries to clear.
+  const runtimeSessionId = "  pi-runtime-session-id  ";
+  const sessionBodies = [];
+  const observationBodies = [];
+  globalThis.fetch = async (url, init) => {
+    const path = new URL(url).pathname;
+    if (path === "/health") return { ok: true, async json() { return { status: "ok" }; } };
+    if (path === "/project/current") {
+      return { ok: true, async json() { return { project: "pi", project_source: "dir_basename", project_path: ROOT }; } };
+    }
+    if (path === "/sessions") {
+      sessionBodies.push(JSON.parse(init.body));
+      return { ok: true, status: 201, async json() { return { status: "created" }; } };
+    }
+    if (path === "/observations") {
+      observationBodies.push(JSON.parse(init.body));
+      return { ok: true, status: 201, async json() { return { id: observationBodies.length }; } };
+    }
+    if (path === "/context") return { ok: true, async json() { return { context: "" }; } };
+    return { ok: true, async json() { return {}; } };
+  };
+
+  try {
+    const { registeredTools, eventHandlers } = await loadPluginHarness("exact-identity");
+    const memSave = registeredTools.get("mem_save");
+    const ctx = runtimeContext(runtimeSessionId);
+    await eventHandlers.get("session_start")({}, ctx);
+
+    const saved = await memSave.execute("exact-1", { title: "first", content: "one" }, undefined, undefined, ctx);
+    assert.equal(saved.isError, undefined);
+    assert.equal(sessionBodies.length, 1, "the first write registers the runtime session once");
+    assert.equal(sessionBodies[0].id, runtimeSessionId, "registration must use the exact runtime identity");
+    assert.equal(observationBodies[0].session_id, runtimeSessionId, "the write must use the exact runtime identity");
+
+    await eventHandlers.get("session_compact")({ summary: "compacted work" }, ctx);
+    assert.equal(sessionBodies.length, 1, "compaction must reuse the cached exact identity instead of registering again");
+    const compactionSummary = observationBodies.find((body) => body.type === "session_summary");
+    assert.ok(compactionSummary, "compaction summary not forwarded");
+    assert.equal(compactionSummary.session_id, runtimeSessionId, "compaction must attribute the summary to the exact identity");
+
+    await eventHandlers.get("session_shutdown")({}, ctx);
+
+    const afterShutdown = await memSave.execute("exact-2", { title: "second", content: "two" }, undefined, undefined, ctx);
+    assert.equal(afterShutdown.isError, undefined);
+    assert.equal(sessionBodies.length, 2, "shutdown must clear the cached entry so nothing is left behind");
+    assert.equal(sessionBodies[1].id, runtimeSessionId, "re-registration must still use the exact runtime identity");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalUrl === undefined) delete process.env.ENGRAM_URL;
+    else process.env.ENGRAM_URL = originalUrl;
+    await rm(NODE_MODULES, { recursive: true, force: true });
+  }
+});

@@ -525,9 +525,12 @@ function getSessionId(ctx: SessionContext): string | undefined {
   return ctx.sessionManager.getSessionId();
 }
 
+// The Pi runtime session ID is opaque: blankness is validated without normalizing it,
+// so registration, writes, compaction, and shutdown cleanup all key off the exact same
+// bytes. Trimming here would split that identity and strand cache entries at shutdown.
 function requireRuntimeSessionID(ctx: SessionContext): string {
-  const sessionId = ctx.sessionManager.getSessionId()?.trim();
-  if (!sessionId) {
+  const sessionId = getSessionId(ctx);
+  if (!sessionId || sessionId.trim().length === 0) {
     throw new Error("Pi runtime session ID is unavailable; session-attributed writes require a native SessionContext ID");
   }
   return sessionId;
