@@ -134,10 +134,12 @@ Engram is local-first: local SQLite is authoritative; cloud features are optiona
 ### Observations
 
 - `POST /observations` — Add observation. Body: `{session_id, type, title, content, tool_name?, project?, scope?, topic_key?}`
+  - `400` when `title` or `content` is missing, empty, or whitespace-only. The observation-create paths (`engram save`, `mem_save`, `POST /observations`) enforce the same title rule because cloud sync rejects observation upserts without a title, and one rejected mutation blocks every later mutation for the project
 - `GET /observations` — Recent observations compatibility endpoint. Query: `?project=X&scope=project|personal|global&limit=N&sort=created_at:desc`
 - `GET /observations/recent` — Recent observations. Query: `?project=X&scope=project|personal|global&limit=N`
 - `GET /observations/{id}` — Get single observation by ID
 - `PATCH /observations/{id}` — Update fields. Body: `{title?, content?, type?, project?, scope?, topic_key?}`
+  - `400` when `title` or `content` is provided but empty or whitespace-only. Omitting a field leaves its current value unchanged
 - `DELETE /observations/{id}` — Delete observation (`?hard=true` for hard delete, soft delete by default)
   - `200` when deleted
   - `404` when observation does not exist
@@ -865,7 +867,7 @@ Save structured observations. The tool description teaches agents the format:
 
 Exact duplicate saves are deduplicated in a rolling time window using a normalized content hash + project + scope + type + title.
 When `topic_key` is provided, `mem_save` upserts the latest observation in the same `project + scope + topic_key`, incrementing `revision_count` and attributing it to the latest writer session.
-Save responses include lifecycle metadata for the saved observation: computed `state` (`active` or `needs_review`) and `review_after` when the observation type has a review cycle.
+Save responses include lifecycle metadata for the saved observation: computed `state` (`active` or `needs_review`) and `review_after` when the observation type has a review cycle. Content is redacted before the configured storage limit is applied; that limit and truncation metadata (`original_bytes`, `limit_bytes`) are UTF-8 bytes. MCP save/update responses include `truncated`, and warn when truncation occurs.
 
 ### mem_update
 
@@ -892,7 +894,7 @@ Delete an observation by ID. Uses soft-delete by default (`deleted_at`); optiona
 
 ### mem_save_prompt
 
-Save user prompts — records what the user asked so future sessions have context about user goals.
+Save user prompts — records what the user asked so future sessions have context about user goals. It applies the same post-redaction byte limit and truncation metadata as `mem_save`; `mem_save_prompt` warns when it truncates.
 When called in the same MCP process, this also feeds process-local current prompt context used by later `mem_save` calls with `capture_prompt=true`. The same MCP process lifecycle must receive the prompt context before the later save; prompt capture is best-effort and `mem_save` still succeeds when no context is available.
 
 ### mem_context
@@ -1094,11 +1096,11 @@ Do not skip step 1. Without it, everything done before compaction is lost from m
 
 ## Project Name Normalization
 
-Engram automatically prevents project name drift — the same project saved under different names (`"engram"` vs `"Engram"` vs `"engram-memory"`) by different clients or users.
+Engram automatically prevents project name drift — the same project saved under different names (`"engram"` vs `"Engram"` vs `"  ENGRAM  "`) by different clients or users.
 
 ### Automatic normalization
 
-All project names are normalized on write and read: **lowercase**, **trimmed**, **collapsed hyphens/underscores**. If a name is changed during normalization, a warning is included in the response.
+All project names are normalized on write and read: **lowercase**, **trimmed**, **collapsed hyphens/underscores**. Hyphens and underscores are not interchangeable, so `"engram-memory"` and `"engram_memory"` are not equivalent. If a name is changed during normalization, a warning is included in the response.
 
 ### Auto-detection
 
@@ -1119,7 +1121,7 @@ When saving to a project that doesn't exist yet, Engram checks for similar exist
 
 ### Retroactive cleanup
 
-Use `engram projects consolidate` to interactively merge variant project names, or `mem_merge_projects` for agent-driven consolidation.
+Use `engram projects consolidate` to interactively merge legacy project names that are equivalent after normalization, or `mem_merge_projects` for agent-driven consolidation.
 
 ---
 

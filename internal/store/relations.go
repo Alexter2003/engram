@@ -63,6 +63,11 @@ func isValidRelationVerb(v string) bool {
 	return validRelationVerbs[v]
 }
 
+// isValidConfidence returns true when confidence is finite and in [0.0, 1.0].
+func isValidConfidence(confidence float64) bool {
+	return !math.IsNaN(confidence) && !math.IsInf(confidence, 0) && confidence >= 0.0 && confidence <= 1.0
+}
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 // CandidateOptions controls the FindCandidates query.
@@ -136,6 +141,10 @@ type DeferredRow struct {
 	TargetKey       string         `json:"target_key"`
 	Project         string         `json:"project"`
 	ScopeClass      string         `json:"scope_class"`
+	RemoteSeq       int64          `json:"remote_seq,omitempty"`
+	EntityKey       string         `json:"entity_key,omitempty"`
+	Op              string         `json:"op,omitempty"`
+	ReasonCode      string         `json:"reason_code,omitempty"`
 	Payload         map[string]any `json:"payload,omitempty"`
 	PayloadRaw      string         `json:"payload_raw"`
 	PayloadValid    bool           `json:"payload_valid"`
@@ -747,7 +756,7 @@ func (s *Store) JudgeBySemantic(p JudgeBySemanticParams) (string, error) {
 	if !isValidRelationVerb(p.Relation) {
 		return "", fmt.Errorf("JudgeBySemantic: invalid relation verb %q — must be one of: related, compatible, scoped, conflicts_with, supersedes, not_conflict", p.Relation)
 	}
-	if p.Confidence < 0.0 || p.Confidence > 1.0 {
+	if !isValidConfidence(p.Confidence) {
 		return "", fmt.Errorf("JudgeBySemantic: confidence %v is out of range [0.0, 1.0]", p.Confidence)
 	}
 
@@ -1106,7 +1115,20 @@ func sanitizeFTSCandidates(title string) string {
 	for _, w := range words {
 		w = strings.Trim(w, `"`)
 		if w != "" {
-			quoted = append(quoted, `"`+w+`"`)
+			var escaped strings.Builder
+			for i := 0; i < len(w); i++ {
+				if w[i] == '"' {
+					// FTS5 escapes a literal quote by doubling it. Preserve an
+					// already escaped pair so callers do not get double escaped.
+					escaped.WriteString(`""`)
+					if i+1 < len(w) && w[i+1] == '"' {
+						i++
+					}
+					continue
+				}
+				escaped.WriteByte(w[i])
+			}
+			quoted = append(quoted, `"`+escaped.String()+`"`)
 		}
 	}
 	return strings.Join(quoted, " OR ")
@@ -1288,8 +1310,9 @@ func (s *Store) GetRelationStats(project string) (RelationStats, error) {
 // pending relation (after a pre-check to skip already-related pairs).
 //
 // Phase 4 extension: when ScanOptions.Semantic is true, after the FTS5 candidate
-// collection a bounded worker pool calls Runner.Compare on each pair and persists
-// non-"not_conflict" verdicts via JudgeBySemantic. Semantic=false (zero value)
+// collection a bounded worker pool calls Runner.Compare on each pair. Applied
+// scans persist non-"not_conflict" verdicts via JudgeBySemantic, while dry-runs
+// report their semantic results without persistence. Semantic=false (zero value)
 // preserves Phase 3 behaviour exactly.
 //
 // Returns a ScanResult with counts, a continuation cursor when another page
@@ -1555,14 +1578,28 @@ scan:
 						return
 					}
 
-					if verdict.Relation == RelationNotConflict {
+					if verdict.Relation == RelationNotConflict && isValidConfidence(verdict.Confidence) {
 						mu.Lock()
 						result.SemanticSkipped++
 						mu.Unlock()
 						return
 					}
 
-					// Persist non-not_conflict verdict.
+					// Dry-runs evaluate and count valid verdicts without persistence.
+					// Invalid verdicts still flow through JudgeBySemantic so existing
+					// semantic error behavior remains unchanged.
+					if !opts.Apply &&
+						pair.sourceSnippet.SyncID != "" &&
+						pair.candidateSnippet.SyncID != "" &&
+						isValidRelationVerb(verdict.Relation) &&
+						isValidConfidence(verdict.Confidence) {
+						mu.Lock()
+						result.SemanticJudged++
+						mu.Unlock()
+						return
+					}
+
+					// Validate and persist non-skipped verdict.
 					_, judgeErr := s.JudgeBySemantic(JudgeBySemanticParams{
 						SourceID:   pair.sourceSnippet.SyncID,
 						TargetID:   pair.candidateSnippet.SyncID,

@@ -110,6 +110,25 @@ func TestFindCandidates_HappyPath(t *testing.T) {
 	}
 }
 
+func TestFindCandidates_EscapesInteriorQuotes(t *testing.T) {
+	s := setupRelationsStore(t)
+	_, _ = addTestObs(t, s, `hello"world candidate`, "decision", "testproject", "project")
+	savedID, _ := addTestObs(t, s, `hello"world source`, "decision", "testproject", "project")
+
+	candidates, err := s.FindCandidates(savedID, CandidateOptions{
+		Project:   "testproject",
+		Scope:     "project",
+		Limit:     3,
+		BM25Floor: ptrFloat64(-10.0),
+	})
+	if err != nil {
+		t.Fatalf("FindCandidates: %v", err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("expected 1 candidate, got %d", len(candidates))
+	}
+}
+
 // TestFindCandidates_EarlyBreakDoesNotSelfBlockWithSingleConnection verifies
 // that FindCandidates closes its FTS rows before follow-up QueryRow/Exec calls.
 // With SetMaxOpenConns(1), leaving rows open after the early-break path can
@@ -1117,7 +1136,7 @@ func TestJudgeRelation_RejectsCrossProject(t *testing.T) {
 }
 
 // C.1e — When the source observation is missing, JudgeRelation must enqueue a
-// mutation with project='' (empty string, not an error).
+// mutation with project=” (empty string, not an error).
 func TestJudgeRelation_MissingSource_EnqueuesEmptyProject(t *testing.T) {
 	s := setupEnrolledStore(t)
 

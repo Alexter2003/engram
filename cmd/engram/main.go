@@ -95,7 +95,8 @@ var (
 	storeDeleteProject     = func(s *store.Store, name string, hard bool) (*store.DeleteProjectResult, error) {
 		return s.DeleteProject(name, hard)
 	}
-	storeTimeline = func(s *store.Store, observationID int64, before, after int) (*store.TimelineResult, error) {
+	storePruneProject = func(s *store.Store, name string) (*store.PruneResult, error) { return s.PruneProject(name) }
+	storeTimeline     = func(s *store.Store, observationID int64, before, after int) (*store.TimelineResult, error) {
 		return s.Timeline(observationID, before, after)
 	}
 	storeFormatContext = func(s *store.Store, project, scope string) (string, error) { return s.FormatContext(project, scope) }
@@ -1033,6 +1034,13 @@ func cmdSave(cfg store.Config) {
 		}
 	}
 
+	// Reject titleless saves before opening the store or creating a session
+	// (#459). The store applies the same rule as a backstop.
+	if err := store.ValidateObservationTitle(title); err != nil {
+		fatal(err)
+		return
+	}
+
 	s, err := storeNew(cfg)
 	if err != nil {
 		fatal(err)
@@ -1624,7 +1632,11 @@ func cmdSync(cfg store.Config) {
 		return
 	}
 
-	fmt.Printf("Created chunk %s\n", result.ChunkID)
+	if result.ChunksExported > 1 {
+		fmt.Printf("Created %d chunks (last %s)\n", result.ChunksExported, result.ChunkID)
+	} else {
+		fmt.Printf("Created chunk %s\n", result.ChunkID)
+	}
 	fmt.Printf("  Sessions:     %d\n", result.SessionsExported)
 	fmt.Printf("  Observations: %d\n", result.ObservationsExported)
 	fmt.Printf("  Prompts:      %d\n", result.PromptsExported)
@@ -1850,7 +1862,7 @@ func cmdProjects(cfg store.Config) {
 		fmt.Fprintf(os.Stderr, "unknown projects subcommand: %s\n", subCmd)
 		fmt.Fprintln(os.Stderr, "usage: engram projects list")
 		fmt.Fprintln(os.Stderr, "       engram projects consolidate [--all] [--dry-run]")
-		fmt.Fprintln(os.Stderr, "       engram projects prune [--dry-run]")
+		fmt.Fprintln(os.Stderr, "       engram projects prune [--dry-run] [--paths-only]")
 		exitFunc(1)
 	}
 }
@@ -1894,98 +1906,34 @@ func cmdProjectsList(cfg store.Config) {
 // projectGroup represents a set of project names that should be merged.
 type projectGroup struct {
 	Names     []string
-	Canonical string // suggested canonical (most observations)
+	Canonical string // normalized operational canonical
 }
 
-// groupSimilarProjects groups projects by name similarity and shared directories.
-// Uses a simple union-find approach.
+// groupSimilarProjects groups only project names that normalize to the same value.
+// Similarity signals and shared directories are deliberately not merge eligibility.
 func groupSimilarProjects(projects []store.ProjectStats) []projectGroup {
-	n := len(projects)
-	if n == 0 {
-		return nil
-	}
-
-	// parent[i] holds the root of i's component
-	parent := make([]int, n)
-	for i := range parent {
-		parent[i] = i
-	}
-
-	var find func(int) int
-	find = func(x int) int {
-		if parent[x] != x {
-			parent[x] = find(parent[x])
-		}
-		return parent[x]
-	}
-	union := func(x, y int) {
-		rx, ry := find(x), find(y)
-		if rx != ry {
-			parent[rx] = ry
+	byNormalizedName := make(map[string][]store.ProjectStats)
+	for _, p := range projects {
+		normalized, _ := store.NormalizeProject(p.Name)
+		if normalized != "" {
+			byNormalizedName[normalized] = append(byNormalizedName[normalized], p)
 		}
 	}
 
-	// Build name-only slice and index map for FindSimilar
-	names := make([]string, n)
-	nameToIndex := make(map[string]int, n)
-	for i, p := range projects {
-		names[i] = p.Name
-		nameToIndex[p.Name] = i
-	}
-
-	// Group by name similarity
-	for i := 0; i < n; i++ {
-		similar := project.FindSimilar(projects[i].Name, names, 3)
-		for _, sm := range similar {
-			if j, ok := nameToIndex[sm.Name]; ok {
-				union(i, j)
-			}
-		}
-	}
-
-	// Group by shared directory
-	dirToProjects := make(map[string][]int)
-	for i, p := range projects {
-		for _, dir := range p.Directories {
-			if dir != "" {
-				dirToProjects[dir] = append(dirToProjects[dir], i)
-			}
-		}
-	}
-	for _, idxs := range dirToProjects {
-		for k := 1; k < len(idxs); k++ {
-			union(idxs[0], idxs[k])
-		}
-	}
-
-	// Collect components
-	components := make(map[int][]int)
-	for i := 0; i < n; i++ {
-		root := find(i)
-		components[root] = append(components[root], i)
-	}
-
-	// Build groups — skip singletons (no duplicates)
+	// Build groups — skip singletons (no normalization-equivalent names).
 	var groups []projectGroup
-	for _, idxs := range components {
-		if len(idxs) < 2 {
+	for canonical, members := range byNormalizedName {
+		if len(members) < 2 {
 			continue
 		}
-		// Suggest the one with most observations as canonical
-		bestIdx := idxs[0]
-		for _, idx := range idxs[1:] {
-			if projects[idx].ObservationCount > projects[bestIdx].ObservationCount {
-				bestIdx = idx
-			}
-		}
-		grpNames := make([]string, len(idxs))
-		for k, idx := range idxs {
-			grpNames[k] = projects[idx].Name
+		grpNames := make([]string, len(members))
+		for i, member := range members {
+			grpNames[i] = member.Name
 		}
 		sort.Strings(grpNames)
 		groups = append(groups, projectGroup{
 			Names:     grpNames,
-			Canonical: projects[bestIdx].Name,
+			Canonical: canonical,
 		})
 	}
 	// Sort groups by canonical name for deterministic output
@@ -1993,6 +1941,67 @@ func groupSimilarProjects(projects []store.ProjectStats) []projectGroup {
 		return groups[i].Canonical < groups[j].Canonical
 	})
 	return groups
+}
+
+func findNormalizationEquivalentProjects(name string, existing []string) []project.ProjectMatch {
+	normalized, _ := store.NormalizeProject(name)
+	if normalized == "" {
+		return nil
+	}
+
+	var matches []project.ProjectMatch
+	for _, candidate := range existing {
+		candidateNormalized, _ := store.NormalizeProject(candidate)
+		if candidate == name || candidateNormalized != normalized {
+			continue
+		}
+		matches = append(matches, project.ProjectMatch{
+			Name:      candidate,
+			MatchType: "normalization-equivalent",
+		})
+	}
+	return matches
+}
+
+// mergedRecordCount reports how many records a merge actually moved. The store
+// validates every source against the canonical name and fail-closes on the ones
+// it cannot prove normalization-equivalent, so a merge can succeed while moving
+// nothing at all. Callers must report that outcome honestly instead of
+// announcing a completed merge.
+func mergedRecordCount(result *store.MergeResult) int64 {
+	if result == nil {
+		return 0
+	}
+	return result.ObservationsUpdated + result.SessionsUpdated + result.PromptsUpdated
+}
+
+// reportUnmergedSources names the selected sources the store left untouched, so
+// a partially applied merge never reads as a complete one.
+func reportUnmergedSources(sources []string, result *store.MergeResult) {
+	merged := make(map[string]bool, len(result.SourcesMerged))
+	for _, name := range result.SourcesMerged {
+		merged[name] = true
+	}
+
+	// SourcesMerged holds the trimmed spelling the store actually rewrote, while
+	// sources holds the raw spellings the operator selected. Only a source that
+	// is literally the canonical name was a no-op by request.
+	var skipped []string
+	seen := make(map[string]bool, len(sources))
+	for _, source := range sources {
+		if strings.TrimSpace(source) == "" || source == result.Canonical {
+			continue
+		}
+		if merged[strings.TrimSpace(source)] || seen[source] {
+			continue
+		}
+		seen[source] = true
+		skipped = append(skipped, source)
+	}
+	if len(skipped) == 0 {
+		return
+	}
+	fmt.Printf("  Not merged (no records moved): %s\n", strings.Join(skipped, ", "))
 }
 
 func cmdProjectsConsolidate(cfg store.Config) {
@@ -2019,7 +2028,7 @@ func cmdProjectsConsolidate(cfg store.Config) {
 		if err != nil {
 			fatal(err)
 		}
-		canonical := detectProject(cwd)
+		canonical, _ := store.NormalizeProject(detectProject(cwd))
 
 		allNames, err := s.ListProjectNames()
 		if err != nil {
@@ -2038,43 +2047,13 @@ func cmdProjectsConsolidate(cfg store.Config) {
 			fmt.Printf("Note: %q has no existing memories. Merging will move memories into this new project name.\n", canonical)
 		}
 
-		// Find candidates by name similarity
-		similar := project.FindSimilar(canonical, allNames, 3)
+		// Only normalization-equivalent legacy names are safe automatic candidates.
+		similar := findNormalizationEquivalentProjects(canonical, allNames)
 
-		// Also find candidates by shared directory (catches renames like sdd-agent-team → agent-teams-lite)
 		allStats, _ := s.ListProjectsWithStats()
 		statsMap := make(map[string]store.ProjectStats)
-		var cwdDirs []string // directories for the canonical project
 		for _, ps := range allStats {
 			statsMap[ps.Name] = ps
-			if ps.Name == canonical {
-				cwdDirs = ps.Directories
-			}
-		}
-		// If canonical has no stats yet, use cwd as its directory
-		if len(cwdDirs) == 0 {
-			cwdDirs = []string{cwd}
-		}
-		// Find projects sharing a directory with the canonical
-		similarNames := make(map[string]bool)
-		for _, sm := range similar {
-			similarNames[sm.Name] = true
-		}
-		for _, ps := range allStats {
-			if ps.Name == canonical || similarNames[ps.Name] {
-				continue
-			}
-			for _, d := range ps.Directories {
-				for _, cd := range cwdDirs {
-					if d == cd {
-						similar = append(similar, project.ProjectMatch{
-							Name:      ps.Name,
-							MatchType: "shared directory",
-						})
-						similarNames[ps.Name] = true
-					}
-				}
-			}
 		}
 
 		if len(similar) == 0 {
@@ -2136,14 +2115,21 @@ func cmdProjectsConsolidate(cfg store.Config) {
 			fatal(err)
 		}
 
-		fmt.Printf("Done! Merged into %q:\n", result.Canonical)
+		if mergedRecordCount(result) == 0 {
+			fmt.Printf("Nothing merged into %q: the store moved no records for the %d selected project(s).\n",
+				result.Canonical, len(sources))
+			return
+		}
+
+		fmt.Printf("Done! Merged %d project(s) into %q:\n", len(result.SourcesMerged), result.Canonical)
 		fmt.Printf("  Observations: %d\n", result.ObservationsUpdated)
 		fmt.Printf("  Sessions:     %d\n", result.SessionsUpdated)
 		fmt.Printf("  Prompts:      %d\n", result.PromptsUpdated)
+		reportUnmergedSources(sources, result)
 		return
 	}
 
-	// --all mode: group all projects by similarity + shared directories
+	// --all mode: group all projects by normalization equivalence.
 	projects, err := s.ListProjectsWithStats()
 	if err != nil {
 		fatal(err)
@@ -2202,23 +2188,30 @@ func cmdProjectsConsolidate(cfg store.Config) {
 			continue
 		}
 
+		renameTarget := ""
 		if answer == "rename" || answer == "r" {
 			fmt.Printf("  Enter canonical name: ")
-			scanInputLine(&canonical)
-			canonical = strings.TrimSpace(canonical)
-			if canonical == "" {
+			var input string
+			scanInputLine(&input)
+			input = strings.TrimSpace(input)
+			if input == "" {
 				fmt.Println("  Empty input, skipping.")
 				fmt.Println()
 				continue
 			}
-			answer = "all" // after rename, merge everything into the new name
+			// Merging only ever targets the group's normalization-equivalent
+			// canonical; the rename is applied afterwards as an explicit
+			// project migration so sync identity follows the new name.
+			renameTarget, _ = store.NormalizeProject(input)
+			answer = "all" // after rename, merge everything then migrate
 		}
+		mergeCanonical, _ := store.NormalizeProject(canonical)
 
 		// Determine which sources to merge
 		var sources []string
 		if answer == "all" || answer == "a" || answer == "y" || answer == "yes" {
 			for _, name := range g.Names {
-				if name != canonical {
+				if name != mergeCanonical {
 					sources = append(sources, name)
 				}
 			}
@@ -2233,7 +2226,7 @@ func cmdProjectsConsolidate(cfg store.Config) {
 					continue
 				}
 				selected := g.Names[idx-1]
-				if selected != canonical {
+				if selected != mergeCanonical {
 					sources = append(sources, selected)
 				}
 			}
@@ -2244,22 +2237,45 @@ func cmdProjectsConsolidate(cfg store.Config) {
 			continue
 		}
 
-		result, err := s.MergeProjects(sources, canonical)
+		result, err := s.MergeProjects(sources, mergeCanonical)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  Error merging: %v\n", err)
 			fmt.Println()
 			continue
 		}
-		fmt.Printf("  Merged: %d obs, %d sessions, %d prompts\n\n",
-			result.ObservationsUpdated, result.SessionsUpdated, result.PromptsUpdated)
+		if mergedRecordCount(result) == 0 {
+			fmt.Printf("  Nothing merged into %q: the store moved no records for the %d selected project(s).\n",
+				mergeCanonical, len(sources))
+		} else {
+			fmt.Printf("  Merged: %d obs, %d sessions, %d prompts\n",
+				result.ObservationsUpdated, result.SessionsUpdated, result.PromptsUpdated)
+			reportUnmergedSources(sources, result)
+		}
+
+		if renameTarget != "" && renameTarget != mergeCanonical {
+			migrateResult, err := s.MigrateProject(mergeCanonical, renameTarget)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "  Error renaming %q → %q: %v\n", mergeCanonical, renameTarget, err)
+				fmt.Println()
+				continue
+			}
+			fmt.Printf("  Renamed %q → %q: %d obs, %d sessions, %d prompts\n",
+				mergeCanonical, renameTarget,
+				migrateResult.ObservationsUpdated, migrateResult.SessionsUpdated, migrateResult.PromptsUpdated)
+		}
+		fmt.Println()
 	}
 }
 
 func cmdProjectsPrune(cfg store.Config) {
 	dryRun := false
+	pathsOnly := false
 	for i := 3; i < len(os.Args); i++ {
-		if os.Args[i] == "--dry-run" {
+		switch os.Args[i] {
+		case "--dry-run":
 			dryRun = true
+		case "--paths-only":
+			pathsOnly = true
 		}
 	}
 
@@ -2274,15 +2290,21 @@ func cmdProjectsPrune(cfg store.Config) {
 		fatal(err)
 	}
 
-	// Find projects with 0 observations
+	// Find projects with 0 observations.
 	var candidates []store.ProjectStats
 	for _, ps := range allStats {
-		if ps.ObservationCount == 0 {
-			candidates = append(candidates, ps)
+		if ps.ObservationCount != 0 || (pathsOnly && !isPathLikeProjectName(ps.Name)) {
+			continue
 		}
+		candidates = append(candidates, ps)
 	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Name < candidates[j].Name })
 
 	if len(candidates) == 0 {
+		if pathsOnly {
+			fmt.Println("No path-named projects to prune.")
+			return
+		}
 		fmt.Println("No empty projects to prune.")
 		return
 	}
@@ -2329,17 +2351,23 @@ func cmdProjectsPrune(cfg store.Config) {
 
 	totalSessions := int64(0)
 	totalPrompts := int64(0)
+	successful := 0
 	for _, ps := range selected {
-		result, err := s.PruneProject(ps.Name)
+		result, err := storePruneProject(s, ps.Name)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error pruning %q: %v\n", ps.Name, err)
 			continue
 		}
+		successful++
 		totalSessions += result.SessionsDeleted
 		totalPrompts += result.PromptsDeleted
 	}
 
-	fmt.Printf("\nPruned %d project(s): %d sessions, %d prompts removed.\n", len(selected), totalSessions, totalPrompts)
+	fmt.Printf("\nPruned %d project(s): %d sessions, %d prompts removed.\n", successful, totalSessions, totalPrompts)
+}
+
+func isPathLikeProjectName(name string) bool {
+	return strings.ContainsAny(name, `/\`)
 }
 
 // cmdSetup classifies os.Args[2:] with a two-pass, order-independent
@@ -2688,6 +2716,10 @@ Commands:
                      Merge similar project names into one canonical name
                        --all      Scan ALL projects for similar name groups
                        --dry-run  Preview what would be merged (no changes)
+  projects prune [--dry-run] [--paths-only]
+                     Remove projects with no observations
+                       --dry-run     Preview projects without removing data
+                       --paths-only  Limit pruning to project names containing / or \
   setup [agent]      Install/setup agent integration (opencode, pi, claude-code,
                      gemini-cli, codex, antigravity-cli, windsurf, qwen, kiro,
                      cursor, vscode-copilot, kilocode)
