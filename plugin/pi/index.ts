@@ -704,7 +704,7 @@ async function callMemoryTool(toolName: string, params: Record<string, unknown>,
       return engramFetch(`/observations/${encodeURIComponent(String(params.id))}${queryString({ hard: params.hard_delete })}`, { method: "DELETE" });
     case "mem_suggest_topic_key":
       return { topic_key: slugifyTopicKey(params) };
-    case "mem_save_prompt":
+    case "mem_save_prompt": {
       if (!requestedProject) requireResolvedProject();
       await ensureSession(activeSessionId, activeProject);
       const response = await engramFetch<{ id: number }>("/prompts", {
@@ -712,6 +712,7 @@ async function callMemoryTool(toolName: string, params: Record<string, unknown>,
         body: { session_id: activeSessionId, content: params.content, project: activeProject },
       });
       return response ? { prompt_id: response.id, status: "saved" } : response;
+    }
     case "mem_session_summary":
       if (!requestedProject) requireResolvedProject();
       await ensureSession(activeSessionId, activeProject);
