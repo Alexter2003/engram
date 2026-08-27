@@ -442,3 +442,24 @@ func TestCmdDoctorRepairApplyUnblocksDoctorAndKeepsPendingWork(t *testing.T) {
 		}
 	}
 }
+
+func TestPrintDoctorUsageMarksProjectOptionalOnlyForSyncMutationRepair(t *testing.T) {
+	withArgs(t, "engram", "doctor", "--help")
+	stdout, stderr := captureOutput(t, func() { cmdDoctor(testConfig(t)) })
+	if stderr != "" {
+		t.Fatalf("stderr=%q", stderr)
+	}
+	wantLines := []string{
+		"usage: engram doctor [--json] [--project PROJECT] [--check CODE]",
+		"       engram doctor repair --project PROJECT --check CODE (--plan|--dry-run|--apply)",
+		"       engram doctor repair [--project PROJECT] --check sync_mutation_required_fields (--plan|--dry-run|--apply)",
+	}
+	for _, line := range wantLines {
+		if !strings.Contains(stdout, line+"\n") {
+			t.Fatalf("usage missing line %q\n%s", line, stdout)
+		}
+	}
+	if !strings.Contains(stdout, "checks: ") {
+		t.Fatalf("usage lost the registered check list\n%s", stdout)
+	}
+}
