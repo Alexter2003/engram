@@ -5779,12 +5779,12 @@ func TestStoreUncoveredBranchesPushToHundred(t *testing.T) {
 			t.Fatalf("expected search rows err")
 		}
 
-		setScanErr("SELECT id, project, directory")
+		setScanErr("SELECT id, ifnull(project, ''), directory")
 		if _, err := s.Export(); err == nil {
 			t.Fatalf("expected export sessions scan error")
 		}
 
-		setRowsErr("SELECT id, project, directory")
+		setRowsErr("SELECT id, ifnull(project, ''), directory")
 		if _, err := s.Export(); err == nil {
 			t.Fatalf("expected export sessions rows err")
 		}
