@@ -8032,6 +8032,75 @@ func TestCountObservationsForProject(t *testing.T) {
 	}
 }
 
+func TestPruneProjectPreservesSoftDeletedObservationSession(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("referenced", "empty-project", "/work"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	observationID, err := s.AddObservation(AddObservationParams{SessionID: "referenced", Type: "note", Title: "deleted", Content: "deleted content", Project: "empty-project", Scope: "project"})
+	if err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+	if err := s.DeleteObservation(observationID, false); err != nil {
+		t.Fatalf("DeleteObservation: %v", err)
+	}
+	if _, err := s.AddPrompt(AddPromptParams{SessionID: "referenced", Content: "remove me", Project: "empty-project"}); err != nil {
+		t.Fatalf("AddPrompt: %v", err)
+	}
+
+	result, err := s.PruneProject("empty-project")
+	if err != nil {
+		t.Fatalf("PruneProject: %v", err)
+	}
+	if result.PromptsDeleted != 1 || result.SessionsDeleted != 0 {
+		t.Fatalf("PruneResult = %+v, want one prompt and no sessions", result)
+	}
+	var sessions, observations, prompts int
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM sessions WHERE id = 'referenced'`).Scan(&sessions); err != nil {
+		t.Fatalf("count sessions: %v", err)
+	}
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM observations WHERE id = ? AND deleted_at IS NOT NULL`, observationID).Scan(&observations); err != nil {
+		t.Fatalf("count observations: %v", err)
+	}
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM user_prompts WHERE project = 'empty-project'`).Scan(&prompts); err != nil {
+		t.Fatalf("count prompts: %v", err)
+	}
+	if sessions != 1 || observations != 1 || prompts != 0 {
+		t.Fatalf("rows after prune: sessions=%d observations=%d prompts=%d", sessions, observations, prompts)
+	}
+}
+
+func TestPruneProjectDeletesOnlyUnreferencedSessions(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("referenced", "empty-project", "/work"); err != nil {
+		t.Fatalf("CreateSession referenced: %v", err)
+	}
+	if err := s.CreateSession("unreferenced", "empty-project", "/work"); err != nil {
+		t.Fatalf("CreateSession unreferenced: %v", err)
+	}
+	id, err := s.AddObservation(AddObservationParams{SessionID: "referenced", Type: "note", Title: "deleted", Content: "deleted content", Project: "empty-project", Scope: "project"})
+	if err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+	if err := s.DeleteObservation(id, false); err != nil {
+		t.Fatalf("DeleteObservation: %v", err)
+	}
+
+	result, err := s.PruneProject("empty-project")
+	if err != nil {
+		t.Fatalf("PruneProject: %v", err)
+	}
+	if result.SessionsDeleted != 1 || result.PromptsDeleted != 0 {
+		t.Fatalf("PruneResult = %+v, want one session and no prompts", result)
+	}
+	var referenced, unreferenced int
+	_ = s.DB().QueryRow(`SELECT COUNT(*) FROM sessions WHERE id = 'referenced'`).Scan(&referenced)
+	_ = s.DB().QueryRow(`SELECT COUNT(*) FROM sessions WHERE id = 'unreferenced'`).Scan(&unreferenced)
+	if referenced != 1 || unreferenced != 0 {
+		t.Fatalf("sessions after prune: referenced=%d unreferenced=%d", referenced, unreferenced)
+	}
+}
+
 // ─── DeleteSession tests ─────────────────────────────────────────────────────
 
 func TestRecentObservationsOrderByCreatedAtBeforeID(t *testing.T) {
