@@ -2233,7 +2233,10 @@ func (s *Store) CreateSession(id, project, directory string) error {
 			return err
 		}
 		var persisted Session
-		if err := tx.QueryRow(`SELECT id, project, directory, started_at, ended_at, summary FROM sessions WHERE id = ?`, id).Scan(
+		// sessions.project is read through ifnull() because a database upgraded from
+		// the schema where the column was nullable still carries rows that identify no
+		// project, and no migration rewrites them.
+		if err := tx.QueryRow(`SELECT id, ifnull(project, ''), directory, started_at, ended_at, summary FROM sessions WHERE id = ?`, id).Scan(
 			&persisted.ID, &persisted.Project, &persisted.Directory, &persisted.StartedAt, &persisted.EndedAt, &persisted.Summary,
 		); err != nil {
 			return err
@@ -2272,8 +2275,11 @@ func (s *Store) EndSession(id string, summary string) error {
 		var startedAt, endedAt string
 		var project, directory string
 		var storedSummary *string
+		// sessions.project is read through ifnull() because a database upgraded from
+		// the schema where the column was nullable still carries rows that identify no
+		// project, and no migration rewrites them.
 		if err := tx.QueryRow(
-			`SELECT project, directory, started_at, ended_at, summary FROM sessions WHERE id = ?`,
+			`SELECT ifnull(project, ''), directory, started_at, ended_at, summary FROM sessions WHERE id = ?`,
 			id,
 		).Scan(&project, &directory, &startedAt, &endedAt, &storedSummary); err != nil {
 			return err
@@ -2350,6 +2356,9 @@ func (s *Store) MostRecentActiveSession(project string) (string, bool, error) {
 	return id, true, nil
 }
 
+// A database upgraded from the schema where sessions.project was nullable still
+// carries rows that identify no project, so the column is read through ifnull():
+// an unscoped listing reads every session row and must not die on one of them.
 func (s *Store) RecentSessions(project string, limit int) ([]SessionSummary, error) {
 	// Normalize project filter for case-insensitive matching
 	project, _ = NormalizeProject(project)
@@ -2359,7 +2368,7 @@ func (s *Store) RecentSessions(project string, limit int) ([]SessionSummary, err
 	}
 
 	query := `
-		SELECT s.id, s.project, s.started_at, s.ended_at, s.summary,
+		SELECT s.id, ifnull(s.project, ''), s.started_at, s.ended_at, s.summary,
 		       COUNT(o.id) as observation_count
 		FROM sessions s
 		LEFT JOIN observations o ON o.session_id = s.id AND o.deleted_at IS NULL
@@ -2393,13 +2402,16 @@ func (s *Store) RecentSessions(project string, limit int) ([]SessionSummary, err
 }
 
 // AllSessions returns recent sessions ordered by most recent first (for TUI browsing).
+// A database upgraded from the schema where sessions.project was nullable still
+// carries rows that identify no project, so the column is read through ifnull():
+// an unscoped listing reads every session row and must not die on one of them.
 func (s *Store) AllSessions(project string, limit int) ([]SessionSummary, error) {
 	if limit <= 0 {
 		limit = 50
 	}
 
 	query := `
-		SELECT s.id, s.project, s.started_at, s.ended_at, s.summary,
+		SELECT s.id, ifnull(s.project, ''), s.started_at, s.ended_at, s.summary,
 		       COUNT(o.id) as observation_count
 		FROM sessions s
 		LEFT JOIN observations o ON o.session_id = s.id AND o.deleted_at IS NULL
@@ -3090,7 +3102,10 @@ func (s *Store) DeleteSession(id string) error {
 	}
 	return s.withTx(func(tx *sql.Tx) error {
 		var project string
-		if err := tx.QueryRow(`SELECT project FROM sessions WHERE id = ?`, id).Scan(&project); err != nil {
+		// sessions.project is read through ifnull() because a database upgraded from
+		// the schema where the column was nullable still carries rows that identify no
+		// project, and no migration rewrites them.
+		if err := tx.QueryRow(`SELECT ifnull(project, '') FROM sessions WHERE id = ?`, id).Scan(&project); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return fmt.Errorf("%w: %q", ErrSessionNotFound, id)
 			}
@@ -3918,13 +3933,16 @@ func (s *Store) ExportRelationMutations(project string) ([]SyncMutation, error) 
 	return mutations, nil
 }
 
+// exportWithProjectScope reads sessions.project through ifnull(): an export is how
+// data leaves the store before a repair, so it must not be the one path that
+// refuses to read the legacy unowned rows the operator is trying to rescue.
 func (s *Store) exportWithProjectScope(project string) (*ExportData, error) {
 	data := &ExportData{
 		Version:    "0.1.0",
 		ExportedAt: Now(),
 	}
 
-	sessionQuery := "SELECT id, project, directory, started_at, ended_at, summary FROM sessions"
+	sessionQuery := "SELECT id, ifnull(project, ''), directory, started_at, ended_at, summary FROM sessions"
 	sessionArgs := []any{}
 	if project != "" {
 		sessionQuery += `
