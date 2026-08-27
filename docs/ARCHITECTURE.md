@@ -287,7 +287,7 @@ engram cloud bootstrap admin --username <name> [--email <email>]
                           Create the first managed admin (see DOCS.md for details
                           and the current server-side auth wiring limitation)
 engram projects list      Show all projects with obs/session/prompt counts
-engram projects consolidate  Interactive merge of similar project names [--all] [--dry-run]
+engram projects consolidate  Interactive merge of normalization-equivalent project names [--all] [--dry-run]
 engram projects prune     Remove projects with 0 observations [--dry-run]
 engram obsidian-export    Export memories to Obsidian vault (beta)
 engram version            Show version
