@@ -1057,6 +1057,106 @@ func TestCmdProjectsRoutesSubcommands(t *testing.T) {
 	_ = stdout2 // just checking it doesn't crash
 }
 
+// seedLegacyNullableSession builds the shape an upgraded database has: a
+// sessions table whose project column is still nullable, carrying rows that
+// identify no project.
+func seedLegacyNullableSession(t *testing.T, cfg store.Config, sessionID string) {
+	t.Helper()
+	raw, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec(`CREATE TABLE sessions (
+		id TEXT PRIMARY KEY,
+		project TEXT,
+		directory TEXT NOT NULL,
+		started_at TEXT NOT NULL DEFAULT (datetime('now')),
+		ended_at TEXT,
+		summary TEXT
+	)`); err != nil {
+		t.Fatalf("create legacy sessions: %v", err)
+	}
+	if _, err := raw.Exec(`INSERT INTO sessions (id, project, directory) VALUES (?, NULL, ?)`, sessionID, "/tmp"); err != nil {
+		t.Fatalf("seed legacy session: %v", err)
+	}
+}
+
+// The repair for an unowned session must be reachable in a zero-config install,
+// where ENGRAM_HTTP_TOKEN is unset and the HTTP rescue endpoint answers 503.
+// This CLI path talks to the store directly and never needs server auth.
+func TestCmdProjectsRescueOwnershipWorksWithoutServerToken(t *testing.T) {
+	cfg := testConfig(t)
+	seedLegacyNullableSession(t, cfg, "legacy-session")
+	t.Setenv("ENGRAM_HTTP_TOKEN", "")
+
+	withArgs(t, "engram", "projects", "rescue-ownership", "--project", "target", "--session", "legacy-session")
+	stdout, stderr := captureOutput(t, func() { cmdProjects(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	if !strings.Contains(stdout, "target") {
+		t.Fatalf("expected the target project in output, got: %q", stdout)
+	}
+
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+	sess, err := s.GetSession("legacy-session")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if sess.Project != "target" {
+		t.Fatalf("session project = %q, want target", sess.Project)
+	}
+}
+
+// A partial rescue must say exactly what it left behind, not just a counter.
+func TestCmdProjectsRescueOwnershipReportsWhatWasLeftBehind(t *testing.T) {
+	cfg := testConfig(t)
+	seedLegacyNullableSession(t, cfg, "legacy-session")
+
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if _, err := s.DB().Exec(
+		`INSERT INTO observations (sync_id, session_id, type, title, content, project, scope) VALUES ('obs-foreign', 'legacy-session', 'note', 'foreign', 'content', 'other', 'project')`,
+	); err != nil {
+		t.Fatalf("seed foreign-owned observation: %v", err)
+	}
+	s.Close()
+
+	withArgs(t, "engram", "projects", "rescue-ownership", "--project", "target", "--session", "legacy-session")
+	stdout, _ := captureOutput(t, func() { cmdProjects(cfg) })
+	if !strings.Contains(stdout, "left behind") {
+		t.Fatalf("expected the partial outcome to be named, got: %q", stdout)
+	}
+	if !strings.Contains(stdout, "legacy-session") {
+		t.Fatalf("expected the blocked session to be listed, got: %q", stdout)
+	}
+}
+
+func TestCmdProjectsRescueOwnershipRequiresScope(t *testing.T) {
+	cfg := testConfig(t)
+
+	exited := false
+	oldExit := exitFunc
+	exitFunc = func(code int) { exited = true }
+	t.Cleanup(func() { exitFunc = oldExit })
+
+	withArgs(t, "engram", "projects", "rescue-ownership", "--project", "target")
+	_, stderr := captureOutput(t, func() { cmdProjects(cfg) })
+	if !strings.Contains(stderr, "usage:") {
+		t.Fatalf("expected usage on missing scope, got: %q", stderr)
+	}
+	if !exited {
+		t.Fatal("expected a non-zero exit when no records are selected")
+	}
+}
+
 func TestCmdProjectsConsolidateNoSimilar(t *testing.T) {
 	cfg := testConfig(t)
 

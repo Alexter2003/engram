@@ -1887,14 +1887,110 @@ func cmdProjects(cfg store.Config) {
 		cmdProjectsConsolidate(cfg)
 	case "prune":
 		cmdProjectsPrune(cfg)
+	case "rescue-ownership":
+		cmdProjectsRescueOwnership(cfg)
 	case "list", "":
 		cmdProjectsList(cfg)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown projects subcommand: %s\n", subCmd)
-		fmt.Fprintln(os.Stderr, "usage: engram projects list")
-		fmt.Fprintln(os.Stderr, "       engram projects consolidate [--all] [--dry-run]")
-		fmt.Fprintln(os.Stderr, "       engram projects prune [--dry-run] [--paths-only]")
+		printProjectsUsage()
 		exitFunc(1)
+	}
+}
+
+func printProjectsUsage() {
+	fmt.Fprintln(os.Stderr, "usage: engram projects list")
+	fmt.Fprintln(os.Stderr, "       engram projects consolidate [--all] [--dry-run]")
+	fmt.Fprintln(os.Stderr, "       engram projects prune [--dry-run] [--paths-only]")
+	fmt.Fprintln(os.Stderr, "       engram projects rescue-ownership --project <name> [--session <id>]... [--observation <id>]... [--prompt <id>]...")
+}
+
+// cmdProjectsRescueOwnership assigns explicit ownership to legacy rows that
+// carry none. It reaches the local store directly, so it is available in a
+// zero-config install where ENGRAM_HTTP_TOKEN is unset and the HTTP rescue
+// endpoint is not served. Every ownership error names this command.
+func cmdProjectsRescueOwnership(cfg store.Config) {
+	params := store.ProjectRescueParams{}
+	for i := 3; i < len(os.Args); i++ {
+		next := func() (string, bool) {
+			if i+1 >= len(os.Args) {
+				return "", false
+			}
+			i++
+			return os.Args[i], true
+		}
+		switch os.Args[i] {
+		case "--project":
+			if value, ok := next(); ok {
+				params.TargetProject = value
+			}
+		case "--session":
+			if value, ok := next(); ok {
+				params.SessionIDs = append(params.SessionIDs, value)
+			}
+		case "--observation":
+			if value, ok := next(); ok {
+				id, err := strconv.ParseInt(value, 10, 64)
+				if err != nil {
+					fatal(fmt.Errorf("invalid --observation id %q: %w", value, err))
+					return
+				}
+				params.ObservationIDs = append(params.ObservationIDs, id)
+			}
+		case "--prompt":
+			if value, ok := next(); ok {
+				id, err := strconv.ParseInt(value, 10, 64)
+				if err != nil {
+					fatal(fmt.Errorf("invalid --prompt id %q: %w", value, err))
+					return
+				}
+				params.PromptIDs = append(params.PromptIDs, id)
+			}
+		}
+	}
+
+	if strings.TrimSpace(params.TargetProject) == "" {
+		fmt.Fprintln(os.Stderr, "--project <name> is required")
+		printProjectsUsage()
+		exitFunc(1)
+		return
+	}
+	if len(params.SessionIDs) == 0 && len(params.ObservationIDs) == 0 && len(params.PromptIDs) == 0 {
+		fmt.Fprintln(os.Stderr, "select at least one --session, --observation, or --prompt to rescue")
+		printProjectsUsage()
+		exitFunc(1)
+		return
+	}
+
+	s, err := storeNew(cfg)
+	if err != nil {
+		fatal(err)
+		return
+	}
+	defer s.Close()
+
+	result, err := s.RescueNullProjectOwnership(params)
+	if err != nil {
+		fatal(err)
+		return
+	}
+
+	fmt.Printf("Rescued ownership into %q: %d sessions, %d observations, %d prompts\n",
+		params.TargetProject, result.RescuedSessions, result.RescuedObservations, result.RescuedPrompts)
+	if result.Complete {
+		fmt.Println("Everything selected now belongs to the target project.")
+	} else {
+		fmt.Printf("%d selected item(s) were left behind:\n", len(result.Blocked))
+		for _, blocked := range result.Blocked {
+			owner := blocked.OwnedBy
+			if owner == "" {
+				owner = "-"
+			}
+			fmt.Printf("  %-11s %-24s %s (owner: %s)\n", blocked.Kind, blocked.ID, blocked.Reason, owner)
+		}
+	}
+	if result.Journaled {
+		fmt.Println("Local sync journal updated; autosync reports reconciliation state.")
 	}
 }
 
