@@ -7787,3 +7787,134 @@ func TestHandleSearch_MatchModeInvalidError(t *testing.T) {
 		t.Fatalf("parameter-validation error must not contain query-advice suffix \"Try simpler keywords\", got: %s", text)
 	}
 }
+
+// TestHandleSaveRejectsEmptyTitle pins that mem_save refuses a titleless save
+// (#459) instead of persisting an observation whose cloud upsert would block
+// the project's mutation queue.
+func TestHandleSaveRejectsEmptyTitle(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		title any
+	}{
+		{"missing title", nil},
+		{"empty title", ""},
+		{"whitespace only title", "   "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newMCPTestStore(t)
+			h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+
+			args := map[string]any{
+				"content": "Body that would otherwise be saved",
+				"type":    "note",
+				"project": "engram",
+			}
+			if tc.title != nil {
+				args["title"] = tc.title
+			}
+
+			res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: args}})
+			if err != nil {
+				t.Fatalf("handler error: %v", err)
+			}
+			if !res.IsError {
+				t.Fatalf("expected tool error, got %q", callResultText(t, res))
+			}
+			if !strings.Contains(callResultText(t, res), "observation title is required") {
+				t.Fatalf("unexpected error text: %q", callResultText(t, res))
+			}
+
+			obs, err := s.RecentObservations("engram", "project", 5)
+			if err != nil {
+				t.Fatalf("recent observations: %v", err)
+			}
+			if len(obs) != 0 {
+				t.Fatalf("expected no observation persisted, got %#v", obs)
+			}
+
+			// The guard runs before project resolution and session creation, so
+			// a rejected save must leave no session behind either.
+			var sessions int
+			if err := s.DB().QueryRow(`SELECT count(*) FROM sessions`).Scan(&sessions); err != nil {
+				t.Fatalf("count sessions: %v", err)
+			}
+			if sessions != 0 {
+				t.Fatalf("expected no session created by a rejected save, got %d", sessions)
+			}
+
+			mutations, err := s.ListPendingSyncMutations(store.DefaultSyncTargetKey, 100)
+			if err != nil {
+				t.Fatalf("list pending sync mutations: %v", err)
+			}
+			if len(mutations) != 0 {
+				t.Fatalf("expected no sync mutation enqueued, got %#v", mutations)
+			}
+		})
+	}
+}
+
+func TestHandleUpdateRejectsBlankTitleWithoutSideEffects(t *testing.T) {
+	s := newMCPTestStore(t)
+	if err := s.CreateSession("s-update-title-guard", "engram", t.TempDir()); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	id, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s-update-title-guard",
+		Type:      "note",
+		Title:     "Original title",
+		Content:   "Original content",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+	before, err := s.GetObservation(id)
+	if err != nil {
+		t.Fatalf("get original observation: %v", err)
+	}
+	countMutations := func() int {
+		t.Helper()
+		mutations, err := s.ListPendingSyncMutations(store.DefaultSyncTargetKey, 10)
+		if err != nil {
+			t.Fatalf("list pending mutations: %v", err)
+		}
+		count := 0
+		for _, mutation := range mutations {
+			if mutation.Entity == store.SyncEntityObservation && mutation.EntityKey == before.SyncID {
+				count++
+			}
+		}
+		return count
+	}
+	mutationsBefore := countMutations()
+
+	for _, title := range []string{"", " \t\n "} {
+		title := title
+		t.Run("blank title", func(t *testing.T) {
+			res, err := handleUpdate(s)(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+				"id":    float64(id),
+				"title": title,
+			}}})
+			if err != nil {
+				t.Fatalf("handler error: %v", err)
+			}
+			if !res.IsError {
+				t.Fatalf("expected tool error, got %q", callResultText(t, res))
+			}
+			if !strings.Contains(callResultText(t, res), "observation title is required") {
+				t.Fatalf("unexpected error text: %q", callResultText(t, res))
+			}
+			after, err := s.GetObservation(id)
+			if err != nil {
+				t.Fatalf("get observation after rejected update: %v", err)
+			}
+			if after.Title != before.Title || after.Content != before.Content || after.RevisionCount != before.RevisionCount {
+				t.Fatalf("rejected update changed observation: before=%#v after=%#v", before, after)
+			}
+			if got := countMutations(); got != mutationsBefore {
+				t.Fatalf("rejected update enqueued a mutation: got %d, want %d", got, mutationsBefore)
+			}
+		})
+	}
+}
