@@ -4731,6 +4731,10 @@ type MigrateResult struct {
 }
 
 func (s *Store) MigrateProject(oldName, newName string) (*MigrateResult, error) {
+	// The rename lands on the migrated (normalized) identity — every other
+	// write path normalizes project names, so a rename must as well or the
+	// renamed records would carry a spelling no other route can produce.
+	newName, _ = NormalizeProject(newName)
 	if oldName == "" || newName == "" || oldName == newName {
 		return &MigrateResult{}, nil
 	}
@@ -4774,6 +4778,14 @@ func (s *Store) MigrateProject(oldName, newName string) (*MigrateResult, error) 
 			return fmt.Errorf("migrate prompts: %w", err)
 		}
 		result.PromptsUpdated, _ = res.RowsAffected()
+
+		// Migrate the old name's sync identity — pending journal rows and
+		// enrollment — so renaming a project (including one that was
+		// consolidated) keeps a single deliverable sync identity.
+		normalizedOld, _ := NormalizeProject(oldName)
+		if err := s.migrateProjectSyncIdentityTx(tx, []string{oldName, normalizedOld}, newName); err != nil {
+			return fmt.Errorf("migrate sync identity: %w", err)
+		}
 
 		// Enqueue sync mutations so cloud sync picks up the migrated records.
 		// Same pattern used by EnrollProject and MergeProjects.
@@ -5036,6 +5048,13 @@ func (s *Store) MergeProjects(sources []string, canonical string) (*MergeResult,
 			result.PromptsUpdated += n
 			sourceUpdated = sourceUpdated || n > 0
 
+			// Migrate the source's sync identity — pending journal rows and
+			// enrollment — so no legacy mutation suppresses canonical backfill
+			// or is later skip-acked as belonging to a non-enrolled project.
+			if err := s.migrateProjectSyncIdentityTx(tx, sourceVariants, canonical); err != nil {
+				return fmt.Errorf("merge sync identity %q → %q: %w", srcNormalized, canonical, err)
+			}
+
 			if sourceUpdated {
 				result.SourcesMerged = append(result.SourcesMerged, sourceVariants[0])
 			}
@@ -5064,6 +5083,84 @@ func projectMergeSourceVariants(rawSource, normalizedSource, canonical string) [
 		return nil
 	}
 	return []string{rawSource}
+}
+
+// migrateProjectSyncIdentityTx moves the pending sync journal rows and the
+// cloud sync enrollment of the given source project spellings onto the
+// canonical name, so a merged or renamed project keeps a single deliverable
+// sync identity. Pending mutations are migrated in place — journal project
+// column and payload project field — which preserves their entity coverage
+// (so backfill correctly skips those entities) while making them deliverable
+// under the canonical enrollment instead of being skip-acked as non-enrolled.
+// Acked journal rows are immutable history and stay untouched.
+func (s *Store) migrateProjectSyncIdentityTx(tx *sql.Tx, sources []string, canonical string) error {
+	seen := make(map[string]struct{}, len(sources))
+	variants := make([]string, 0, len(sources))
+	for _, source := range sources {
+		source = strings.TrimSpace(source)
+		if source == "" || source == canonical {
+			continue
+		}
+		if _, ok := seen[source]; ok {
+			continue
+		}
+		seen[source] = struct{}{}
+		variants = append(variants, source)
+	}
+	if len(variants) == 0 {
+		return nil
+	}
+
+	placeholders := sqlPlaceholders(len(variants))
+	variantArgs := make([]any, 0, len(variants))
+	for _, variant := range variants {
+		variantArgs = append(variantArgs, variant)
+	}
+
+	// Migrate pending journal rows: both rows whose project column carries a
+	// source spelling and rows whose payload still embeds one.
+	args := make([]any, 0, 3*len(variants)+2)
+	args = append(args, variantArgs...)
+	args = append(args, canonical, canonical)
+	args = append(args, variantArgs...)
+	args = append(args, variantArgs...)
+	if _, err := s.execHook(tx, `
+		UPDATE sync_mutations
+		SET payload = CASE
+				WHEN json_valid(payload) AND json_extract(payload, '$.project') IN (`+placeholders+`)
+				THEN json_set(payload, '$.project', ?)
+				ELSE payload
+			END,
+			project = ?
+		WHERE acked_at IS NULL
+		  AND (project IN (`+placeholders+`)
+		       OR (json_valid(payload) AND json_extract(payload, '$.project') IN (`+placeholders+`)))`,
+		args...,
+	); err != nil {
+		return fmt.Errorf("migrate pending sync mutations: %w", err)
+	}
+
+	// Carry enrollment: if any source spelling was enrolled, the canonical
+	// name becomes (or stays) enrolled and the source rows are superseded.
+	insertArgs := make([]any, 0, len(variants)+1)
+	insertArgs = append(insertArgs, canonical)
+	insertArgs = append(insertArgs, variantArgs...)
+	if _, err := s.execHook(tx, `
+		INSERT OR IGNORE INTO sync_enrolled_projects (project)
+		SELECT ? WHERE EXISTS (
+			SELECT 1 FROM sync_enrolled_projects WHERE project IN (`+placeholders+`)
+		)`,
+		insertArgs...,
+	); err != nil {
+		return fmt.Errorf("carry sync enrollment: %w", err)
+	}
+	if _, err := s.execHook(tx,
+		`DELETE FROM sync_enrolled_projects WHERE project IN (`+placeholders+`)`,
+		variantArgs...,
+	); err != nil {
+		return fmt.Errorf("supersede source sync enrollment: %w", err)
+	}
+	return nil
 }
 
 // ─── Project Pruning ─────────────────────────────────────────────────────────
