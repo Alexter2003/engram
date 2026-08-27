@@ -137,7 +137,7 @@ func TestMCPWriteToolsReportByteTruncation(t *testing.T) {
 				if err != nil {
 					t.Fatalf("seed observation: %v", err)
 				}
-				res, err := handleUpdate(s)(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"id": float64(id), "content": content}}})
+				res, err := handleUpdate(s, MCPConfig{})(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"id": float64(id), "content": content}}})
 				if err != nil {
 					t.Fatalf("mem_update: %v", err)
 				}
@@ -209,7 +209,7 @@ func TestMCPTruncationUsesRedactedByteCounts(t *testing.T) {
 				if err != nil {
 					t.Fatalf("seed observation: %v", err)
 				}
-				res, err := handleUpdate(s)(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"id": float64(id), "content": content}}})
+				res, err := handleUpdate(s, MCPConfig{})(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"id": float64(id), "content": content}}})
 				if err != nil {
 					t.Fatalf("mem_update: %v", err)
 				}
@@ -1101,7 +1101,7 @@ func TestHandleSearchAndCRUDHandlers(t *testing.T) {
 		t.Fatalf("expected search result pinned=true, got %v", firstResult["pinned"])
 	}
 
-	update := handleUpdate(s)
+	update := handleUpdate(s, MCPConfig{})
 	updateReq := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
 		"id":    float64(obsID),
 		"title": "Fix parser panic",
@@ -1477,7 +1477,7 @@ func TestMCPHandlersErrorBranches(t *testing.T) {
 		t.Fatalf("expected no memories response")
 	}
 
-	update := handleUpdate(s)
+	update := handleUpdate(s, MCPConfig{})
 	missingIDRes, err := update(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{}}})
 	if err != nil {
 		t.Fatalf("update missing id error: %v", err)
@@ -1561,7 +1561,7 @@ func TestMCPHandlersReturnErrorsWhenStoreClosed(t *testing.T) {
 		t.Fatalf("expected search to return tool error when store is closed")
 	}
 
-	updateRes, err := handleUpdate(s)(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"id": 1.0, "title": "new"}}})
+	updateRes, err := handleUpdate(s, MCPConfig{})(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"id": 1.0, "title": "new"}}})
 	if err != nil {
 		t.Fatalf("closed store update call: %v", err)
 	}
@@ -1758,7 +1758,7 @@ func TestHandleUpdateAcceptsAllOptionalFields(t *testing.T) {
 		t.Fatalf("add observation: %v", err)
 	}
 
-	res, err := handleUpdate(s)(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+	res, err := handleUpdate(s, MCPConfig{})(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
 		"id":        float64(id),
 		"title":     "Updated",
 		"content":   "Updated content",
@@ -1800,7 +1800,7 @@ func TestHandleUpdateRejectsFieldOnlyUpdateFromDifferentDetectedProject(t *testi
 	}
 	t.Chdir(cwd)
 
-	res, err := handleUpdate(s)(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+	res, err := handleUpdate(s, MCPConfig{})(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
 		"id":    float64(id),
 		"title": "Updated from another project",
 	}}})
@@ -1846,7 +1846,7 @@ func TestHandleUpdateRejectsNullOwnedObservationWithStructuredMetadata(t *testin
 		t.Fatalf("clear observation project: %v", err)
 	}
 
-	res, err := handleUpdate(s)(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+	res, err := handleUpdate(s, MCPConfig{})(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
 		"id":    float64(id),
 		"title": "Updated",
 	}}})
@@ -1866,6 +1866,93 @@ func TestHandleUpdateRejectsNullOwnedObservationWithStructuredMetadata(t *testin
 	if hint, _ := envelope["hint"].(string); !strings.Contains(hint, "ownership rescue") {
 		t.Fatalf("hint = %q, want ownership rescue guidance", hint)
 	}
+}
+
+// seedUpdatableObservationOutsideDetectedProject stores an observation owned by
+// "trusted project" and points the working directory at an unrelated detected
+// project, so only a process-level override can authorize the update.
+func seedUpdatableObservationOutsideDetectedProject(t *testing.T, s *store.Store) int64 {
+	t.Helper()
+	if err := s.CreateSession("s-process-override", "trusted project", "/tmp/trusted"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	id, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s-process-override",
+		Type:      "note",
+		Title:     "Original",
+		Content:   "Original content",
+		Project:   "trusted project",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	cwd := t.TempDir()
+	if err := os.Mkdir(filepath.Join(cwd, ".engram"), 0755); err != nil {
+		t.Fatalf("create detected-project configuration: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, ".engram", "config.json"), []byte(`{"project_name":"different-project"}`), 0644); err != nil {
+		t.Fatalf("write detected-project configuration: %v", err)
+	}
+	t.Chdir(cwd)
+	return id
+}
+
+func assertUpdateAppliedThroughProcessOverride(t *testing.T, s *store.Store, res *mcppkg.CallToolResult, err error, id int64) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("update handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("process override update failed: %s", callResultText(t, res))
+	}
+	envelope := callResultJSON(t, res)
+	if envelope["project"] != "trusted project" {
+		t.Fatalf("project = %v, want trusted project", envelope["project"])
+	}
+	if envelope["project_source"] != sourceProcessOverride {
+		t.Fatalf("project_source = %v, want %s", envelope["project_source"], sourceProcessOverride)
+	}
+	updated, err := s.GetObservation(id)
+	if err != nil || updated.Title != "Updated" {
+		t.Fatalf("updated observation = %#v, err=%v", updated, err)
+	}
+}
+
+func TestHandleUpdateHonorsProcessDefaultProjectOverride(t *testing.T) {
+	s := newMCPTestStore(t)
+	id := seedUpdatableObservationOutsideDetectedProject(t, s)
+
+	res, err := handleUpdate(s, MCPConfig{DefaultProject: "Trusted Project"})(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"id":    float64(id),
+		"title": "Updated",
+	}}})
+	assertUpdateAppliedThroughProcessOverride(t, s, res, err, id)
+}
+
+func TestHandleUpdateHonorsEngramProjectEnvironmentOverride(t *testing.T) {
+	s := newMCPTestStore(t)
+	id := seedUpdatableObservationOutsideDetectedProject(t, s)
+	t.Setenv("ENGRAM_PROJECT", "Trusted Project")
+
+	res, err := handleUpdate(s, MCPConfig{})(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"id":    float64(id),
+		"title": "Updated",
+	}}})
+	assertUpdateAppliedThroughProcessOverride(t, s, res, err, id)
+}
+
+func TestHandleUpdateProcessDefaultProjectBeatsEnvironmentOverride(t *testing.T) {
+	s := newMCPTestStore(t)
+	id := seedUpdatableObservationOutsideDetectedProject(t, s)
+	t.Setenv("ENGRAM_PROJECT", "env-project")
+
+	res, err := handleUpdate(s, MCPConfig{DefaultProject: "Trusted Project"})(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"id":    float64(id),
+		"title": "Updated",
+	}}})
+	assertUpdateAppliedThroughProcessOverride(t, s, res, err, id)
 }
 
 func TestHandleContextWithSessionOnlyUsesNoneProjects(t *testing.T) {

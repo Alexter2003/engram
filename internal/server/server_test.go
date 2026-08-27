@@ -202,6 +202,10 @@ func TestHandleRescueProjectOwnershipRescuesNullOwnershipAndReportsLocalJournal(
 	if _, err := st.DB().Exec(`UPDATE observations SET project = NULL WHERE id = ?`, id); err != nil {
 		t.Fatalf("clear legacy ownership: %v", err)
 	}
+	// The parent session is unowned too; rescuing the observation must move it.
+	if _, err := st.DB().Exec(`UPDATE sessions SET project = '' WHERE id = ?`, "legacy-session"); err != nil {
+		t.Fatalf("clear legacy session ownership: %v", err)
+	}
 	if _, err := st.DB().Exec(`DELETE FROM sync_mutations WHERE entity_key = (SELECT sync_id FROM observations WHERE id = ?)`, id); err != nil {
 		t.Fatalf("clear legacy mutation: %v", err)
 	}
@@ -232,6 +236,10 @@ func TestHandleRescueProjectOwnershipRescuesNullOwnershipAndReportsLocalJournal(
 	}
 	if !project.Valid || project.String != "target" {
 		t.Fatalf("rescued ownership = %#v, want target", project)
+	}
+	var sessionProject string
+	if err := st.DB().QueryRow(`SELECT project FROM sessions WHERE id = ?`, "legacy-session").Scan(&sessionProject); err != nil || sessionProject != "target" {
+		t.Fatalf("rescued session ownership = %q, err=%v, want target", sessionProject, err)
 	}
 	var journaled int
 	if err := st.DB().QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE entity_key = (SELECT sync_id FROM observations WHERE id = ?)`, id).Scan(&journaled); err != nil {

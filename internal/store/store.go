@@ -4811,26 +4811,49 @@ func (s *Store) RescueNullProjectOwnership(p ProjectRescueParams) (*ProjectRescu
 
 	result := &ProjectRescueResult{}
 	err := s.withTx(func(tx *sql.Tx) error {
-		var err error
-		result.RescuedObservations, result.ConflictingRecords, result.SkippedRecords, err = rescueNullProjectIDsTx(tx, rescueObservationQuery, p.ObservationIDs, target)
+		// Dependent session ownership is resolved and moved before any record is
+		// touched, inside this same transaction, so an observation or prompt can
+		// never land in a project its parent session does not own.
+		observations, err := loadRescueRecordsTx(tx, rescueObservationQuery, p.ObservationIDs)
 		if err != nil {
 			return err
 		}
-		var conflicts, skipped int64
-		result.RescuedPrompts, conflicts, skipped, err = rescueNullProjectIDsTx(tx, rescuePromptQuery, p.PromptIDs, target)
+		prompts, err := loadRescueRecordsTx(tx, rescuePromptQuery, p.PromptIDs)
 		if err != nil {
 			return err
 		}
-		result.ConflictingRecords += conflicts
-		result.SkippedRecords += skipped
-		result.RescuedSessions, conflicts, skipped, err = rescueNullProjectSessionIDsTx(tx, p.SessionIDs, target)
-		if err != nil {
-			return err
-		}
-		result.ConflictingRecords += conflicts
-		result.SkippedRecords += skipped
 
-		journaled, err := s.enqueueRescuedProjectMutationsTx(tx, target, p)
+		scope := resolveRescueSessionScope(p.SessionIDs, observations, prompts)
+		owned := map[string]bool{}
+		for _, sessionID := range scope.ordered {
+			outcome, err := rescueOwnershipTx(tx, rescueSessionQuery, sessionID, target)
+			if err != nil {
+				return err
+			}
+			if outcome == rescueRescued || outcome == rescueAlreadyOwned {
+				owned[sessionID] = true
+			}
+			if outcome == rescueRescued {
+				result.RescuedSessions++
+			}
+			// Only explicitly requested sessions are reported; dependent sessions
+			// are an implementation detail of the atomic move and are accounted for
+			// through their records.
+			if scope.explicit[sessionID] {
+				result.countOutcome(outcome)
+			}
+		}
+
+		result.RescuedObservations, err = rescueDependentRecordsTx(tx, rescueObservationQuery, observations, owned, target, result)
+		if err != nil {
+			return err
+		}
+		result.RescuedPrompts, err = rescueDependentRecordsTx(tx, rescuePromptQuery, prompts, owned, target, result)
+		if err != nil {
+			return err
+		}
+
+		journaled, err := s.enqueueRescuedProjectMutationsTx(tx, target, scope.ordered, p)
 		if err != nil {
 			return err
 		}
@@ -4843,82 +4866,150 @@ func (s *Store) RescueNullProjectOwnership(p ProjectRescueParams) (*ProjectRescu
 	return result, nil
 }
 
+// rescueOutcome classifies what happened to one record during a rescue.
+type rescueOutcome int
+
+const (
+	rescueRescued rescueOutcome = iota
+	rescueAlreadyOwned
+	rescueConflict
+	rescueMissing
+)
+
+func (r *ProjectRescueResult) countOutcome(outcome rescueOutcome) {
+	switch outcome {
+	case rescueAlreadyOwned, rescueMissing:
+		r.SkippedRecords++
+	case rescueConflict:
+		r.ConflictingRecords++
+	}
+}
+
 type rescueRecordQuery struct {
-	selectProject string
-	updateProject string
+	// selectSessionID reads the parent session id of one record. It is empty for
+	// sessions, which have no parent.
+	selectSessionID string
+	selectProject   string
+	updateProject   string
 }
 
 var (
 	rescueObservationQuery = rescueRecordQuery{
-		selectProject: `SELECT project FROM observations WHERE id = ?`,
-		updateProject: `UPDATE observations SET project = ? WHERE id = ? AND project IS NULL`,
+		selectSessionID: `SELECT session_id FROM observations WHERE id = ?`,
+		selectProject:   `SELECT project FROM observations WHERE id = ?`,
+		updateProject:   `UPDATE observations SET project = ? WHERE id = ? AND ifnull(trim(project), '') = ''`,
 	}
 	rescuePromptQuery = rescueRecordQuery{
-		selectProject: `SELECT project FROM user_prompts WHERE id = ?`,
-		updateProject: `UPDATE user_prompts SET project = ? WHERE id = ? AND project IS NULL`,
+		selectSessionID: `SELECT session_id FROM user_prompts WHERE id = ?`,
+		selectProject:   `SELECT project FROM user_prompts WHERE id = ?`,
+		updateProject:   `UPDATE user_prompts SET project = ? WHERE id = ? AND ifnull(trim(project), '') = ''`,
+	}
+	rescueSessionQuery = rescueRecordQuery{
+		selectProject: `SELECT project FROM sessions WHERE id = ?`,
+		updateProject: `UPDATE sessions SET project = ? WHERE id = ? AND ifnull(trim(project), '') = ''`,
 	}
 )
 
-func rescueNullProjectIDsTx(tx *sql.Tx, query rescueRecordQuery, ids []int64, target string) (rescued, conflicts, skipped int64, err error) {
-	for _, id := range ids {
-		var project sql.NullString
-		err = tx.QueryRow(query.selectProject, id).Scan(&project)
-		if errors.Is(err, sql.ErrNoRows) {
-			skipped++
-			continue
-		}
-		if err != nil {
-			return
-		}
-		if project.Valid {
-			owned, _ := NormalizeProject(project.String)
-			if owned == target {
-				skipped++
-			} else {
-				conflicts++
-			}
-			continue
-		}
-		res, execErr := tx.Exec(query.updateProject, target, id)
-		if execErr != nil {
-			err = execErr
-			return
-		}
-		updated, _ := res.RowsAffected()
-		rescued += updated
-	}
-	return
+// rescueRecord is the pre-read ownership state of one requested record.
+type rescueRecord struct {
+	id        int64
+	sessionID string
+	exists    bool
 }
 
-func rescueNullProjectSessionIDsTx(tx *sql.Tx, ids []string, target string) (rescued, conflicts, skipped int64, err error) {
+func loadRescueRecordsTx(tx *sql.Tx, query rescueRecordQuery, ids []int64) ([]rescueRecord, error) {
+	records := make([]rescueRecord, 0, len(ids))
 	for _, id := range ids {
-		var project sql.NullString
-		err = tx.QueryRow(`SELECT project FROM sessions WHERE id = ?`, id).Scan(&project)
-		if errors.Is(err, sql.ErrNoRows) {
-			skipped++
-			continue
+		record := rescueRecord{id: id}
+		err := tx.QueryRow(query.selectSessionID, id).Scan(&record.sessionID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
 		}
-		if err != nil {
-			return
-		}
-		if project.Valid {
-			owned, _ := NormalizeProject(project.String)
-			if owned == target {
-				skipped++
-			} else {
-				conflicts++
-			}
-			continue
-		}
-		res, execErr := tx.Exec(`UPDATE sessions SET project = ? WHERE id = ? AND project IS NULL`, target, id)
-		if execErr != nil {
-			err = execErr
-			return
-		}
-		updated, _ := res.RowsAffected()
-		rescued += updated
+		record.exists = err == nil
+		records = append(records, record)
 	}
-	return
+	return records, nil
+}
+
+// rescueSessionScope is the set of sessions whose ownership must move with the
+// requested records: the explicitly requested ones plus every parent session.
+type rescueSessionScope struct {
+	ordered  []string
+	explicit map[string]bool
+}
+
+func resolveRescueSessionScope(explicitIDs []string, recordGroups ...[]rescueRecord) rescueSessionScope {
+	scope := rescueSessionScope{explicit: make(map[string]bool, len(explicitIDs))}
+	seen := map[string]bool{}
+	add := func(id string) {
+		if id == "" || seen[id] {
+			return
+		}
+		seen[id] = true
+		scope.ordered = append(scope.ordered, id)
+	}
+	for _, id := range explicitIDs {
+		scope.explicit[id] = true
+		add(id)
+	}
+	for _, group := range recordGroups {
+		for _, record := range group {
+			if record.exists {
+				add(record.sessionID)
+			}
+		}
+	}
+	return scope
+}
+
+// rescueOwnershipTx claims a single row for target when it carries no ownership.
+// Blank ownership is treated exactly like NULL: neither identifies a project.
+func rescueOwnershipTx(tx *sql.Tx, query rescueRecordQuery, id any, target string) (rescueOutcome, error) {
+	var project sql.NullString
+	err := tx.QueryRow(query.selectProject, id).Scan(&project)
+	if errors.Is(err, sql.ErrNoRows) {
+		return rescueMissing, nil
+	}
+	if err != nil {
+		return rescueMissing, err
+	}
+	if owned, _ := NormalizeProject(strings.TrimSpace(project.String)); owned != "" {
+		if owned == target {
+			return rescueAlreadyOwned, nil
+		}
+		return rescueConflict, nil
+	}
+	if _, err := tx.Exec(query.updateProject, target, id); err != nil {
+		return rescueMissing, err
+	}
+	return rescueRescued, nil
+}
+
+// rescueDependentRecordsTx moves only records whose parent session is already
+// owned by target after the session pass. A record whose session belongs to a
+// different project is reported as conflicting instead of being split from it.
+func rescueDependentRecordsTx(tx *sql.Tx, query rescueRecordQuery, records []rescueRecord, ownedSessions map[string]bool, target string, result *ProjectRescueResult) (int64, error) {
+	var rescued int64
+	for _, record := range records {
+		if !record.exists {
+			result.countOutcome(rescueMissing)
+			continue
+		}
+		if !ownedSessions[record.sessionID] {
+			result.countOutcome(rescueConflict)
+			continue
+		}
+		outcome, err := rescueOwnershipTx(tx, query, record.id, target)
+		if err != nil {
+			return 0, err
+		}
+		if outcome == rescueRescued {
+			rescued++
+			continue
+		}
+		result.countOutcome(outcome)
+	}
+	return rescued, nil
 }
 
 func (s *Store) MigrateProject(oldName, newName string) (*MigrateResult, error) {
@@ -5526,9 +5617,12 @@ func (s *Store) backfillProjectSyncMutationsTx(tx *sql.Tx, project string) error
 	return s.backfillRelationSyncMutationsTx(tx, project)
 }
 
-func (s *Store) enqueueRescuedProjectMutationsTx(tx *sql.Tx, target string, p ProjectRescueParams) (bool, error) {
+// enqueueRescuedProjectMutationsTx journals the rescued rows. sessionIDs covers
+// the explicitly requested sessions plus every dependent parent session, so a
+// rescued observation is never pushed ahead of the session that now owns it.
+func (s *Store) enqueueRescuedProjectMutationsTx(tx *sql.Tx, target string, sessionIDs []string, p ProjectRescueParams) (bool, error) {
 	journaled := false
-	for _, id := range p.SessionIDs {
+	for _, id := range sessionIDs {
 		var payload syncSessionPayload
 		err := tx.QueryRow(`SELECT id, project, directory, started_at, ended_at, summary FROM sessions WHERE id = ? AND project = ?`, id, target).
 			Scan(&payload.ID, &payload.Project, &payload.Directory, &payload.StartedAt, &payload.EndedAt, &payload.Summary)
@@ -5585,7 +5679,13 @@ func (s *Store) enqueueRescuedProjectMutationsTx(tx *sql.Tx, target string, p Pr
 }
 
 func (s *Store) enqueueMissingLocalMutationTx(tx *sql.Tx, entity, entityKey string, payload any, ops ...string) (bool, error) {
-	project, _ := NormalizeProject(extractProjectFromPayload(payload))
+	project, _ := NormalizeProject(strings.TrimSpace(extractProjectFromPayload(payload)))
+	// A blank-owned payload has no project identity to reconcile against, so it
+	// must never reach the journal — pushing it would recreate the unowned rows
+	// this rescue exists to repair.
+	if project == "" {
+		return false, ErrProjectRequired
+	}
 	op := SyncOpUpsert
 	if len(ops) > 0 {
 		op = ops[0]

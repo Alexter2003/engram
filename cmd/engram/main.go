@@ -786,8 +786,8 @@ func cmdServe(cfg store.Config) {
 }
 
 func resolveServeSyncStatusProject() string {
-	projectName := strings.TrimSpace(os.Getenv("ENGRAM_PROJECT"))
-	if projectName == "" {
+	projectName, ok := project.ProcessOverride("")
+	if !ok {
 		if cwd, err := os.Getwd(); err == nil {
 			projectName = detectProject(cwd)
 		}
@@ -849,7 +849,9 @@ func tryStartAutosync(ctx context.Context, s *store.Store, cfg store.Config) (au
 
 func cmdMCP(cfg store.Config) {
 	toolsFilter := ""
-	projectOverride := strings.TrimSpace(os.Getenv("ENGRAM_PROJECT"))
+	// The --project flag below is the explicit process argument of the shared
+	// override rule; project.ProcessOverride supplies the ENGRAM_PROJECT step.
+	projectOverride, _ := project.ProcessOverride("")
 	for i := 2; i < len(os.Args); i++ {
 		if strings.HasPrefix(os.Args[i], "--tools=") {
 			toolsFilter = strings.TrimPrefix(os.Args[i], "--tools=")
@@ -1040,17 +1042,24 @@ func cmdSave(cfg store.Config) {
 		fatal(err)
 		return
 	}
+	// Identity precedence is the one process-level rule shared with the MCP and
+	// HTTP entry points: the explicit --project flag, then the process override
+	// (project.ProcessOverride reads ENGRAM_PROJECT), then cwd detection.
 	if strings.TrimSpace(projectName) == "" {
-		resolved := detectProjectFull(cwd)
-		if resolved.Error != nil || strings.TrimSpace(resolved.Project) == "" {
-			if resolved.Error != nil {
-				fatal(fmt.Errorf("cannot save without an unambiguous project identity: %w; use --project <name>", resolved.Error))
-			} else {
-				fatal(errors.New("cannot save without an unambiguous project identity; use --project <name>"))
+		if override, ok := project.ProcessOverride(""); ok {
+			projectName = override
+		} else {
+			resolved := detectProjectFull(cwd)
+			if resolved.Error != nil || strings.TrimSpace(resolved.Project) == "" {
+				if resolved.Error != nil {
+					fatal(fmt.Errorf("cannot save without an unambiguous project identity: %w; use --project <name>", resolved.Error))
+				} else {
+					fatal(errors.New("cannot save without an unambiguous project identity; use --project <name>"))
+				}
+				return
 			}
-			return
+			projectName = resolved.Project
 		}
-		projectName = resolved.Project
 	}
 	var warning string
 	projectName, warning = store.NormalizeProject(projectName)
@@ -2744,7 +2753,11 @@ Commands:
 Environment:
   ENGRAM_DATA_DIR    Override data directory (default: ~/.engram)
   ENGRAM_PORT        Override HTTP server port (default: 7437)
-  ENGRAM_PROJECT     Process-level default project override.
+  ENGRAM_PROJECT     Process-level default project override, applied by every entry point
+                     with one precedence rule: explicit request project (engram save --project,
+                     an MCP tool project argument) > process override (engram mcp --project,
+                     then ENGRAM_PROJECT) > cwd detection.
+                     For "engram save": owns the observation when --project is omitted.
                      For "engram serve": fallback for GET /sync/status with no project param.
                      For "engram mcp": sets DefaultProject, overriding cwd detection for all tools.
   ENGRAM_HTTP_TOKEN  Optional Bearer auth for local HTTP server (engram serve).

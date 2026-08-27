@@ -295,6 +295,7 @@ func TestRescueNullProjectOwnershipRescuesOnlyNullRecordsAndJournalsOnce(t *test
 		query string
 		args  []any
 	}{
+		{`UPDATE sessions SET project = '' WHERE id = ?`, []any{"legacy-session"}},
 		{`UPDATE observations SET project = NULL WHERE id = ?`, []any{observationID}},
 		{`UPDATE user_prompts SET project = NULL WHERE id = ?`, []any{promptID}},
 		{`DELETE FROM sync_mutations WHERE entity_key = (SELECT sync_id FROM observations WHERE id = ?)`, []any{observationID}},
@@ -310,10 +311,13 @@ func TestRescueNullProjectOwnershipRescuesOnlyNullRecordsAndJournalsOnce(t *test
 	if err != nil {
 		t.Fatalf("RescueNullProjectOwnership: %v", err)
 	}
-	if result.Rescued() != 2 || result.ConflictingRecords != 1 || !result.Journaled {
+	// The unowned session moves with its two records; the owned record stays put
+	// because its own session belongs to another project.
+	if result.Rescued() != 3 || result.RescuedSessions != 1 || result.ConflictingRecords != 1 || !result.Journaled {
 		t.Fatalf("unexpected rescue result: %#v", result)
 	}
 	for _, query := range []string{
+		`SELECT project FROM sessions WHERE id = 'legacy-session'`,
 		`SELECT project FROM observations WHERE id = ` + fmt.Sprint(observationID),
 		`SELECT project FROM user_prompts WHERE id = ` + fmt.Sprint(promptID),
 	} {
@@ -327,8 +331,8 @@ func TestRescueNullProjectOwnershipRescuesOnlyNullRecordsAndJournalsOnce(t *test
 		t.Fatalf("owned record changed to %q, err=%v", ownedProject, err)
 	}
 	var mutations int
-	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE project = 'target'`).Scan(&mutations); err != nil || mutations != 2 {
-		t.Fatalf("target mutations = %d, err=%v, want 2", mutations, err)
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE project = 'target'`).Scan(&mutations); err != nil || mutations != 3 {
+		t.Fatalf("target mutations = %d, err=%v, want 3", mutations, err)
 	}
 
 	again, err := s.RescueNullProjectOwnership(params)
@@ -338,8 +342,8 @@ func TestRescueNullProjectOwnershipRescuesOnlyNullRecordsAndJournalsOnce(t *test
 	if again.Rescued() != 0 || again.ConflictingRecords != 1 || again.SkippedRecords != 2 || !again.Journaled {
 		t.Fatalf("repeat rescue result = %#v", again)
 	}
-	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE project = 'target'`).Scan(&mutations); err != nil || mutations != 2 {
-		t.Fatalf("repeat target mutations = %d, err=%v, want 2", mutations, err)
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE project = 'target'`).Scan(&mutations); err != nil || mutations != 3 {
+		t.Fatalf("repeat target mutations = %d, err=%v, want 3", mutations, err)
 	}
 }
 
@@ -358,6 +362,10 @@ func TestRescueNullProjectOwnershipReplacesStaleAcknowledgedJournal(t *testing.T
 	}
 	if _, err := s.DB().Exec(`UPDATE observations SET project = NULL WHERE id = ?`, id); err != nil {
 		t.Fatalf("seed NULL ownership: %v", err)
+	}
+	// The parent session is unowned too, so the rescue is allowed to move both.
+	if _, err := s.DB().Exec(`UPDATE sessions SET project = '' WHERE id = ?`, "legacy-session"); err != nil {
+		t.Fatalf("seed unowned parent session: %v", err)
 	}
 	if _, err := s.DB().Exec(`UPDATE sync_mutations SET project = 'stale', payload = '{"project":"stale"}', acked_at = datetime('now') WHERE entity = ? AND entity_key = ?`, SyncEntityObservation, syncID); err != nil {
 		t.Fatalf("seed stale journal: %v", err)
@@ -397,6 +405,9 @@ func TestRescueNullProjectOwnershipEnqueuesDeleteDespitePendingOppositeOperation
 	if _, err := s.DB().Exec(`UPDATE observations SET project = NULL, deleted_at = datetime('now') WHERE id = ?`, id); err != nil {
 		t.Fatalf("seed soft-deleted NULL ownership: %v", err)
 	}
+	if _, err := s.DB().Exec(`UPDATE sessions SET project = '' WHERE id = ?`, "legacy-session"); err != nil {
+		t.Fatalf("seed unowned parent session: %v", err)
+	}
 	if _, err := s.DB().Exec(`UPDATE sync_mutations SET project = 'target', payload = json_set(payload, '$.project', 'target') WHERE entity = ? AND entity_key = ? AND op = ?`, SyncEntityObservation, syncID, SyncOpUpsert); err != nil {
 		t.Fatalf("seed pending opposite mutation: %v", err)
 	}
@@ -434,6 +445,9 @@ func TestRescueNullProjectOwnershipRollsBackWhenJournalEnqueueFails(t *testing.T
 	if _, err := s.DB().Exec(`UPDATE observations SET project = NULL WHERE id = ?`, id); err != nil {
 		t.Fatalf("seed legacy observation ownership: %v", err)
 	}
+	if _, err := s.DB().Exec(`UPDATE sessions SET project = '' WHERE id = ?`, "legacy-session"); err != nil {
+		t.Fatalf("seed unowned parent session: %v", err)
+	}
 	if _, err := s.DB().Exec(`DELETE FROM sync_mutations WHERE entity_key = (SELECT sync_id FROM observations WHERE id = ?)`, id); err != nil {
 		t.Fatalf("seed legacy observation: %v", err)
 	}
@@ -454,6 +468,153 @@ func TestRescueNullProjectOwnershipRollsBackWhenJournalEnqueueFails(t *testing.T
 	}
 	if project.Valid {
 		t.Fatalf("ownership persisted after rollback: %q", project.String)
+	}
+}
+
+// seedUnownedObservationTx inserts an observation whose ownership is NULL under
+// an existing session, mirroring rows written before project identity was
+// mandatory.
+func seedUnownedObservation(t *testing.T, s *Store, sessionID, syncID, title string) int64 {
+	t.Helper()
+	res, err := s.DB().Exec(
+		`INSERT INTO observations (sync_id, session_id, type, title, content, project, scope) VALUES (?, ?, 'note', ?, 'content', NULL, 'project')`,
+		syncID, sessionID, title,
+	)
+	if err != nil {
+		t.Fatalf("seed unowned observation: %v", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("read seeded observation id: %v", err)
+	}
+	return id
+}
+
+func assertNoBlankOwnedMutations(t *testing.T, s *Store) {
+	t.Helper()
+	var blank int
+	if err := s.DB().QueryRow(
+		`SELECT COUNT(*) FROM sync_mutations WHERE ifnull(project, '') = '' OR ifnull(json_extract(payload, '$.project'), '') = ''`,
+	).Scan(&blank); err != nil {
+		t.Fatalf("count blank-owned mutations: %v", err)
+	}
+	if blank != 0 {
+		t.Fatalf("blank-owned sync mutations = %d, want 0", blank)
+	}
+}
+
+func TestRescueNullProjectOwnershipMovesDependentSessionOwnershipAtomically(t *testing.T) {
+	type legacySession struct{ id, project string }
+	s := newTestStoreWithNullableLegacySessions(t, legacySession{"legacy-session", "<NULL>"})
+	observationID := seedUnownedObservation(t, s, "legacy-session", "obs-legacy", "legacy")
+
+	result, err := s.RescueNullProjectOwnership(ProjectRescueParams{TargetProject: "target", ObservationIDs: []int64{observationID}})
+	if err != nil {
+		t.Fatalf("RescueNullProjectOwnership: %v", err)
+	}
+	if result.RescuedObservations != 1 || result.RescuedSessions != 1 || !result.Journaled {
+		t.Fatalf("rescue result = %#v, want the dependent session rescued alongside the observation", result)
+	}
+	var sessionProject string
+	if err := s.DB().QueryRow(`SELECT ifnull(project, '') FROM sessions WHERE id = ?`, "legacy-session").Scan(&sessionProject); err != nil || sessionProject != "target" {
+		t.Fatalf("dependent session project = %q, err=%v, want target", sessionProject, err)
+	}
+	var sessionMutations int
+	if err := s.DB().QueryRow(
+		`SELECT COUNT(*) FROM sync_mutations WHERE entity = ? AND entity_key = ? AND project = 'target' AND acked_at IS NULL`,
+		SyncEntitySession, "legacy-session",
+	).Scan(&sessionMutations); err != nil || sessionMutations != 1 {
+		t.Fatalf("dependent session mutations = %d, err=%v, want 1", sessionMutations, err)
+	}
+	assertNoBlankOwnedMutations(t, s)
+}
+
+func TestRescueNullProjectOwnershipMovesBlankOwnedDependentSessionAtomically(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("blank-session", "legacy", "/tmp"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	observationID := seedUnownedObservation(t, s, "blank-session", "obs-blank", "blank")
+	if _, err := s.DB().Exec(`UPDATE sessions SET project = '' WHERE id = ?`, "blank-session"); err != nil {
+		t.Fatalf("seed blank session ownership: %v", err)
+	}
+	if _, err := s.DB().Exec(`DELETE FROM sync_mutations`); err != nil {
+		t.Fatalf("clear seeded journal: %v", err)
+	}
+
+	result, err := s.RescueNullProjectOwnership(ProjectRescueParams{TargetProject: "target", ObservationIDs: []int64{observationID}})
+	if err != nil {
+		t.Fatalf("RescueNullProjectOwnership: %v", err)
+	}
+	if result.RescuedObservations != 1 || result.RescuedSessions != 1 {
+		t.Fatalf("rescue result = %#v, want the blank-owned session rescued alongside the observation", result)
+	}
+	var sessionProject string
+	if err := s.DB().QueryRow(`SELECT project FROM sessions WHERE id = ?`, "blank-session").Scan(&sessionProject); err != nil || sessionProject != "target" {
+		t.Fatalf("blank session project = %q, err=%v, want target", sessionProject, err)
+	}
+	assertNoBlankOwnedMutations(t, s)
+}
+
+func TestRescueNullProjectOwnershipRefusesRecordsOwnedByAnotherSessionProject(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("other-session", "other", "/tmp"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	observationID := seedUnownedObservation(t, s, "other-session", "obs-other", "other")
+	promptID, err := s.AddPrompt(AddPromptParams{SessionID: "other-session", Content: "prompt", Project: "other"})
+	if err != nil {
+		t.Fatalf("AddPrompt: %v", err)
+	}
+	if _, err := s.DB().Exec(`UPDATE user_prompts SET project = NULL WHERE id = ?`, promptID); err != nil {
+		t.Fatalf("seed unowned prompt: %v", err)
+	}
+
+	result, err := s.RescueNullProjectOwnership(ProjectRescueParams{
+		TargetProject:  "target",
+		ObservationIDs: []int64{observationID},
+		PromptIDs:      []int64{promptID},
+	})
+	if err != nil {
+		t.Fatalf("RescueNullProjectOwnership: %v", err)
+	}
+	if result.Rescued() != 0 || result.ConflictingRecords != 2 {
+		t.Fatalf("rescue result = %#v, want both records reported as conflicting", result)
+	}
+	for _, query := range []string{
+		`SELECT project FROM observations WHERE id = ?`,
+		`SELECT project FROM user_prompts WHERE id = ?`,
+	} {
+		id := any(observationID)
+		if strings.Contains(query, "user_prompts") {
+			id = promptID
+		}
+		var project sql.NullString
+		if err := s.DB().QueryRow(query, id).Scan(&project); err != nil {
+			t.Fatalf("read record ownership: %v", err)
+		}
+		if project.Valid {
+			t.Fatalf("record moved without its session: %q", project.String)
+		}
+	}
+	var sessionProject string
+	if err := s.DB().QueryRow(`SELECT project FROM sessions WHERE id = ?`, "other-session").Scan(&sessionProject); err != nil || sessionProject != "other" {
+		t.Fatalf("session project = %q, err=%v, want other", sessionProject, err)
+	}
+}
+
+func TestEnqueueMissingLocalMutationRefusesBlankOwnedSession(t *testing.T) {
+	s := newTestStore(t)
+	err := s.withTx(func(tx *sql.Tx) error {
+		_, enqueueErr := s.enqueueMissingLocalMutationTx(tx, SyncEntitySession, "blank-session", syncSessionPayload{ID: "blank-session", Directory: "/tmp"})
+		return enqueueErr
+	})
+	if !errors.Is(err, ErrProjectRequired) {
+		t.Fatalf("enqueue blank-owned session error = %v, want ErrProjectRequired", err)
+	}
+	var mutations int
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE entity = ?`, SyncEntitySession).Scan(&mutations); err != nil || mutations != 0 {
+		t.Fatalf("journaled blank-owned session mutations = %d, err=%v, want 0", mutations, err)
 	}
 }
 

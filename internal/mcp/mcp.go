@@ -31,7 +31,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-const sourceProcessOverride = "process_override"
+const sourceProcessOverride = projectpkg.SourceProcessOverride
 
 // MCPConfig holds configuration for the MCP server.
 type MCPConfig struct {
@@ -384,7 +384,7 @@ Examples:
 					mcp.Description("New topic key (normalized internally)"),
 				),
 			),
-			queuedWriteHandler(writeQueue, handleUpdate(s)),
+			queuedWriteHandler(writeQueue, handleUpdate(s, cfg)),
 		)
 	}
 
@@ -1371,7 +1371,7 @@ func handleSuggestTopicKey() server.ToolHandlerFunc {
 	}
 }
 
-func handleUpdate(s *store.Store) server.ToolHandlerFunc {
+func handleUpdate(s *store.Store, cfg MCPConfig) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		id := int64(intArg(req, "id", 0))
 		if id == 0 {
@@ -1399,7 +1399,7 @@ func handleUpdate(s *store.Store) server.ToolHandlerFunc {
 			return mcp.NewToolResultError("provide at least one field to update"), nil
 		}
 
-		detRes, err := resolveWriteProject()
+		detRes, err := resolveWriteProjectWithProcessOverride(cfg.DefaultProject)
 		if err != nil {
 			return writeProjectErrorResult(nil, "", detRes, err), nil
 		}
@@ -2325,9 +2325,12 @@ func resolveWriteProject() (projectpkg.DetectionResult, error) {
 	return res, nil
 }
 
-func processProjectResult(project string) (projectpkg.DetectionResult, bool) {
-	project = strings.TrimSpace(project)
-	if project == "" {
+// processProjectResult applies the single process-level override rule
+// (projectpkg.ProcessOverride): the trusted MCPConfig.DefaultProject first, then
+// ENGRAM_PROJECT, and only then cwd detection by the caller.
+func processProjectResult(defaultProject string) (projectpkg.DetectionResult, bool) {
+	project, ok := projectpkg.ProcessOverride(defaultProject)
+	if !ok {
 		return projectpkg.DetectionResult{}, false
 	}
 	normalized, warning := store.NormalizeProject(project)

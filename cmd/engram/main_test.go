@@ -525,6 +525,66 @@ func TestCmdSaveResolvesConfiguredProjectWithoutFlag(t *testing.T) {
 	}
 }
 
+// assertCmdSaveOwnedBy runs cmdSave and asserts the manual session and its
+// observation landed under the expected project.
+func assertCmdSaveOwnedBy(t *testing.T, cfg store.Config, rawProject, wantProject string) {
+	t.Helper()
+	stdout, stderr := captureOutput(t, func() { cmdSave(cfg) })
+	wantWarning := fmt.Sprintf("Project name normalized: %q → %q", rawProject, wantProject)
+	if !strings.Contains(stdout, "Memory saved:") || !strings.Contains(stderr, wantWarning) {
+		t.Fatalf("cmdSave output = stdout %q stderr %q, want %q", stdout, stderr, wantWarning)
+	}
+
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+	session, err := s.GetSession("manual-save-" + wantProject)
+	if err != nil || session.Project != wantProject {
+		t.Fatalf("resolved session = %#v, err=%v, want project %q", session, err, wantProject)
+	}
+	observations, err := s.RecentObservations(wantProject, "project", 10)
+	if err != nil || len(observations) != 1 || observations[0].Title != "resolved-title" {
+		t.Fatalf("resolved observations = %#v, err=%v", observations, err)
+	}
+}
+
+// seedDetectedProjectCWD points the working directory at a project whose
+// .engram/config.json names a project other than any process-level override.
+func seedDetectedProjectCWD(t *testing.T) {
+	t.Helper()
+	cwd := t.TempDir()
+	configDir := filepath.Join(cwd, ".engram")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatalf("create project config directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(`{"project_name":"Configured-Project"}`), 0644); err != nil {
+		t.Fatalf("write project config: %v", err)
+	}
+	withCwd(t, cwd)
+}
+
+func TestCmdSaveHonorsEngramProjectEnvironmentOverride(t *testing.T) {
+	stubExitWithPanic(t)
+	cfg := testConfig(t)
+	seedDetectedProjectCWD(t)
+	t.Setenv("ENGRAM_PROJECT", "Env-Project")
+	withArgs(t, "engram", "save", "resolved-title", "resolved-content")
+
+	assertCmdSaveOwnedBy(t, cfg, "Env-Project", "env-project")
+}
+
+func TestCmdSaveExplicitProjectFlagBeatsEnvironmentOverride(t *testing.T) {
+	stubExitWithPanic(t)
+	cfg := testConfig(t)
+	seedDetectedProjectCWD(t)
+	t.Setenv("ENGRAM_PROJECT", "Env-Project")
+	withArgs(t, "engram", "save", "resolved-title", "resolved-content", "--project", "Flag-Project")
+
+	assertCmdSaveOwnedBy(t, cfg, "Flag-Project", "flag-project")
+}
+
 func TestCmdSaveUsesDetectionSeamAndPrintsNormalizationWarning(t *testing.T) {
 	stubExitWithPanic(t)
 	cfg := testConfig(t)
