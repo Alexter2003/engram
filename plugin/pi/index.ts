@@ -238,10 +238,24 @@ async function engramFetch<TResponse = unknown>(path: string, opts: FetchOptions
   return data as TResponse;
 }
 
+// warnEngramFailure reports a background capture failure on stderr. These calls
+// are best-effort by design, but discarding them without a trace means a user
+// whose memories stopped being saved — an unowned session rejecting writes, for
+// example — has no signal at all that anything is wrong.
+function warnEngramFailure(path: string, error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error);
+  try {
+    process.stderr.write(`[engram] background capture to ${redactUrlPath(path)} failed: ${message}\n`);
+  } catch {
+    // Diagnostics must never break the caller.
+  }
+}
+
 async function bestEffortEngramFetch<TResponse = unknown>(path: string, opts: FetchOptions = {}): Promise<TResponse | null> {
   try {
     return await engramFetch<TResponse>(path, opts);
-  } catch {
+  } catch (error) {
+    warnEngramFailure(path, error);
     return null;
   }
 }

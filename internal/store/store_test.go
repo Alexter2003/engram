@@ -271,6 +271,211 @@ func TestRescueNullProjectOwnershipRescuesLegacyNullableSessionAndJournalsOnce(t
 	}
 }
 
+// seedForeignOwnedObservationTx inserts an observation directly, bypassing the
+// write paths, so a test can construct the legacy shape where an unowned session
+// already parents a record owned by a different project.
+func seedForeignOwnedObservation(t *testing.T, s *Store, sessionID, project, title string) int64 {
+	t.Helper()
+	res, err := s.DB().Exec(
+		`INSERT INTO observations (sync_id, session_id, type, title, content, project, scope) VALUES (?, ?, 'note', ?, 'content', ?, 'project')`,
+		"obs-seed-"+title, sessionID, title, project,
+	)
+	if err != nil {
+		t.Fatalf("seed foreign-owned observation: %v", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("seed foreign-owned observation id: %v", err)
+	}
+	return id
+}
+
+func sessionProjectOrNull(t *testing.T, s *Store, sessionID string) string {
+	t.Helper()
+	var project sql.NullString
+	if err := s.DB().QueryRow(`SELECT project FROM sessions WHERE id = ?`, sessionID).Scan(&project); err != nil {
+		t.Fatalf("read session project: %v", err)
+	}
+	if !project.Valid {
+		return "<NULL>"
+	}
+	return project.String
+}
+
+// A legacy session that carries no ownership must not permanently reject writes.
+// The write already knows its own project, so the session adopts it instead of
+// the record being rejected or silently split from its parent.
+func TestAddObservationAdoptsUnownedLegacySessionProject(t *testing.T) {
+	type legacySession struct{ id, project string }
+	for _, tc := range []struct{ name, sessionID string }{
+		{"null project", "null-session"},
+		{"blank project", "blank-session"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStoreWithNullableLegacySessions(t,
+				legacySession{"null-session", "<NULL>"},
+				legacySession{"blank-session", " "},
+			)
+
+			id, err := s.AddObservation(AddObservationParams{SessionID: tc.sessionID, Type: "note", Title: "upgraded", Content: "content", Project: "target"})
+			if err != nil {
+				t.Fatalf("AddObservation on unowned legacy session = %v, want success", err)
+			}
+			if id == 0 {
+				t.Fatal("AddObservation returned id 0")
+			}
+			if got := sessionProjectOrNull(t, s, tc.sessionID); got != "target" {
+				t.Fatalf("session project = %q, want target (session must adopt the write's project)", got)
+			}
+			obs, err := s.GetObservation(id)
+			if err != nil {
+				t.Fatalf("GetObservation: %v", err)
+			}
+			if obs.Project == nil || *obs.Project != "target" {
+				t.Fatalf("observation project = %v, want target", obs.Project)
+			}
+			// The adopted session must be journaled so the cloud sees the same
+			// ownership the local store now holds.
+			var mutations int
+			if err := s.DB().QueryRow(
+				`SELECT COUNT(*) FROM sync_mutations WHERE entity = ? AND entity_key = ? AND project = ? AND acked_at IS NULL`,
+				SyncEntitySession, tc.sessionID, "target",
+			).Scan(&mutations); err != nil {
+				t.Fatalf("count session mutations: %v", err)
+			}
+			if mutations != 1 {
+				t.Fatalf("adopted session mutations = %d, want 1", mutations)
+			}
+		})
+	}
+}
+
+func TestAddPromptAdoptsUnownedLegacySessionProject(t *testing.T) {
+	type legacySession struct{ id, project string }
+	s := newTestStoreWithNullableLegacySessions(t, legacySession{"null-session", "<NULL>"})
+
+	if _, err := s.AddPrompt(AddPromptParams{SessionID: "null-session", Content: "prompt", Project: "target"}); err != nil {
+		t.Fatalf("AddPrompt on unowned legacy session = %v, want success", err)
+	}
+	if got := sessionProjectOrNull(t, s, "null-session"); got != "target" {
+		t.Fatalf("session project = %q, want target", got)
+	}
+
+	if _, _, err := s.AddPromptIfMissing(AddPromptParams{SessionID: "null-session", Content: "prompt", Project: "target"}); err != nil {
+		t.Fatalf("AddPromptIfMissing on adopted session = %v, want success", err)
+	}
+}
+
+// Adoption must never create the mirror split: an unowned session that already
+// parents a record owned by a different project is genuinely ambiguous, so the
+// write is refused rather than guessed.
+func TestAddObservationRefusesAdoptionWhenSessionParentsForeignOwnedRecord(t *testing.T) {
+	type legacySession struct{ id, project string }
+	s := newTestStoreWithNullableLegacySessions(t, legacySession{"null-session", "<NULL>"})
+	seedForeignOwnedObservation(t, s, "null-session", "other", "foreign")
+
+	_, err := s.AddObservation(AddObservationParams{SessionID: "null-session", Type: "note", Title: "new", Content: "content", Project: "target"})
+	if !errors.Is(err, ErrProjectOwnershipAmbiguous) {
+		t.Fatalf("AddObservation error = %v, want ErrProjectOwnershipAmbiguous", err)
+	}
+	if !strings.Contains(err.Error(), "engram projects rescue-ownership") {
+		t.Fatalf("error %q must name the concrete repair command", err)
+	}
+	if got := sessionProjectOrNull(t, s, "null-session"); got != "<NULL>" {
+		t.Fatalf("session project = %q, want it left untouched", got)
+	}
+}
+
+// The residual hard-fail (no project on the request and none derivable from the
+// session) must name a repair the operator can actually run.
+func TestAddObservationUnownedSessionErrorNamesReachableRepair(t *testing.T) {
+	type legacySession struct{ id, project string }
+	s := newTestStoreWithNullableLegacySessions(t, legacySession{"null-session", "<NULL>"})
+
+	_, err := s.AddObservation(AddObservationParams{SessionID: "null-session", Type: "note", Title: "t", Content: "c"})
+	if !errors.Is(err, ErrProjectRequired) {
+		t.Fatalf("error = %v, want ErrProjectRequired", err)
+	}
+	for _, want := range []string{"null-session", "engram projects rescue-ownership"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q must mention %q", err, want)
+		}
+	}
+}
+
+// A legacy NULL project must be readable; otherwise every caller that inspects
+// the session before writing dies on an opaque scan error.
+func TestGetSessionReadsLegacyNullProject(t *testing.T) {
+	type legacySession struct{ id, project string }
+	s := newTestStoreWithNullableLegacySessions(t, legacySession{"null-session", "<NULL>"})
+
+	sess, err := s.GetSession("null-session")
+	if err != nil {
+		t.Fatalf("GetSession on legacy NULL project = %v, want success", err)
+	}
+	if sess.Project != "" {
+		t.Fatalf("session project = %q, want empty string for NULL ownership", sess.Project)
+	}
+}
+
+// Finding 3, mirror direction: the session pass must not move a session out from
+// under a record that the record pass will classify as conflicting.
+func TestRescueNullProjectOwnershipDoesNotSplitSessionFromForeignOwnedRecord(t *testing.T) {
+	type legacySession struct{ id, project string }
+	s := newTestStoreWithNullableLegacySessions(t, legacySession{"legacy-session", "<NULL>"})
+	foreignID := seedForeignOwnedObservation(t, s, "legacy-session", "other", "foreign")
+
+	result, err := s.RescueNullProjectOwnership(ProjectRescueParams{
+		TargetProject:  "target",
+		SessionIDs:     []string{"legacy-session"},
+		ObservationIDs: []int64{foreignID},
+	})
+	if err != nil {
+		t.Fatalf("RescueNullProjectOwnership: %v", err)
+	}
+	if got := sessionProjectOrNull(t, s, "legacy-session"); got != "<NULL>" {
+		t.Fatalf("session project = %q, want <NULL>: the session must not move away from its foreign-owned record", got)
+	}
+	if result.RescuedSessions != 0 {
+		t.Fatalf("rescued sessions = %d, want 0", result.RescuedSessions)
+	}
+	if result.Complete {
+		t.Fatal("result.Complete = true, want false when records are left behind")
+	}
+	if len(result.Blocked) == 0 {
+		t.Fatal("result.Blocked is empty, want the exact records left behind")
+	}
+	var sawSession, sawObservation bool
+	for _, blocked := range result.Blocked {
+		if blocked.Kind == "session" && blocked.ID == "legacy-session" {
+			sawSession = true
+		}
+		if blocked.Kind == "observation" && blocked.OwnedBy == "other" {
+			sawObservation = true
+		}
+	}
+	if !sawSession || !sawObservation {
+		t.Fatalf("blocked = %#v, want both the session and its foreign-owned observation", result.Blocked)
+	}
+}
+
+// The safe outcome must remain distinguishable from the partial one.
+func TestRescueNullProjectOwnershipReportsCompleteWhenNothingIsLeftBehind(t *testing.T) {
+	type legacySession struct{ id, project string }
+	s := newTestStoreWithNullableLegacySessions(t, legacySession{"legacy-session", "<NULL>"})
+
+	result, err := s.RescueNullProjectOwnership(ProjectRescueParams{TargetProject: "target", SessionIDs: []string{"legacy-session"}})
+	if err != nil {
+		t.Fatalf("RescueNullProjectOwnership: %v", err)
+	}
+	if !result.Complete {
+		t.Fatalf("result.Complete = false, want true when everything moved: %#v", result)
+	}
+	if len(result.Blocked) != 0 {
+		t.Fatalf("blocked = %#v, want empty", result.Blocked)
+	}
+}
+
 func TestRescueNullProjectOwnershipRescuesOnlyNullRecordsAndJournalsOnce(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.CreateSession("legacy-session", "legacy", "/tmp"); err != nil {

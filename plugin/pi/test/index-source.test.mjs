@@ -575,3 +575,19 @@ test("mem_review is registered as a Pi-native executable memory tool", () => {
   assert.match(source, /case "mem_review":[\s\S]*body: \{ observation_id: params\.observation_id \|\| params\.id \}/);
   assert.match(source, /for \(const toolName of ENGRAM_TOOLS\)[\s\S]*executeMemoryTool\(toolName/);
 });
+
+test("best-effort capture failures are surfaced instead of silently discarded", () => {
+  // A passive capture that the server rejects (for example because the parent
+  // session carries no project ownership) must not vanish: the operator has no
+  // other signal that memories stopped being saved.
+  assert.match(source, /function warnEngramFailure\(/);
+  assert.match(source, /process\.stderr\.write/);
+  assert.match(
+    source,
+    /async function bestEffortEngramFetch[\s\S]*catch \(error\) \{[\s\S]*warnEngramFailure\(path, error\)/,
+  );
+  assert.doesNotMatch(
+    source,
+    /async function bestEffortEngramFetch[\s\S]{0,200}catch \{\s*\n\s*return null;/,
+  );
+});

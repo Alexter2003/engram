@@ -188,6 +188,184 @@ func TestHandleRescueProjectOwnershipRequiresConfirmedBoundedRescue(t *testing.T
 	}
 }
 
+// newServerTestStoreWithLegacyNullableSessions builds the shape an upgraded
+// database has: sessions.project is still nullable and carries rows that
+// identify no project.
+func newServerTestStoreWithLegacyNullableSessions(t *testing.T, sessionIDs ...string) *store.Store {
+	t.Helper()
+	cfg, err := store.DefaultConfig()
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.DataDir = t.TempDir()
+	raw, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE sessions (
+		id TEXT PRIMARY KEY,
+		project TEXT,
+		directory TEXT NOT NULL,
+		started_at TEXT NOT NULL DEFAULT (datetime('now')),
+		ended_at TEXT,
+		summary TEXT
+	)`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("create legacy sessions: %v", err)
+	}
+	for _, id := range sessionIDs {
+		if _, err := raw.Exec(`INSERT INTO sessions (id, project, directory) VALUES (?, NULL, ?)`, id, "/tmp"); err != nil {
+			_ = raw.Close()
+			t.Fatalf("seed legacy session: %v", err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close legacy database: %v", err)
+	}
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("open migrated legacy database: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+// An upgraded install must keep accepting writes: the write knows its project,
+// so the unowned session adopts it instead of the write failing forever.
+func TestHandleWritesOnLegacyUnownedSessionSucceedAndAdoptOwnership(t *testing.T) {
+	st := newServerTestStoreWithLegacyNullableSessions(t, "legacy-session")
+	srv := New(st, 0)
+
+	req := httptest.NewRequest(http.MethodPost, "/observations",
+		strings.NewReader(`{"session_id":"legacy-session","type":"note","title":"upgraded","content":"content","project":"target"}`))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("observation on legacy unowned session returned %d: %s", rec.Code, rec.Body.String())
+	}
+
+	sess, err := st.GetSession("legacy-session")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if sess.Project != "target" {
+		t.Fatalf("session project = %q, want target", sess.Project)
+	}
+
+	// Passive capture, the path the Pi plugin drives, must work too.
+	passive := httptest.NewRequest(http.MethodPost, "/observations/passive",
+		strings.NewReader(`{"session_id":"legacy-session","source":"bash","project":"target","content":"## Key Learnings\n\n- The retry backoff must be capped to avoid a thundering herd on restart\n"}`))
+	passiveRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(passiveRec, passive)
+	if passiveRec.Code != http.StatusOK {
+		t.Fatalf("passive capture returned %d: %s", passiveRec.Code, passiveRec.Body.String())
+	}
+}
+
+// When nothing can resolve the project, the failure must be a client-actionable
+// 409 naming the repair — not an opaque 500 the operator cannot act on.
+func TestHandleAddObservationUnresolvableOwnershipReturnsActionableConflict(t *testing.T) {
+	st := newServerTestStoreWithLegacyNullableSessions(t, "legacy-session")
+	srv := New(st, 0)
+
+	req := httptest.NewRequest(http.MethodPost, "/observations",
+		strings.NewReader(`{"session_id":"legacy-session","type":"note","title":"t","content":"c"}`))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409: %s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if response["code"] != "project_ownership_required" {
+		t.Fatalf("code = %v, want project_ownership_required", response["code"])
+	}
+	remedy, _ := response["remedy"].(string)
+	if !strings.Contains(remedy, "engram projects rescue-ownership") {
+		t.Fatalf("remedy = %q, must name the reachable repair", remedy)
+	}
+}
+
+// The zero-config recovery path: no ENGRAM_HTTP_TOKEN anywhere, the HTTP rescue
+// endpoint is unavailable by design, and the CLI repair is what closes the loop.
+func TestRescueOwnershipEndpointUnavailableWithoutTokenButStoreRepairSucceeds(t *testing.T) {
+	t.Setenv("ENGRAM_HTTP_TOKEN", "")
+	st := newServerTestStoreWithLegacyNullableSessions(t, "legacy-session")
+	srv := New(st, 0)
+
+	req := httptest.NewRequest(http.MethodPost, "/projects/rescue-ownership",
+		strings.NewReader(`{"target_project":"target","confirmed":true,"session_ids":["legacy-session"]}`))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 without a configured token", rec.Code)
+	}
+
+	// The same repair, reached without server auth, is what the error tells the
+	// operator to run.
+	result, err := st.RescueNullProjectOwnership(store.ProjectRescueParams{TargetProject: "target", SessionIDs: []string{"legacy-session"}})
+	if err != nil {
+		t.Fatalf("store rescue: %v", err)
+	}
+	if !result.Complete {
+		t.Fatalf("result.Complete = false, want true: %#v", result)
+	}
+	sess, err := st.GetSession("legacy-session")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if sess.Project != "target" {
+		t.Fatalf("session project = %q, want target", sess.Project)
+	}
+}
+
+// The rescue response must let an operator tell a clean move apart from a
+// partial one without inferring it from counters.
+func TestHandleRescueProjectOwnershipReportsWhatWasLeftBehind(t *testing.T) {
+	const token = "rescue-token"
+	t.Setenv("ENGRAM_HTTP_TOKEN", token)
+	st := newServerTestStoreWithLegacyNullableSessions(t, "legacy-session")
+	if _, err := st.DB().Exec(
+		`INSERT INTO observations (sync_id, session_id, type, title, content, project, scope) VALUES ('obs-foreign', 'legacy-session', 'note', 'foreign', 'content', 'other', 'project')`,
+	); err != nil {
+		t.Fatalf("seed foreign-owned observation: %v", err)
+	}
+	srv := New(st, 0)
+
+	req := httptest.NewRequest(http.MethodPost, "/projects/rescue-ownership",
+		strings.NewReader(`{"target_project":"target","confirmed":true,"session_ids":["legacy-session"]}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("rescue returned %d: %s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if response["status"] != "partially_rescued" {
+		t.Fatalf("status = %v, want partially_rescued", response["status"])
+	}
+	if response["complete"] != false {
+		t.Fatalf("complete = %v, want false", response["complete"])
+	}
+	blocked, ok := response["blocked"].([]any)
+	if !ok || len(blocked) == 0 {
+		t.Fatalf("blocked = %#v, want the records left behind", response["blocked"])
+	}
+	// The session must not have moved away from its foreign-owned record.
+	var project sql.NullString
+	if err := st.DB().QueryRow(`SELECT project FROM sessions WHERE id = ?`, "legacy-session").Scan(&project); err != nil {
+		t.Fatalf("read session: %v", err)
+	}
+	if project.Valid && strings.TrimSpace(project.String) != "" {
+		t.Fatalf("session project = %q, want it left unowned", project.String)
+	}
+}
+
 func TestHandleRescueProjectOwnershipRescuesNullOwnershipAndReportsLocalJournal(t *testing.T) {
 	const token = "rescue-token"
 	t.Setenv("ENGRAM_HTTP_TOKEN", token)

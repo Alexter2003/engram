@@ -56,6 +56,10 @@ var (
 	ErrProjectNotFound             = errors.New("project not found")
 	ErrProjectRequired             = errors.New("project identity is required")
 	ErrProjectRescueInvalidRequest = errors.New("project rescue request is invalid")
+	// ErrProjectOwnershipAmbiguous is returned when an unowned session cannot
+	// adopt a write's project because it already parents records owned by a
+	// different one. Guessing there would split a record from its session.
+	ErrProjectOwnershipAmbiguous   = errors.New("session project ownership is ambiguous")
 	ErrObservationProjectImmutable = errors.New("observation project cannot be reassigned")
 	ErrObservationTitleRequired    = errors.New("observation title is required")
 	ErrObservationContentRequired  = errors.New("observation content is required")
@@ -2176,9 +2180,14 @@ func (s *Store) GetSession(id string) (*Session, error) {
 		`SELECT id, project, directory, started_at, ended_at, summary FROM sessions WHERE id = ?`, id,
 	)
 	var sess Session
-	if err := row.Scan(&sess.ID, &sess.Project, &sess.Directory, &sess.StartedAt, &sess.EndedAt, &sess.Summary); err != nil {
+	// A database upgraded from the schema where sessions.project was nullable
+	// still carries NULL ownership, so the column must be read as nullable or
+	// every caller that inspects a legacy session dies on an opaque scan error.
+	var project sql.NullString
+	if err := row.Scan(&sess.ID, &project, &sess.Directory, &sess.StartedAt, &sess.EndedAt, &sess.Summary); err != nil {
 		return nil, err
 	}
+	sess.Project = project.String
 	return &sess, nil
 }
 
@@ -2393,12 +2402,14 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 
 	var observationID int64
 	err := s.withTx(func(tx *sql.Tx) error {
-		if strings.TrimSpace(p.Project) == "" {
-			var err error
-			p.Project, err = requiredSessionProjectTx(tx, p.SessionID)
+		{
+			// Settle ownership first: an unowned legacy session adopts this
+			// write's project rather than rejecting the write forever.
+			resolved, err := s.resolveWriteProjectTx(tx, p.SessionID, p.Project)
 			if err != nil {
 				return err
 			}
+			p.Project = resolved
 		}
 		var obs *Observation
 		if topicKey != "" {
@@ -2712,12 +2723,14 @@ func (s *Store) AddPrompt(p AddPromptParams) (int64, error) {
 
 	var promptID int64
 	err := s.withTx(func(tx *sql.Tx) error {
-		if strings.TrimSpace(p.Project) == "" {
-			var err error
-			p.Project, err = requiredSessionProjectTx(tx, p.SessionID)
+		{
+			// Settle ownership first: an unowned legacy session adopts this
+			// write's project rather than rejecting the write forever.
+			resolved, err := s.resolveWriteProjectTx(tx, p.SessionID, p.Project)
 			if err != nil {
 				return err
 			}
+			p.Project = resolved
 		}
 		syncID := newSyncID("prompt")
 		res, err := s.execHook(tx,
@@ -2762,12 +2775,14 @@ func (s *Store) AddPromptIfMissing(p AddPromptParams) (int64, bool, error) {
 	var promptID int64
 	inserted := false
 	err := s.withTx(func(tx *sql.Tx) error {
-		if strings.TrimSpace(p.Project) == "" {
-			var err error
-			p.Project, err = requiredSessionProjectTx(tx, p.SessionID)
+		{
+			// Settle ownership first: an unowned legacy session adopts this
+			// write's project rather than rejecting the write forever.
+			resolved, err := s.resolveWriteProjectTx(tx, p.SessionID, p.Project)
 			if err != nil {
 				return err
 			}
+			p.Project = resolved
 		}
 		err := tx.QueryRow(
 			`SELECT id FROM user_prompts WHERE session_id = ? AND ifnull(project, '') = ? AND content = ? ORDER BY id DESC LIMIT 1`,
@@ -4796,6 +4811,35 @@ type ProjectRescueParams struct {
 	PromptIDs      []int64
 }
 
+// Reasons a record or session was left behind by a rescue.
+const (
+	// RescueBlockedOwnedByOtherProject means the row itself already belongs to a
+	// project other than the target.
+	RescueBlockedOwnedByOtherProject = "owned_by_other_project"
+	// RescueBlockedSessionOwnedByOtherProject means the row is unowned but its
+	// parent session belongs to another project, so moving it would split it.
+	RescueBlockedSessionOwnedByOtherProject = "session_owned_by_other_project"
+	// RescueBlockedDependentRecordOwnedByOtherProject means an unowned session
+	// was left in place because it parents a record owned by another project.
+	RescueBlockedDependentRecordOwnedByOtherProject = "dependent_record_owned_by_other_project"
+	// RescueBlockedMissing means the requested row does not exist.
+	RescueBlockedMissing = "missing"
+)
+
+// ProjectRescueBlocked names one row the rescue deliberately did not move, and
+// why. It is what lets an operator tell "everything moved" apart from "some
+// things were left behind" without guessing from counters.
+type ProjectRescueBlocked struct {
+	// Kind is "session", "observation", or "prompt".
+	Kind string `json:"kind"`
+	// ID is the session id or the decimal record id.
+	ID string `json:"id"`
+	// Reason is one of the RescueBlocked* constants.
+	Reason string `json:"reason"`
+	// OwnedBy is the conflicting project, when one is known.
+	OwnedBy string `json:"owned_by,omitempty"`
+}
+
 // ProjectRescueResult reports local ownership recovery. Journaled means a
 // canonical pending local mutation exists after the call, whether newly
 // inserted or already pending; it does not imply a cloud acknowledgement.
@@ -4806,10 +4850,19 @@ type ProjectRescueResult struct {
 	ConflictingRecords  int64 `json:"conflicting_records"`
 	SkippedRecords      int64 `json:"skipped_records"`
 	Journaled           bool  `json:"journaled"`
+	// Complete is true only when every requested row now belongs to the target
+	// project and nothing was left behind.
+	Complete bool `json:"complete"`
+	// Blocked lists exactly what was left behind, and why.
+	Blocked []ProjectRescueBlocked `json:"blocked"`
 }
 
 func (r ProjectRescueResult) Rescued() int64 {
 	return r.RescuedObservations + r.RescuedSessions + r.RescuedPrompts
+}
+
+func (r *ProjectRescueResult) block(kind, id, reason, ownedBy string) {
+	r.Blocked = append(r.Blocked, ProjectRescueBlocked{Kind: kind, ID: id, Reason: reason, OwnedBy: ownedBy})
 }
 
 // RescueNullProjectOwnership assigns an explicit project only to selected legacy
@@ -4835,9 +4888,11 @@ func (s *Store) RescueNullProjectOwnership(p ProjectRescueParams) (*ProjectRescu
 
 	result := &ProjectRescueResult{}
 	err := s.withTx(func(tx *sql.Tx) error {
-		// Dependent session ownership is resolved and moved before any record is
-		// touched, inside this same transaction, so an observation or prompt can
-		// never land in a project its parent session does not own.
+		// The whole plan — which sessions and which records will move — is
+		// resolved before anything is written. Mutating the session pass first
+		// would move a session out from under a record the record pass then
+		// classifies as conflicting, splitting the record from its session in
+		// the mirror direction of the case this rescue guards.
 		observations, err := loadRescueRecordsTx(tx, rescueObservationQuery, p.ObservationIDs)
 		if err != nil {
 			return err
@@ -4848,33 +4903,41 @@ func (s *Store) RescueNullProjectOwnership(p ProjectRescueParams) (*ProjectRescu
 		}
 
 		scope := resolveRescueSessionScope(p.SessionIDs, observations, prompts)
-		owned := map[string]bool{}
-		for _, sessionID := range scope.ordered {
-			outcome, err := rescueOwnershipTx(tx, rescueSessionQuery, sessionID, target)
-			if err != nil {
-				return err
-			}
-			if outcome == rescueRescued || outcome == rescueAlreadyOwned {
-				owned[sessionID] = true
-			}
-			if outcome == rescueRescued {
-				result.RescuedSessions++
-			}
-			// Only explicitly requested sessions are reported; dependent sessions
-			// are an implementation detail of the atomic move and are accounted for
-			// through their records.
-			if scope.explicit[sessionID] {
-				result.countOutcome(outcome)
-			}
+		plan, err := planRescueSessionsTx(tx, scope, target, result)
+		if err != nil {
+			return err
 		}
 
-		result.RescuedObservations, err = rescueDependentRecordsTx(tx, rescueObservationQuery, observations, owned, target, result)
+		observationMoves, err := planRescueRecordsTx(tx, rescueObservationQuery, "observation", observations, plan, target, result)
 		if err != nil {
 			return err
 		}
-		result.RescuedPrompts, err = rescueDependentRecordsTx(tx, rescuePromptQuery, prompts, owned, target, result)
+		promptMoves, err := planRescueRecordsTx(tx, rescuePromptQuery, "prompt", prompts, plan, target, result)
 		if err != nil {
 			return err
+		}
+
+		// Plan settled — only now does anything change.
+		for _, sessionID := range plan.claim {
+			if _, err := s.execHook(tx, rescueSessionQuery.updateProject, target, sessionID); err != nil {
+				return err
+			}
+			result.RescuedSessions++
+		}
+		for _, query := range []struct {
+			query rescueRecordQuery
+			moves []int64
+			count *int64
+		}{
+			{rescueObservationQuery, observationMoves, &result.RescuedObservations},
+			{rescuePromptQuery, promptMoves, &result.RescuedPrompts},
+		} {
+			for _, id := range query.moves {
+				if _, err := s.execHook(tx, query.query.updateProject, target, id); err != nil {
+					return err
+				}
+				*query.count++
+			}
 		}
 
 		journaled, err := s.enqueueRescuedProjectMutationsTx(tx, target, scope.ordered, p)
@@ -4882,12 +4945,104 @@ func (s *Store) RescueNullProjectOwnership(p ProjectRescueParams) (*ProjectRescu
 			return err
 		}
 		result.Journaled = journaled
+		result.Complete = len(result.Blocked) == 0
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 	return result, nil
+}
+
+// rescuePlan is the settled decision about session ownership, computed before
+// any row is written.
+type rescuePlan struct {
+	// claim lists unowned sessions that will be moved to the target.
+	claim []string
+	// willOwn reports, for every session in scope, whether it belongs to the
+	// target once the plan is applied.
+	willOwn map[string]bool
+}
+
+// planRescueSessionsTx decides which sessions can move, without moving any. An
+// unowned session that already parents a record owned by another project stays
+// put: claiming it would split that record from its session.
+func planRescueSessionsTx(tx *sql.Tx, scope rescueSessionScope, target string, result *ProjectRescueResult) (rescuePlan, error) {
+	plan := rescuePlan{willOwn: make(map[string]bool, len(scope.ordered))}
+	for _, sessionID := range scope.ordered {
+		project, found, err := sessionOwnershipTx(tx, sessionID)
+		if err != nil {
+			return plan, err
+		}
+		switch {
+		case !found:
+			if scope.explicit[sessionID] {
+				result.countOutcome(rescueMissing)
+				result.block("session", sessionID, RescueBlockedMissing, "")
+			}
+		case project == target:
+			plan.willOwn[sessionID] = true
+			if scope.explicit[sessionID] {
+				result.countOutcome(rescueAlreadyOwned)
+			}
+		case project != "":
+			if scope.explicit[sessionID] {
+				result.countOutcome(rescueConflict)
+			}
+			result.block("session", sessionID, RescueBlockedOwnedByOtherProject, project)
+		default:
+			_, owner, err := foreignRecordOwnerTx(tx, sessionID, target)
+			if err != nil {
+				return plan, err
+			}
+			if owner != "" {
+				// Leaving the session unowned keeps it with its records; moving
+				// it would strand the foreign-owned one.
+				if scope.explicit[sessionID] {
+					result.countOutcome(rescueConflict)
+				}
+				result.block("session", sessionID, RescueBlockedDependentRecordOwnedByOtherProject, owner)
+				continue
+			}
+			plan.claim = append(plan.claim, sessionID)
+			plan.willOwn[sessionID] = true
+		}
+	}
+	return plan, nil
+}
+
+// planRescueRecordsTx decides which records can move, without moving any.
+func planRescueRecordsTx(tx *sql.Tx, query rescueRecordQuery, kind string, records []rescueRecord, plan rescuePlan, target string, result *ProjectRescueResult) ([]int64, error) {
+	var moves []int64
+	for _, record := range records {
+		id := strconv.FormatInt(record.id, 10)
+		if !record.exists {
+			result.countOutcome(rescueMissing)
+			result.block(kind, id, RescueBlockedMissing, "")
+			continue
+		}
+		var raw sql.NullString
+		if err := tx.QueryRow(query.selectProject, record.id).Scan(&raw); err != nil {
+			return nil, err
+		}
+		owned, _ := NormalizeProject(strings.TrimSpace(raw.String))
+		if owned == target {
+			result.countOutcome(rescueAlreadyOwned)
+			continue
+		}
+		if owned != "" {
+			result.countOutcome(rescueConflict)
+			result.block(kind, id, RescueBlockedOwnedByOtherProject, owned)
+			continue
+		}
+		if !plan.willOwn[record.sessionID] {
+			result.countOutcome(rescueConflict)
+			result.block(kind, id, RescueBlockedSessionOwnedByOtherProject, "")
+			continue
+		}
+		moves = append(moves, record.id)
+	}
+	return moves, nil
 }
 
 // rescueOutcome classifies what happened to one record during a rescue.
@@ -4984,56 +5139,6 @@ func resolveRescueSessionScope(explicitIDs []string, recordGroups ...[]rescueRec
 		}
 	}
 	return scope
-}
-
-// rescueOwnershipTx claims a single row for target when it carries no ownership.
-// Blank ownership is treated exactly like NULL: neither identifies a project.
-func rescueOwnershipTx(tx *sql.Tx, query rescueRecordQuery, id any, target string) (rescueOutcome, error) {
-	var project sql.NullString
-	err := tx.QueryRow(query.selectProject, id).Scan(&project)
-	if errors.Is(err, sql.ErrNoRows) {
-		return rescueMissing, nil
-	}
-	if err != nil {
-		return rescueMissing, err
-	}
-	if owned, _ := NormalizeProject(strings.TrimSpace(project.String)); owned != "" {
-		if owned == target {
-			return rescueAlreadyOwned, nil
-		}
-		return rescueConflict, nil
-	}
-	if _, err := tx.Exec(query.updateProject, target, id); err != nil {
-		return rescueMissing, err
-	}
-	return rescueRescued, nil
-}
-
-// rescueDependentRecordsTx moves only records whose parent session is already
-// owned by target after the session pass. A record whose session belongs to a
-// different project is reported as conflicting instead of being split from it.
-func rescueDependentRecordsTx(tx *sql.Tx, query rescueRecordQuery, records []rescueRecord, ownedSessions map[string]bool, target string, result *ProjectRescueResult) (int64, error) {
-	var rescued int64
-	for _, record := range records {
-		if !record.exists {
-			result.countOutcome(rescueMissing)
-			continue
-		}
-		if !ownedSessions[record.sessionID] {
-			result.countOutcome(rescueConflict)
-			continue
-		}
-		outcome, err := rescueOwnershipTx(tx, query, record.id, target)
-		if err != nil {
-			return 0, err
-		}
-		if outcome == rescueRescued {
-			rescued++
-			continue
-		}
-		result.countOutcome(outcome)
-	}
-	return rescued, nil
 }
 
 func (s *Store) MigrateProject(oldName, newName string) (*MigrateResult, error) {
@@ -6442,23 +6547,156 @@ func (s *Store) resolveSessionProjectTx(tx *sql.Tx, sessionID string) (string, e
 	return project, nil
 }
 
-func requiredSessionProjectTx(tx *sql.Tx, sessionID string) (string, error) {
-	var project sql.NullString
-	err := tx.QueryRow(`SELECT project FROM sessions WHERE id = ?`, sessionID).Scan(&project)
+// RescueOwnershipCommand is the repair an operator can always run, whatever the
+// server authorization configuration is: it reaches the local store directly and
+// never goes through the HTTP endpoint. Every ownership error names it, so the
+// failure carries its own remedy instead of pointing at a changelog.
+const RescueOwnershipCommand = "engram projects rescue-ownership"
+
+// rescueOwnershipHint renders the exact repair for one session.
+func rescueOwnershipHint(sessionID string) string {
+	return fmt.Sprintf("%s --project <name> --session %s", RescueOwnershipCommand, sessionID)
+}
+
+// sessionOwnershipTx reads one session's ownership. found reports whether the
+// session row exists; project is empty when the row carries NULL or blank
+// ownership, which are the two legacy shapes that identify no project.
+func sessionOwnershipTx(tx *sql.Tx, sessionID string) (project string, found bool, err error) {
+	var raw sql.NullString
+	err = tx.QueryRow(`SELECT project FROM sessions WHERE id = ?`, sessionID).Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", ErrProjectRequired
+		return "", false, nil
 	}
+	if err != nil {
+		return "", false, err
+	}
+	normalized, _ := NormalizeProject(strings.TrimSpace(raw.String))
+	return normalized, true, nil
+}
+
+// foreignRecordOwnerTx returns the first project, other than exclude, that owns
+// a record parented by this session. It is how a would-be adoption discovers it
+// would split an existing record away from its session. kind reads as a noun
+// phrase inside the error message, so it carries its own article.
+func foreignRecordOwnerTx(tx *sql.Tx, sessionID, exclude string) (string, string, error) {
+	for _, source := range []struct{ kind, query string }{
+		{"an observation", `SELECT project FROM observations WHERE session_id = ? AND ifnull(trim(project), '') <> '' AND deleted_at IS NULL`},
+		{"a prompt", `SELECT project FROM user_prompts WHERE session_id = ? AND ifnull(trim(project), '') <> ''`},
+	} {
+		rows, err := tx.Query(source.query, sessionID)
+		if err != nil {
+			return "", "", err
+		}
+		owner, findErr := func() (string, error) {
+			defer rows.Close()
+			for rows.Next() {
+				var raw sql.NullString
+				if err := rows.Scan(&raw); err != nil {
+					return "", err
+				}
+				owned, _ := NormalizeProject(strings.TrimSpace(raw.String))
+				if owned != "" && owned != exclude {
+					return owned, nil
+				}
+			}
+			return "", rows.Err()
+		}()
+		if findErr != nil {
+			return "", "", findErr
+		}
+		if owner != "" {
+			return source.kind, owner, nil
+		}
+	}
+	return "", "", nil
+}
+
+// resolveWriteProjectTx settles the project one write lands in, and repairs the
+// parent session's ownership on the way through.
+//
+// A database upgraded from the schema where sessions.project was nullable still
+// carries sessions that identify no project. Demanding ownership those rows
+// never had would make every later write to them fail permanently, so ownership
+// is established forward instead: when the write already knows its project, the
+// unowned session adopts it inside this same transaction and is journaled like
+// any other ownership move. The record and its session therefore agree, which is
+// the invariant the hard gate was reaching for, without the lockout.
+//
+// Adoption is refused in the one genuinely ambiguous case — an unowned session
+// that already parents a record owned by a different project — because claiming
+// it there would split that record from its session.
+func (s *Store) resolveWriteProjectTx(tx *sql.Tx, sessionID, requested string) (string, error) {
+	requested, _ = NormalizeProject(strings.TrimSpace(requested))
+	sessionProject, found, err := sessionOwnershipTx(tx, sessionID)
 	if err != nil {
 		return "", err
 	}
-	if !project.Valid {
-		return "", ErrProjectRequired
+
+	if requested == "" {
+		// Nothing on the request to fall back on: the session is the only
+		// source of identity left.
+		if !found {
+			return "", fmt.Errorf("%w: session %q does not exist, so the write has no project to inherit", ErrProjectRequired, sessionID)
+		}
+		if sessionProject == "" {
+			return "", fmt.Errorf(
+				"%w: session %q carries no project ownership and the write supplied none; assign ownership with: %s",
+				ErrProjectRequired, sessionID, rescueOwnershipHint(sessionID),
+			)
+		}
+		return sessionProject, nil
 	}
-	normalized, _ := NormalizeProject(project.String)
-	if strings.TrimSpace(normalized) == "" {
-		return "", ErrProjectRequired
+
+	// The session already agrees, or does not exist yet (callers create it
+	// separately); nothing to repair.
+	if !found || sessionProject == requested {
+		return requested, nil
 	}
-	return normalized, nil
+	if sessionProject != "" {
+		// An owned session keeps its ownership; the caller decides whether a
+		// mismatch is an error. This preserves existing behavior.
+		return requested, nil
+	}
+
+	kind, owner, err := foreignRecordOwnerTx(tx, sessionID, requested)
+	if err != nil {
+		return "", err
+	}
+	if owner != "" {
+		return "", fmt.Errorf(
+			"%w: session %q carries no project ownership but already parents %s owned by %q, so it cannot adopt %q; resolve it explicitly with: %s",
+			ErrProjectOwnershipAmbiguous, sessionID, kind, owner, requested, rescueOwnershipHint(sessionID),
+		)
+	}
+
+	if err := s.adoptSessionOwnershipTx(tx, sessionID, requested); err != nil {
+		return "", err
+	}
+	return requested, nil
+}
+
+// adoptSessionOwnershipTx claims an unowned session for project and journals the
+// move, so the cloud converges on the same ownership the local store now holds.
+func (s *Store) adoptSessionOwnershipTx(tx *sql.Tx, sessionID, project string) error {
+	res, err := s.execHook(tx,
+		`UPDATE sessions SET project = ? WHERE id = ? AND ifnull(trim(project), '') = ''`,
+		project, sessionID,
+	)
+	if err != nil {
+		return err
+	}
+	if affected, err := res.RowsAffected(); err != nil || affected == 0 {
+		return err
+	}
+	var payload syncSessionPayload
+	err = tx.QueryRow(
+		`SELECT id, project, directory, started_at, ended_at, summary FROM sessions WHERE id = ?`, sessionID,
+	).Scan(&payload.ID, &payload.Project, &payload.Directory, &payload.StartedAt, &payload.EndedAt, &payload.Summary)
+	if err != nil {
+		return err
+	}
+	_, err = s.enqueueMissingLocalMutationTx(tx, SyncEntitySession, payload.ID, payload)
+	return err
 }
 
 func (s *Store) applyPulledMutationTx(tx *sql.Tx, mutation SyncMutation) error {

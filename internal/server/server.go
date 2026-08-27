@@ -156,8 +156,36 @@ func requireAuth(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// writeOwnershipError reports an ownership failure the client can act on, and
+// names the concrete repair. The repair is a CLI path that reaches the store
+// directly, so it stays available in a zero-config install where the HTTP
+// rescue endpoint is not served. Returns false when err is not an ownership
+// failure and the caller should keep its own handling.
+func writeOwnershipError(w http.ResponseWriter, sessionID string, err error) bool {
+	code := ""
+	switch {
+	case errors.Is(err, store.ErrProjectOwnershipAmbiguous):
+		code = "project_ownership_ambiguous"
+	case errors.Is(err, store.ErrProjectRequired):
+		code = "project_ownership_required"
+	default:
+		return false
+	}
+	remedy := store.RescueOwnershipCommand + " --project <name>"
+	if strings.TrimSpace(sessionID) != "" {
+		remedy += " --session " + sessionID
+	}
+	jsonErrorWithFields(w, http.StatusConflict, err.Error(), map[string]any{
+		"code":   code,
+		"remedy": remedy,
+	})
+	return true
+}
+
 // requireConfiguredAuth rejects requests when the server token is not configured.
 // It is reserved for endpoints that must never use the zero-config auth default.
+// It is not the only way to repair ownership: store.RescueOwnershipCommand does
+// the same work locally without any server token.
 func requireConfiguredAuth(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if os.Getenv("ENGRAM_HTTP_TOKEN") == "" {
@@ -365,6 +393,7 @@ func (s *Server) handleAddObservation(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, store.ErrObservationTitleRequired),
 			errors.Is(err, store.ErrObservationContentRequired):
 			jsonError(w, http.StatusBadRequest, err.Error())
+		case writeOwnershipError(w, body.SessionID, err):
 		default:
 			jsonError(w, http.StatusInternalServerError, err.Error())
 		}
@@ -391,6 +420,9 @@ func (s *Server) handlePassiveCapture(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.store.PassiveCapture(body)
 	if err != nil {
+		if writeOwnershipError(w, body.SessionID, err) {
+			return
+		}
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -665,6 +697,7 @@ func (s *Server) handleAddPrompt(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, store.ErrPromptContentRequired):
 			jsonError(w, http.StatusBadRequest, err.Error())
+		case writeOwnershipError(w, body.SessionID, err):
 		default:
 			jsonError(w, http.StatusInternalServerError, err.Error())
 		}
@@ -1023,8 +1056,21 @@ func (s *Server) handleRescueProjectOwnership(w http.ResponseWriter, r *http.Req
 	if result.Rescued() > 0 || result.Journaled {
 		s.notifyWrite()
 	}
+	// "rescued" and "partially_rescued" are distinguishable outcomes: the
+	// counters alone cannot tell a clean move apart from one that left records
+	// behind, so the status and the blocked list say it outright.
+	status := "rescued"
+	if !result.Complete {
+		status = "partially_rescued"
+	}
+	blocked := result.Blocked
+	if blocked == nil {
+		blocked = []store.ProjectRescueBlocked{}
+	}
 	jsonResponse(w, http.StatusOK, map[string]any{
-		"status":                "rescued",
+		"status":                status,
+		"complete":              result.Complete,
+		"blocked":               blocked,
 		"target_project":        target,
 		"rescued_observations":  result.RescuedObservations,
 		"rescued_sessions":      result.RescuedSessions,
