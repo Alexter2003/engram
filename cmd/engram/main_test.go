@@ -1062,6 +1062,56 @@ func TestCmdProjectsConsolidateAllDryRun(t *testing.T) {
 	}
 }
 
+func TestCmdProjectsConsolidateAllRenameMigratesMergedIdentity(t *testing.T) {
+	cfg := testConfig(t)
+
+	// Seed a canonical project and a normalization-equivalent legacy variant.
+	mustSeedObservation(t, cfg, "s-eng", "engram", "note", "eng note", "content", "project")
+	mustSeedObservation(t, cfg, "s-legacy", "legacy-source", "note", "legacy note", "content", "project")
+	rewriteLegacyProjectName(t, cfg, "legacy-source", "ENGRAM")
+
+	// Answer "rename" first, then provide the new canonical name.
+	answers := []string{"rename", "Engram Core"}
+	oldScan := scanInputLine
+	t.Cleanup(func() { scanInputLine = oldScan })
+	scanInputLine = func(a ...any) (int, error) {
+		answer := ""
+		if len(answers) > 0 {
+			answer = answers[0]
+			answers = answers[1:]
+		}
+		if ptr, ok := a[0].(*string); ok {
+			*ptr = answer
+		}
+		return 1, nil
+	}
+
+	withArgs(t, "engram", "projects", "consolidate", "--all")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	if !strings.Contains(stdout, "Merged") {
+		t.Fatalf("expected merge output, got: %q", stdout)
+	}
+	if !strings.Contains(stdout, `"engram core"`) {
+		t.Fatalf("expected rename output mentioning new canonical, got: %q", stdout)
+	}
+
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	defer s.Close()
+	names, err := s.ListProjectNames()
+	if err != nil {
+		t.Fatalf("ListProjectNames: %v", err)
+	}
+	if len(names) != 1 || names[0] != "engram core" {
+		t.Fatalf("expected all records under renamed canonical, got: %v", names)
+	}
+}
+
 func TestCmdProjectsAllRejectsWeakAndTransitiveGroups(t *testing.T) {
 	cfg := testConfig(t)
 

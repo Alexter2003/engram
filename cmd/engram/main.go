@@ -2128,16 +2128,22 @@ func cmdProjectsConsolidate(cfg store.Config) {
 			continue
 		}
 
+		renameTarget := ""
 		if answer == "rename" || answer == "r" {
 			fmt.Printf("  Enter canonical name: ")
-			scanInputLine(&canonical)
-			canonical = strings.TrimSpace(canonical)
-			if canonical == "" {
+			var input string
+			scanInputLine(&input)
+			input = strings.TrimSpace(input)
+			if input == "" {
 				fmt.Println("  Empty input, skipping.")
 				fmt.Println()
 				continue
 			}
-			answer = "all" // after rename, merge everything into the new name
+			// Merging only ever targets the group's normalization-equivalent
+			// canonical; the rename is applied afterwards as an explicit
+			// project migration so sync identity follows the new name.
+			renameTarget, _ = store.NormalizeProject(input)
+			answer = "all" // after rename, merge everything then migrate
 		}
 		mergeCanonical, _ := store.NormalizeProject(canonical)
 
@@ -2171,14 +2177,27 @@ func cmdProjectsConsolidate(cfg store.Config) {
 			continue
 		}
 
-		result, err := s.MergeProjects(sources, canonical)
+		result, err := s.MergeProjects(sources, mergeCanonical)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  Error merging: %v\n", err)
 			fmt.Println()
 			continue
 		}
-		fmt.Printf("  Merged: %d obs, %d sessions, %d prompts\n\n",
+		fmt.Printf("  Merged: %d obs, %d sessions, %d prompts\n",
 			result.ObservationsUpdated, result.SessionsUpdated, result.PromptsUpdated)
+
+		if renameTarget != "" && renameTarget != mergeCanonical {
+			migrateResult, err := s.MigrateProject(mergeCanonical, renameTarget)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "  Error renaming %q → %q: %v\n", mergeCanonical, renameTarget, err)
+				fmt.Println()
+				continue
+			}
+			fmt.Printf("  Renamed %q → %q: %d obs, %d sessions, %d prompts\n",
+				mergeCanonical, renameTarget,
+				migrateResult.ObservationsUpdated, migrateResult.SessionsUpdated, migrateResult.PromptsUpdated)
+		}
+		fmt.Println()
 	}
 }
 
