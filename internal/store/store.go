@@ -1601,13 +1601,17 @@ func (s *Store) withReadTx(fn func(tx *sql.Tx) ([]cloudUpgradeLegacyMutationEval
 	return fn(tx)
 }
 
+// listPendingProjectMutationsTx returns the transportable pending journal rows a
+// cloud upgrade still has to account for. Quarantined rows are excluded: they are
+// already dispositioned local evidence, so counting them would keep the upgrade
+// blocked forever with no remaining action an operator could take.
 func (s *Store) listPendingProjectMutationsTx(tx *sql.Tx, project string) ([]SyncMutation, error) {
 	rows, err := s.queryItHook(tx, `
 		SELECT seq, target_key, entity, entity_key, op, payload, source, project, occurred_at, acked_at
 		FROM sync_mutations
-		WHERE target_key = ? AND project = ? AND acked_at IS NULL
+		WHERE target_key = ? AND project = ? AND acked_at IS NULL AND disposition = ?
 		ORDER BY seq ASC
-	`, DefaultSyncTargetKey, project)
+	`, DefaultSyncTargetKey, project, SyncMutationDispositionPending)
 	if err != nil {
 		return nil, err
 	}
@@ -4143,7 +4147,7 @@ func (s *Store) QuarantineIrreparableSyncMutations(project string, apply bool) (
 			return err
 		}
 		for affectedProject := range affectedProjects {
-			if err := s.refreshSyncLifecycleTx(tx, syncTargetKeyForProject(affectedProject)); err != nil {
+			if err := s.refreshProjectSyncLifecycleTx(tx, affectedProject); err != nil {
 				return err
 			}
 		}
@@ -4479,12 +4483,40 @@ func (s *Store) refreshProjectSyncStateTx(tx *sql.Tx, project string) error {
 // refreshSyncLifecycleTx derives a target lifecycle from its remaining transportable mutations.
 func (s *Store) refreshSyncLifecycleTx(tx *sql.Tx, targetKey string) error {
 	targetKey = normalizeSyncTargetKey(targetKey)
-	state, err := s.getSyncStateTx(tx, targetKey)
-	if err != nil {
+	var pendingCount int
+	if err := tx.QueryRow(
+		`SELECT COUNT(*) FROM sync_mutations WHERE target_key = ? AND acked_at IS NULL AND disposition = ?`,
+		targetKey, SyncMutationDispositionPending,
+	).Scan(&pendingCount); err != nil {
 		return err
 	}
+	return s.applySyncLifecycleTx(tx, targetKey, pendingCount)
+}
+
+// refreshProjectSyncLifecycleTx derives the `cloud:<project>` lifecycle from the
+// journal rows the local writer actually produces. enqueueSyncMutationTx always
+// stores mutations under the default `cloud` target key and keeps the project in
+// its own column, so counting rows keyed by `cloud:<project>` would always return
+// zero and mark the project healthy while real pending work remains.
+func (s *Store) refreshProjectSyncLifecycleTx(tx *sql.Tx, project string) error {
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return nil
+	}
 	var pendingCount int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE target_key = ? AND acked_at IS NULL AND disposition = 'pending'`, targetKey).Scan(&pendingCount); err != nil {
+	if err := tx.QueryRow(
+		`SELECT COUNT(*) FROM sync_mutations WHERE target_key = ? AND project = ? AND acked_at IS NULL AND disposition = ?`,
+		DefaultSyncTargetKey, project, SyncMutationDispositionPending,
+	).Scan(&pendingCount); err != nil {
+		return err
+	}
+	return s.applySyncLifecycleTx(tx, syncTargetKeyForProject(project), pendingCount)
+}
+
+func (s *Store) applySyncLifecycleTx(tx *sql.Tx, targetKey string, pendingCount int) error {
+	state, err := s.getSyncStateTx(tx, targetKey)
+	if err != nil {
 		return err
 	}
 	lifecycle := SyncLifecycleHealthy

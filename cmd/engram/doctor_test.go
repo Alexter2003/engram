@@ -361,3 +361,84 @@ func TestCmdDoctorRepairQuarantinesOnlyIrreparableMutations(t *testing.T) {
 		t.Fatalf("dispositions poison=%q later=%q", poison, later)
 	}
 }
+
+func TestCmdDoctorRepairApplyUnblocksDoctorAndKeepsPendingWork(t *testing.T) {
+	cfg := testConfig(t)
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	seedDoctorPendingMutation(t, cfg, "engram", store.SyncEntitySession, "poison", store.SyncOpUpsert, `{"id":"poison"}`)
+	seedDoctorPendingMutation(t, cfg, "engram", store.SyncEntitySession, "keep", store.SyncOpUpsert, `{"id":"keep","directory":"/work/engram"}`)
+
+	runDoctor := func(stage string) map[string]any {
+		t.Helper()
+		withArgs(t, "engram", "doctor", "--json", "--project", "engram", "--check", "sync_mutation_required_fields")
+		stdout, stderr := captureOutput(t, func() { cmdDoctor(cfg) })
+		if stderr != "" {
+			t.Fatalf("%s stderr=%q", stage, stderr)
+		}
+		var report map[string]any
+		if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+			t.Fatalf("%s doctor json invalid: %v\n%s", stage, err, stdout)
+		}
+		return report
+	}
+
+	if report := runDoctor("before repair"); report["status"] != "blocked" {
+		t.Fatalf("expected blocked doctor before repair, got %v", report)
+	}
+
+	withArgs(t, "engram", "doctor", "repair", "--project", "engram", "--check", "sync_mutation_required_fields", "--apply")
+	applyOut, applyErr := captureOutput(t, func() { cmdDoctor(cfg) })
+	if applyErr != "" {
+		t.Fatalf("apply stderr=%q", applyErr)
+	}
+	applied := decodeRepairPlan(t, applyOut)
+	if applied["applied"] != true || len(applied["actions"].([]any)) != 1 {
+		t.Fatalf("apply=%v", applied)
+	}
+
+	report := runDoctor("after repair")
+	if report["status"] == "blocked" {
+		t.Fatalf("doctor stayed blocked after quarantine repair: %v", report)
+	}
+	check := report["checks"].([]any)[0].(map[string]any)
+	if check["result"] == "blocked" || check["severity"] == "blocking" {
+		t.Fatalf("check stayed blocking after quarantine repair: %v", check)
+	}
+	findings := check["findings"].([]any)
+	if len(findings) != 1 {
+		t.Fatalf("expected the quarantined row to remain visible as evidence, got %v", findings)
+	}
+	finding := findings[0].(map[string]any)
+	if finding["severity"] != "info" || finding["reason_code"] != "sync_mutation_quarantined" || finding["requires_confirmation"] != false {
+		t.Fatalf("unexpected quarantined finding: %v", finding)
+	}
+	evidence := finding["evidence"].(map[string]any)
+	if evidence["entity_key"] != "poison" || evidence["disposition"] != store.SyncMutationDispositionQuarantined {
+		t.Fatalf("quarantined evidence lost mutation identity: %v", evidence)
+	}
+
+	reopened, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer reopened.Close()
+	pending, err := reopened.HasPendingSyncMutationsForProject("engram")
+	if err != nil || !pending {
+		t.Fatalf("HasPendingSyncMutationsForProject=%v err=%v", pending, err)
+	}
+	for _, targetKey := range []string{store.DefaultSyncTargetKey, store.DefaultSyncTargetKey + ":engram"} {
+		state, err := reopened.GetSyncState(targetKey)
+		if err != nil {
+			t.Fatalf("state for %q: %v", targetKey, err)
+		}
+		if state.Lifecycle != store.SyncLifecyclePending {
+			t.Fatalf("quarantine repair masked pending work for %q: lifecycle=%q", targetKey, state.Lifecycle)
+		}
+	}
+}
