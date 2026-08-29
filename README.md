@@ -132,6 +132,10 @@ engram cloud upgrade status --project <project>
 
 See the [Cloud upgrade reference](DOCS.md#cloud-upgrade-flow) for apply, rollback, and recovery details.
 
+### Project-aware reads
+
+Project-aware reads use the canonical current project when no selector is supplied: an explicit project, then `ENGRAM_PROJECT`, then cwd detection. Use `--all` in the CLI or `all_projects=true` in HTTP for an intentional global read; do not combine either with an explicit project. `engram context` retains its positional project as an alias for `--project`. `GET /sync/status` supports one resolved project and rejects `all_projects=true` because its provider cannot aggregate status.
+
 ## Terminal UI
 
 ```bash
