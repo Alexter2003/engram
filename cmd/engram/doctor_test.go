@@ -511,6 +511,33 @@ func TestCmdDoctorRepairRepairsTitleOnlyObservationMutation(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatalf("close store: %v", err)
 	}
+	withArgs(t, "engram", "doctor", "repair", "--project", "engram", "--check", "sync_mutation_required_fields", "--plan")
+	planOut, planErr := captureOutput(t, func() { cmdDoctor(cfg) })
+	if planErr != "" {
+		t.Fatalf("plan stderr=%q", planErr)
+	}
+	plan := decodeRepairPlan(t, planOut)
+	repairs := plan["repairs"].([]any)
+	if plan["applied"] != false || len(repairs) != 1 {
+		t.Fatalf("plan=%v", plan)
+	}
+	repairedSeq := repairs[0].(map[string]any)["seq"]
+	for _, action := range plan["actions"].([]any) {
+		if action.(map[string]any)["seq"] == repairedSeq {
+			t.Fatalf("repaired sequence %v remained in residual actions: %v", repairedSeq, plan)
+		}
+	}
+	s, err = store.New(cfg)
+	if err != nil {
+		t.Fatalf("reopen store after plan: %v", err)
+	}
+	planned, err := s.GetObservation(id)
+	if err != nil || planned.Title != "" {
+		t.Fatalf("plan mutated observation=%+v err=%v", planned, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close store after plan: %v", err)
+	}
 	withArgs(t, "engram", "doctor", "repair", "--project", "engram", "--check", "sync_mutation_required_fields", "--apply")
 	out, stderr := captureOutput(t, func() { cmdDoctor(cfg) })
 	if stderr != "" {

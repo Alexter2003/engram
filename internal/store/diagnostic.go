@@ -448,6 +448,7 @@ func (s *Store) RepairObservationMutationTitles(project string, apply bool) (Syn
 	project, _ = NormalizeProject(project)
 	project = strings.TrimSpace(project)
 	report := SyncMutationTitleRepairReport{Project: project, Applied: apply, Actions: []SyncMutationTitleRepairAction{}}
+	var actions []SyncMutationTitleRepairAction
 	err := s.withTx(func(tx *sql.Tx) error {
 		type titleRepair struct {
 			action        SyncMutationTitleRepairAction
@@ -455,6 +456,7 @@ func (s *Store) RepairObservationMutationTitles(project string, apply bool) (Syn
 			observationID int64
 			sourceTitle   string
 		}
+		attemptActions := make([]SyncMutationTitleRepairAction, 0)
 		repairs := make([]titleRepair, 0)
 		query := `SELECT seq, target_key, entity, entity_key, op, payload, source, project, occurred_at, acked_at
 			FROM sync_mutations WHERE target_key = ? AND acked_at IS NULL AND disposition = 'pending'`
@@ -480,13 +482,14 @@ func (s *Store) RepairObservationMutationTitles(project string, apply bool) (Syn
 			if !ok {
 				continue
 			}
-			report.Actions = append(report.Actions, action)
+			attemptActions = append(attemptActions, action)
 			repairs = append(repairs, titleRepair{action, payload, observationID, sourceTitle})
 		}
 		if err := closeRowsWithError(rows, rows.Err()); err != nil {
 			return err
 		}
 		if !apply {
+			actions = attemptActions
 			return nil
 		}
 		repairedObservations := make(map[int64]struct{})
@@ -512,11 +515,13 @@ func (s *Store) RepairObservationMutationTitles(project string, apply bool) (Syn
 				return fmt.Errorf("repair observation title mutation %d", repair.action.Seq)
 			}
 		}
+		actions = attemptActions
 		return nil
 	})
 	if err != nil {
 		return SyncMutationTitleRepairReport{}, fmt.Errorf("repair observation mutation titles: %w", err)
 	}
+	report.Actions = actions
 	return report, nil
 }
 
@@ -535,7 +540,7 @@ func (s *Store) observationMutationTitleRepairTx(tx *sql.Tx, mutation SyncMutati
 		return strings.TrimSpace(value)
 	}
 	entityKey := strings.TrimSpace(mutation.EntityKey)
-	if entityKey == "" || (payloadString("sync_id") != "" && payloadString("sync_id") != entityKey) || payloadString("content") == "" {
+	if entityKey == "" || payloadString("sync_id") != entityKey || payloadString("content") == "" {
 		return SyncMutationTitleRepairAction{}, "", 0, "", false, nil
 	}
 	observation, err := s.getObservationBySyncIDTx(tx, entityKey, false)

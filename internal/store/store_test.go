@@ -10162,6 +10162,125 @@ func TestRepairObservationMutationTitles(t *testing.T) {
 		})
 	}
 
+	t.Run("skips ineligible observations without mutation", func(t *testing.T) {
+		for _, tc := range []struct {
+			name   string
+			mutate func(t *testing.T, s *Store, obs Observation, mutation SyncMutation)
+		}{
+			{
+				name: "missing payload sync ID",
+				mutate: func(t *testing.T, s *Store, _ Observation, mutation SyncMutation) {
+					t.Helper()
+					var payload map[string]json.RawMessage
+					if err := json.Unmarshal([]byte(mutation.Payload), &payload); err != nil {
+						t.Fatalf("decode payload: %v", err)
+					}
+					delete(payload, "sync_id")
+					body, err := json.Marshal(payload)
+					if err != nil {
+						t.Fatalf("encode payload: %v", err)
+					}
+					if _, err := s.db.Exec(`UPDATE sync_mutations SET payload = ? WHERE seq = ?`, string(body), mutation.Seq); err != nil {
+						t.Fatalf("remove payload sync ID: %v", err)
+					}
+				},
+			},
+			{
+				name: "mismatched payload sync ID",
+				mutate: func(t *testing.T, s *Store, _ Observation, mutation SyncMutation) {
+					t.Helper()
+					if _, err := s.db.Exec(`UPDATE sync_mutations SET payload = json_set(payload, '$.sync_id', 'other-observation') WHERE seq = ?`, mutation.Seq); err != nil {
+						t.Fatalf("mismatch payload sync ID: %v", err)
+					}
+				},
+			},
+			{
+				name: "payload project mismatch",
+				mutate: func(t *testing.T, s *Store, _ Observation, mutation SyncMutation) {
+					t.Helper()
+					if _, err := s.db.Exec(`UPDATE sync_mutations SET payload = json_set(payload, '$.project', 'project-b') WHERE seq = ?`, mutation.Seq); err != nil {
+						t.Fatalf("mismatch payload project: %v", err)
+					}
+				},
+			},
+			{
+				name: "mutation project mismatch",
+				mutate: func(t *testing.T, s *Store, _ Observation, mutation SyncMutation) {
+					t.Helper()
+					if _, err := s.db.Exec(`UPDATE sync_mutations SET project = 'project-b' WHERE seq = ?`, mutation.Seq); err != nil {
+						t.Fatalf("mismatch mutation project: %v", err)
+					}
+				},
+			},
+			{
+				name: "soft-deleted observation",
+				mutate: func(t *testing.T, s *Store, obs Observation, _ SyncMutation) {
+					t.Helper()
+					if _, err := s.db.Exec(`UPDATE observations SET deleted_at = datetime('now') WHERE id = ?`, obs.ID); err != nil {
+						t.Fatalf("soft-delete observation: %v", err)
+					}
+				},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				s, obs, mutation, _ := seed(t, "Recovered title. More detail.", func(map[string]json.RawMessage) {})
+				tc.mutate(t, s, obs, mutation)
+
+				var title, payload string
+				var deletedAt sql.NullString
+				if err := s.db.QueryRow(`SELECT title, deleted_at FROM observations WHERE id = ?`, obs.ID).Scan(&title, &deletedAt); err != nil {
+					t.Fatalf("read source before repair: %v", err)
+				}
+				if err := s.db.QueryRow(`SELECT payload FROM sync_mutations WHERE seq = ?`, mutation.Seq).Scan(&payload); err != nil {
+					t.Fatalf("read mutation before repair: %v", err)
+				}
+
+				report, err := s.RepairObservationMutationTitles("project-a", true)
+				if err != nil || len(report.Actions) != 0 {
+					t.Fatalf("report=%+v err=%v", report, err)
+				}
+
+				var repairedTitle, repairedPayload string
+				var repairedDeletedAt sql.NullString
+				if err := s.db.QueryRow(`SELECT title, deleted_at FROM observations WHERE id = ?`, obs.ID).Scan(&repairedTitle, &repairedDeletedAt); err != nil {
+					t.Fatalf("read source after repair: %v", err)
+				}
+				if err := s.db.QueryRow(`SELECT payload FROM sync_mutations WHERE seq = ?`, mutation.Seq).Scan(&repairedPayload); err != nil {
+					t.Fatalf("read mutation after repair: %v", err)
+				}
+				if repairedTitle != title || repairedPayload != payload || repairedDeletedAt != deletedAt {
+					t.Fatalf("ineligible repair mutated source title=%q payload=%q deleted_at=%v; want title=%q payload=%q deleted_at=%v", repairedTitle, repairedPayload, repairedDeletedAt, title, payload, deletedAt)
+				}
+			})
+		}
+	})
+
+	t.Run("reports only actions from the successful retry attempt", func(t *testing.T) {
+		s, _, _, _ := seed(t, "Recovered title. More detail.", func(map[string]json.RawMessage) {})
+		oldBackoffs := sqliteWriteRetryBackoffs
+		sqliteWriteRetryBackoffs = []time.Duration{0}
+		t.Cleanup(func() { sqliteWriteRetryBackoffs = oldBackoffs })
+
+		originalCommit := s.hooks.commit
+		commitAttempts := 0
+		s.hooks.commit = func(tx *sql.Tx) error {
+			commitAttempts++
+			if commitAttempts == 1 {
+				return errors.New("database is locked")
+			}
+			return originalCommit(tx)
+		}
+		t.Cleanup(func() { s.hooks.commit = originalCommit })
+
+		report, err := s.RepairObservationMutationTitles("project-a", false)
+		if err != nil {
+			t.Fatalf("repair after retry: %v", err)
+		}
+		if commitAttempts != 2 || len(report.Actions) != 1 {
+			t.Fatalf("commit attempts=%d report=%+v", commitAttempts, report)
+		}
+	})
+
 	t.Run("applies a Unicode blank source title", func(t *testing.T) {
 		s, obs, _, _ := seed(t, "Recovered title. More detail.", func(map[string]json.RawMessage) {})
 		if _, err := s.db.Exec(`UPDATE observations SET title = ? WHERE id = ?`, "\u2003", obs.ID); err != nil {
