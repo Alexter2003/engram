@@ -69,12 +69,13 @@ The CLI `--json` and MCP tool return:
 
 Plain `engram doctor` remains diagnostic-only. Findings that imply data movement set `requires_confirmation=true` so agents know a human must review evidence before repair.
 
-`engram doctor repair` is intentionally narrow and local-first: local SQLite remains the source of truth, and cloud/sync repair is out of scope. The repair MVP only supports project reclassification for:
+`engram doctor repair` is intentionally narrow and local-first: local SQLite remains the source of truth. It supports project reclassification for:
 
 - `session_project_directory_mismatch`, using trusted `git_remote` or `git_root` evidence from doctor findings.
 - `manual_session_name_project_mismatch`, only for exact `manual-save-{known_project}` sessions, and only when trusted directory evidence does not contradict the manual-name target.
+- `sync_mutation_required_fields`, only when a pending observation upsert has a blank title as its sole missing field and the matching local titleless observation has non-empty content. Repair derives a sanitized, bounded title from that local content and rewrites the existing payload in place; all other invalid mutations remain quarantined on `--apply`.
 
-Repair never deletes or deduplicates rows, never edits sync cursors, never mutates `sync_state`/`sync_mutations`, and never writes cloud state. `--plan` and `--dry-run` are non-mutating. `--apply` creates a SQLite backup under `<ENGRAM_DATA_DIR>/backups/` before a transaction updates only:
+Repair never deletes or deduplicates rows, never edits sync cursors, and never writes cloud state. `--plan` and `--dry-run` are non-mutating. `--apply` creates a SQLite backup under `<ENGRAM_DATA_DIR>/backups/` before a project reclassification transaction updates only:
 
 - `sessions.project`
 - `observations.project`
@@ -83,6 +84,8 @@ Repair never deletes or deduplicates rows, never edits sync cursors, never mutat
 ### Repair JSON envelope
 
 All repair modes print stable JSON to stdout:
+
+For `sync_mutation_required_fields`, `repairs` lists title-only observation upserts that can be restored in place; `actions` continues to list residual rows quarantined on `--apply`.
 
 ```json
 {
