@@ -4098,8 +4098,14 @@ func TestSessionEndFailsClosedWhenRepositoryBindingUnavailable(t *testing.T) {
 		t.Fatalf("expected repository binding failure, got %q", callResultText(t, res))
 	}
 	body := callResultJSON(t, res)
-	if body["error_code"] != "ambiguous_project" || !strings.Contains(body["message"].(string), project.ErrRepositoryBinding.Error()) {
+	if body["error_code"] != "repository_binding_unavailable" || !strings.Contains(body["message"].(string), project.ErrRepositoryBinding.Error()) || !strings.Contains(body["message"].(string), "Configure the repository's .engram/config.json with the intended canonical project.") {
 		t.Fatalf("expected repository binding error response, got %v", body)
+	}
+	if _, ok := body["recovery_token"]; ok {
+		t.Fatalf("repository binding error must not issue an ambiguity recovery token: %v", body)
+	}
+	if _, ok := body["token_ttl_seconds"]; ok {
+		t.Fatalf("repository binding error must not include ambiguity token metadata: %v", body)
 	}
 	session, err := s.GetSession("binding-session")
 	if err != nil || session.EndedAt != nil {
@@ -6361,6 +6367,63 @@ func TestErrorWithMeta_WrapsResponse(t *testing.T) {
 	}
 	if !strings.Contains(text, "repo-a") {
 		t.Errorf("response must contain available_projects, got: %q", text)
+	}
+}
+
+func TestWriteProjectErrorResultClassifiesDetectionErrors(t *testing.T) {
+	activity := NewSessionActivity(10 * time.Minute)
+	tests := []struct {
+		name      string
+		err       error
+		wantCode  string
+		wantToken bool
+		wantHint  string
+	}{
+		{
+			name:      "ambiguous project",
+			err:       project.ErrAmbiguousProject,
+			wantCode:  "ambiguous_project",
+			wantToken: true,
+		},
+		{
+			name:     "invalid config",
+			err:      fmt.Errorf("%w: project_name is required", project.ErrInvalidConfig),
+			wantCode: "invalid_project_config",
+		},
+		{
+			name:     "repository binding",
+			err:      fmt.Errorf("%w: binding is invalid", project.ErrRepositoryBinding),
+			wantCode: "repository_binding_unavailable",
+			wantHint: "Configure the repository's .engram/config.json with the intended canonical project.",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res := writeProjectErrorResult(activity, "session-id", project.DetectionResult{
+				Path:              "/workspace",
+				AvailableProjects: []string{"repo-a", "repo-b"},
+			}, tt.err)
+			body := callResultJSON(t, res)
+			if body["error_code"] != tt.wantCode {
+				t.Fatalf("error code = %q, want %q; body=%v", body["error_code"], tt.wantCode, body)
+			}
+			_, gotToken := body["recovery_token"]
+			if gotToken != tt.wantToken {
+				t.Fatalf("recovery token present = %t, want %t; body=%v", gotToken, tt.wantToken, body)
+			}
+			if tt.wantHint != "" && !strings.Contains(body["message"].(string), tt.wantHint) {
+				t.Fatalf("message %q does not contain recovery guidance %q", body["message"], tt.wantHint)
+			}
+			if tt.wantHint != "" && body["hint"] != tt.wantHint {
+				t.Fatalf("hint = %q, want %q", body["hint"], tt.wantHint)
+			}
+			if tt.wantCode == "repository_binding_unavailable" {
+				if _, ok := body["token_ttl_seconds"]; ok {
+					t.Fatalf("repository binding error must not include ambiguity token metadata: %v", body)
+				}
+			}
+		})
 	}
 }
 

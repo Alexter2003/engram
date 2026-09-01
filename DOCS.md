@@ -763,13 +763,15 @@ Engram resolves the project at MCP tool call time. The default source is the **s
 | Case | Condition                                                                                 | Source            | Project                            |
 | ---- | ----------------------------------------------------------------------------------------- | ----------------- | ---------------------------------- |
 | 1    | nearest `.engram/config.json` exists within the enclosing git root, or at cwd outside git | `config`          | `project_name` from config         |
-| 2    | cwd is a git root with `origin` remote                                                    | `git_remote`      | repo name from remote URL          |
-| 3    | cwd is inside a git repo (subdirectory)                                                   | `git_root`        | git root's directory basename      |
+| 2    | cwd is inside a git repo that currently has an `origin` remote                              | `git_remote`      | if the binding is absent, initialize it from the remote repo name; otherwise reuse the stored binding label |
+| 3    | cwd is inside a git repo that currently has no `origin` remote                               | `git_root`        | if the binding is absent, initialize it from the git-root basename; otherwise reuse the stored binding label |
 | 4    | cwd has exactly one git-repo child                                                        | `git_child`       | child repo name (warning included) |
 | 5    | cwd has multiple git-repo children                                                        | `ambiguous` error | — write tools fail fast            |
 | 6    | no git repo near cwd                                                                      | `dir_basename`    | basename of cwd                    |
 
 Child scan constraints: depth=1, max 20 entries, 200ms timeout, skips hidden dirs and noise dirs (`node_modules`, `vendor`, `.venv`, `__pycache__`, `target`, `dist`, `build`, `.idea`, `.vscode`).
+
+The Git binding is private to each clone and shared by that clone's linked worktrees. Independent clones and forks establish fresh opaque bindings. Cross-clone identity sharing and alias propagation are not currently supported.
 
 ### Response envelope
 
@@ -785,6 +787,8 @@ Most successful MCP tool responses use this envelope:
 ```
 
 Error responses include `available_projects` when the error is `ambiguous_project` or `unknown_project`.
+
+When a Git repository binding cannot be read or created, MCP returns `repository_binding_unavailable` with guidance to configure the repository's `.engram/config.json` with the intended canonical project. This is not an ambiguity and does not include ambiguity recovery tokens.
 
 Exceptions:
 

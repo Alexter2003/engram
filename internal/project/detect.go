@@ -27,8 +27,8 @@ var ErrInvalidConfig = errors.New("invalid .engram/config.json")
 
 // Source constants describe how the project name was resolved.
 const (
-	SourceGitRemote        = "git_remote"        // derived from git remote origin URL
-	SourceGitRoot          = "git_root"          // derived from git repository root basename
+	SourceGitRemote        = "git_remote"        // current repository has an origin remote; Project may come from its binding
+	SourceGitRoot          = "git_root"          // current repository has no origin remote; Project may come from its binding
 	SourceGitChild         = "git_child"         // auto-promoted from single child git repo
 	SourceDirBasename      = "dir_basename"      // fallback: directory basename
 	SourceAmbiguous        = "ambiguous"         // cwd contains multiple git repos (Case 4)
@@ -100,26 +100,27 @@ var (
 
 // DetectionResult carries the full output of DetectProjectFull.
 type DetectionResult struct {
-	// Project is the resolved project name. Empty when Error==ErrAmbiguousProject.
+	// Project is the resolved project name. Empty when detection returns an error.
 	Project string
-	// Source describes how the project name was derived.
+	// Source describes the resolution path. For Git projects, it reflects current
+	// origin-remote presence while Project may come from the stored binding.
 	Source string
 	// Path is the canonical directory associated with the project
 	// (repo root for git cases, input dir for dir_basename).
 	Path string
 	// Warning is a non-empty advisory message when Source==SourceGitChild.
 	Warning string
-	// Error is non-nil only for ErrAmbiguousProject.
+	// Error is non-nil when detection cannot safely resolve a project.
 	Error error
 	// AvailableProjects is populated only when Error==ErrAmbiguousProject.
 	AvailableProjects []string
 }
 
-// DetectProjectFull resolves the project for dir using a 5-case algorithm:
+// DetectProjectFull resolves the project for dir using a 6-case algorithm:
 //
 //  0. config     — nearest .engram/config.json inside the enclosing repo/root
-//  1. git_remote — cwd is a git root with a remote → derive name from remote URL
-//  2. git_root   — cwd is inside a git repo → use repo root basename
+//  1. git_remote — Git repo currently has origin: initialize an absent private binding from the remote name; otherwise reuse it
+//  2. git_root   — Git repo currently has no origin: initialize an absent private binding from the root basename; otherwise reuse it
 //  3. git_child  — cwd has exactly one git-repo child → auto-promote it
 //  4. ambiguous  — cwd has multiple git-repo children → return ErrAmbiguousProject
 //  5. dir_basename — none of the above → use filepath.Base(dir)
@@ -450,7 +451,8 @@ func scanChildren(dir string) (repos []string, timedOut bool) {
 }
 
 // DetectProject detects the project name for a given directory.
-// Priority: git remote origin repo name → git root basename → dir basename.
+// Git detection uses a clone-private binding, initialized once from the remote
+// origin name or repository root basename; later calls reuse that binding.
 // The returned name is always non-empty and already normalized (lowercase, trimmed).
 // This function is a backward-compatible wrapper around DetectProjectFull.
 // On ErrAmbiguousProject, falls back to filepath.Base(dir) so CLI callers

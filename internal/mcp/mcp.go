@@ -2903,6 +2903,13 @@ func respondWithProject(res projectpkg.DetectionResult, text string, extra map[s
 // resolution fails. It handles ambiguous project errors and invalid configs.
 func writeProjectErrorResult(activity *SessionActivity, sessionID string, res projectpkg.DetectionResult, err error) *mcp.CallToolResult {
 	code := "ambiguous_project"
+	if errors.Is(err, projectpkg.ErrRepositoryBinding) {
+		return errorWithMeta(
+			"repository_binding_unavailable",
+			fmt.Sprintf("Cannot determine project: %s. Configure the repository's .engram/config.json with the intended canonical project.", err),
+			nil,
+		)
+	}
 	if errors.Is(err, projectpkg.ErrInvalidConfig) {
 		code = "invalid_project_config"
 	}
@@ -3056,6 +3063,8 @@ func errorWithMeta(code, msg string, availableProjects []string) *mcp.CallToolRe
 		envelope["hint"] = "Use one of the available_projects values, or omit project to auto-detect."
 	case "invalid_project_config":
 		envelope["hint"] = "Fix .engram/config.json so project_name is a non-empty project name."
+	case "repository_binding_unavailable":
+		envelope["hint"] = "Configure the repository's .engram/config.json with the intended canonical project."
 	case "invalid_project":
 		envelope["hint"] = "Use a non-empty project name, not a path."
 	case "unknown_session":

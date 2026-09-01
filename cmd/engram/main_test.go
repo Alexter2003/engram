@@ -2329,6 +2329,61 @@ func TestCmdSyncUsesFullProjectDetection(t *testing.T) {
 	}
 }
 
+func TestCmdSyncFailsClosedWhenFullProjectDetectionFails(t *testing.T) {
+	workDir := t.TempDir()
+	withCwd(t, workDir)
+	t.Setenv("ENGRAM_PROJECT", "")
+	stubExitWithPanic(t)
+
+	oldDetectProjectFull := detectProjectFull
+	oldSyncExport := syncExport
+	t.Cleanup(func() {
+		detectProjectFull = oldDetectProjectFull
+		syncExport = oldSyncExport
+	})
+
+	for _, tt := range []struct {
+		name   string
+		detect project.DetectionResult
+		want   error
+	}{
+		{
+			name:   "repository binding unavailable",
+			detect: project.DetectionResult{Source: project.SourceGitRoot, Path: workDir, Error: fmt.Errorf("%w: test binding failure", project.ErrRepositoryBinding)},
+			want:   project.ErrRepositoryBinding,
+		},
+		{
+			name:   "invalid project config",
+			detect: project.DetectionResult{Source: project.SourceConfig, Path: workDir, Error: fmt.Errorf("%w: test config failure", project.ErrInvalidConfig)},
+			want:   project.ErrInvalidConfig,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			detectProjectFull = func(string) project.DetectionResult { return tt.detect }
+			exportCalled := false
+			syncExport = func(*engramsync.Syncer, string, string) (*engramsync.SyncResult, error) {
+				exportCalled = true
+				return nil, errors.New("syncExport must not run after project detection failure")
+			}
+
+			withArgs(t, "engram", "sync")
+			stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdSync(testConfig(t)) })
+			if _, ok := recovered.(exitCode); !ok {
+				t.Fatalf("cmdSync recovery = %v, want exit code", recovered)
+			}
+			if !strings.Contains(stderr, tt.want.Error()) {
+				t.Fatalf("stderr %q does not contain detection error %q", stderr, tt.want)
+			}
+			if exportCalled {
+				t.Fatal("cmdSync invoked syncExport after project detection failed")
+			}
+			if strings.Contains(stdout, "Exporting memories") {
+				t.Fatalf("cmdSync emitted export output after project detection failed: %q", stdout)
+			}
+		})
+	}
+}
+
 // ─── obsidian-export command tests ───────────────────────────────────────────
 
 // TestObsidianExportMissingVault verifies that omitting --vault exits with code 1
