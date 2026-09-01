@@ -2306,16 +2306,18 @@ func TestCmdMCPServesBeforeDeferredEnrolledProjectRepair(t *testing.T) {
 	}
 }
 
-func TestCmdSyncUsesDetectProject(t *testing.T) {
+func TestCmdSyncUsesFullProjectDetection(t *testing.T) {
 	workDir := t.TempDir()
 	withCwd(t, workDir)
 
 	cfg := testConfig(t)
 
-	// Stub detectProject to verify it's called instead of filepath.Base
-	old := detectProject
-	t.Cleanup(func() { detectProject = old })
-	detectProject = func(dir string) string { return "git-detected-project" }
+	// Stub full detection so sync preserves fail-closed automatic Git detection.
+	old := detectProjectFull
+	t.Cleanup(func() { detectProjectFull = old })
+	detectProjectFull = func(dir string) project.DetectionResult {
+		return project.DetectionResult{Project: "git-detected-project", Source: project.SourceGitRemote, Path: dir}
+	}
 
 	withArgs(t, "engram", "sync")
 	stdout, stderr := captureOutput(t, func() { cmdSync(cfg) })
@@ -2323,7 +2325,7 @@ func TestCmdSyncUsesDetectProject(t *testing.T) {
 		t.Fatalf("expected no stderr, got: %q", stderr)
 	}
 	if !strings.Contains(stdout, "git-detected-project") {
-		t.Fatalf("expected detectProject result in output, got: %q", stdout)
+		t.Fatalf("expected full detection result in output, got: %q", stdout)
 	}
 }
 

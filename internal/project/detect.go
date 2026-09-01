@@ -136,29 +136,9 @@ func DetectProjectFull(dir string) DetectionResult {
 		return res
 	}
 
-	// ── Case 1: git_remote ──────────────────────────────────────────────
-	if name := detectFromGitRemote(dir); name != "" {
-		// JS2: use repo root as Path for consistency with Case 2 (git_root).
-		// When called from a subdir, both cases should set Path to the root.
-		path := detectGitRootDir(dir)
-		if path == "" {
-			// Fallback: should not happen if detectFromGitRemote succeeded, but be safe.
-			path, _ = filepath.Abs(dir)
-		}
-		return DetectionResult{
-			Project: normalize(name),
-			Source:  SourceGitRemote,
-			Path:    path,
-		}
-	}
-
-	// ── Case 2: git_root (includes subdir case) ─────────────────────────
-	if root := detectGitRootDir(dir); root != "" {
-		return DetectionResult{
-			Project: normalize(filepath.Base(root)),
-			Source:  SourceGitRoot,
-			Path:    root,
-		}
+	// ── Cases 1 & 2: Git repository binding ─────────────────────────────
+	if res, ok := detectFromGitBinding(dir); ok {
+		return res
 	}
 
 	// ── Cases 3 & 4: scan child directories ────────────────────────────
@@ -208,6 +188,35 @@ basename:
 		Source:  SourceDirBasename,
 		Path:    absDir,
 	}
+}
+
+// detectFromGitBinding preserves the first legacy Git-derived project label in
+// the repository's shared Git metadata. The binding is private to a clone and
+// shared by linked worktrees; mutable remotes are only consulted at creation.
+func detectFromGitBinding(dir string) (DetectionResult, bool) {
+	commonDir := detectGitCommonDir(dir)
+	if commonDir == "" {
+		return DetectionResult{}, false
+	}
+	root := detectGitRootDir(dir)
+	if root == "" {
+		return DetectionResult{
+			Source: SourceGitRoot,
+			Error:  fmt.Errorf("%w: cannot determine the repository root; configure project_name explicitly", ErrRepositoryBinding),
+		}, true
+	}
+
+	legacyProject := normalize(filepath.Base(root))
+	source := SourceGitRoot
+	if name := detectFromGitRemote(dir); name != "" {
+		legacyProject = normalize(name)
+		source = SourceGitRemote
+	}
+	binding, err := loadOrCreateRepositoryBinding(commonDir, legacyProject)
+	if err != nil {
+		return DetectionResult{Source: source, Path: root, Error: err}, true
+	}
+	return DetectionResult{Project: binding.Project, Source: source, Path: root}, true
 }
 
 type configFile struct {
@@ -334,6 +343,12 @@ func detectGitRootDir(dir string) string {
 		}
 	}
 	return repositoryRootFromCommonDir(commonDir)
+}
+
+func detectGitCommonDir(dir string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return gitRevParsePath(ctx, dir, "--git-common-dir")
 }
 
 func gitRevParsePath(ctx context.Context, dir, argument string) string {
