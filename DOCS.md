@@ -1130,8 +1130,8 @@ All project names are normalized on write and read: **lowercase**, **trimmed**, 
 MCP tools resolve project names at call time using the shared detection chain:
 
 1. Nearest `.engram/config.json` `project_name` within the enclosing git root, or at cwd outside git
-2. Git remote origin URL (extracts repo name)
-3. Git repository root directory name
+2. Git repository with an `origin` remote: initialize an absent private binding from the normalized repo name, otherwise reuse the stored binding label
+3. Git repository without an `origin` remote: initialize an absent private binding from the normalized root directory name, otherwise reuse the stored binding label
 4. Single git-repo child of cwd
 5. Multiple git-repo children of cwd returns `ambiguous_project` with `available_projects`
 6. Current working directory basename
