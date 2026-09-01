@@ -645,6 +645,13 @@ It requires `ENGRAM_CLOUD_TOKEN_PEPPER`, preserves existing grants, and prints t
 - Disabled managed users, revoked managed tokens, and revoked project grants stop authenticating/authorizing on the very next request — no server restart required.
 - No rollback action is required to keep using legacy credentials: legacy `ENGRAM_CLOUD_TOKEN` / `ENGRAM_CLOUD_ADMIN` behavior is unchanged and remains fully supported whether or not `ENGRAM_CLOUD_TOKEN_PEPPER` is configured.
 
+#### Managed admin API response JSON
+
+The managed-admin API returns snake_case JSON keys for user and grant objects:
+
+- `POST /admin/users` returns one user object and `GET /admin/users` returns an array of user objects. Each object contains `principal_id`, `username`, `email`, `display_name`, `role`, `enabled`, and `created_at`.
+- `POST /admin/users/{principalID}/grants` returns one grant object and `GET /admin/users/{principalID}/grants` returns an array of grant objects. Each object contains `principal_id`, `project`, `granted_by_principal_id`, and `created_at`.
+
 Cloud sync is still local-first and explicit:
 
 ```bash
@@ -810,6 +817,7 @@ Guardrails:
 - An unbacked explicit `project` fails loudly and does not create a new bucket.
 - If a non-empty `session_id` is supplied and no session exists, `mem_save` fails with a structured error and does not write.
 - If both explicit `project` and `session_id` are supplied, they must resolve to the same normalized project or `mem_save` fails with a structured error and does not write.
+- When a write omits `session_id`, Engram uses the current process directory only to narrow active non-manual runtime sessions for the resolved project. It attaches to a session only when exactly one candidate remains, uses the project manual-save session when none remain, and rejects multiple candidates rather than selecting by recency. Directory is not session identity; callers with concurrent sessions must supply `session_id`.
 - `project_choice_reason=user_selected_after_ambiguous_project` is only honored when cwd resolution is actually ambiguous. On a non-ambiguous cwd, stale recovery flags do not override explicit-project precedence or session mismatch validation.
 - If ambiguous-project recovery is active, `project` must exactly match one of the previously returned `available_projects`; invented or normalized guesses are rejected.
 - Exact ambiguous-project choices can still fail with `project_name_collision` when multiple available names collapse to the same stored project bucket after normalization. Rename or disambiguate the colliding projects before retrying.
