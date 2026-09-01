@@ -1721,6 +1721,29 @@ func TestHandlePromptContextStatsTimelineAndSessionHandlers(t *testing.T) {
 	}
 }
 
+func TestHandleContextPropagatesStatsError(t *testing.T) {
+	s := newMCPTestStore(t)
+	if err := s.CreateSession("context-stats", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := s.AddObservation(store.AddObservationParams{SessionID: "context-stats", Type: "decision", Title: "Fence", Content: "Restart after replacement", Project: "engram"}); err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+	original := loadContextStats
+	t.Cleanup(func() { loadContextStats = original })
+	loadContextStats = func(*store.Store) (*store.Stats, error) {
+		return nil, store.ErrDatabaseGenerationChanged
+	}
+
+	result, err := handleContext(s, MCPConfig{}, NewSessionActivity(10*time.Minute))(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"project": "engram"}}})
+	if err != nil {
+		t.Fatalf("context handler error: %v", err)
+	}
+	if !result.IsError || !strings.Contains(callResultText(t, result), store.ErrDatabaseGenerationChanged.Error()) {
+		t.Fatalf("context result = %q, want generation error", callResultText(t, result))
+	}
+}
+
 func TestMemContextRemainsProjectScopedAcrossSessions(t *testing.T) {
 	s := newMCPTestStore(t)
 	for _, sessionID := range []string{"manual-a", "manual-b"} {
@@ -6552,6 +6575,38 @@ func TestResolveReadProject_UnknownOverride(t *testing.T) {
 	var upe *unknownProjectError
 	if !errors.As(err, &upe) {
 		t.Errorf("expected *unknownProjectError, got %T: %v", err, err)
+	}
+}
+
+func TestResolveReadProject_UnknownOverrideStatsGenerationChange(t *testing.T) {
+	previous := loadMCPStats
+	loadMCPStats = func(*store.Store) (*store.Stats, error) {
+		return nil, store.ErrDatabaseGenerationChanged
+	}
+	t.Cleanup(func() {
+		loadMCPStats = previous
+	})
+
+	s := newMCPTestStore(t)
+	res, err := resolveReadProject(s, "does-not-exist")
+	if !errors.Is(err, store.ErrDatabaseGenerationChanged) {
+		t.Fatalf("resolveReadProject error = %v; want ErrDatabaseGenerationChanged", err)
+	}
+
+	result := readProjectErrorResult(NewSessionActivity(time.Minute), res, err)
+	var envelope map[string]any
+	if err := json.Unmarshal([]byte(callResultText(t, result)), &envelope); err != nil {
+		t.Fatalf("unmarshal project error result: %v", err)
+	}
+	if got := envelope["error_code"]; got != "database_generation_changed" {
+		t.Errorf("error_code = %q; want database_generation_changed", got)
+	}
+	message, _ := envelope["message"].(string)
+	if !strings.Contains(message, "restart Engram") {
+		t.Errorf("message = %q; want restart guidance", message)
+	}
+	if _, ok := envelope["recovery_token"]; ok {
+		t.Error("project error result included recovery_token")
 	}
 }
 
