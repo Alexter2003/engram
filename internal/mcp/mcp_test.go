@@ -3170,6 +3170,208 @@ func TestServerInstructionsConstantIsNonEmpty(t *testing.T) {
 	}
 }
 
+func TestBuildServerInstructions_NilOrAll(t *testing.T) {
+	instructions := buildServerInstructions(nil)
+	if instructions == "" {
+		t.Fatal("buildServerInstructions(nil) returned empty string")
+	}
+
+	// Intro header
+	if !strings.Contains(instructions, "Engram provides persistent memory that survives across sessions and compactions.") {
+		t.Errorf("missing intro header in nil allowlist instructions")
+	}
+
+	// CORE tools
+	coreTools := []string{
+		"mem_save", "mem_search", "mem_context", "mem_session_summary",
+		"mem_get_observation", "mem_save_prompt", "mem_current_project", "mem_judge", "mem_compare",
+	}
+	for _, tool := range coreTools {
+		if !strings.Contains(instructions, tool) {
+			t.Errorf("expected core tool %q in nil allowlist instructions", tool)
+		}
+	}
+
+	// DEFERRED tools (both agent and admin)
+	deferredTools := []string{
+		"mem_update", "mem_review", "mem_pin", "mem_unpin", "mem_suggest_topic_key",
+		"mem_session_start", "mem_session_end", "mem_doctor", "mem_capture_passive",
+		"mem_stats", "mem_delete", "mem_timeline", "mem_merge_projects",
+	}
+	for _, tool := range deferredTools {
+		if !strings.Contains(instructions, tool) {
+			t.Errorf("expected deferred tool %q in nil allowlist instructions", tool)
+		}
+	}
+
+	// Proactive save rule & conflict surfacing
+	if !strings.Contains(instructions, "PROACTIVE SAVE RULE:") {
+		t.Errorf("expected PROACTIVE SAVE RULE in nil allowlist instructions")
+	}
+	if !strings.Contains(instructions, "## CONFLICT SURFACING") {
+		t.Errorf("expected CONFLICT SURFACING in nil allowlist instructions")
+	}
+}
+
+func TestBuildServerInstructions_ProfileAgent(t *testing.T) {
+	instructions := buildServerInstructions(ProfileAgent)
+
+	// CORE tools should all be present
+	coreTools := []string{
+		"mem_save", "mem_search", "mem_context", "mem_session_summary",
+		"mem_get_observation", "mem_save_prompt", "mem_current_project", "mem_judge", "mem_compare",
+	}
+	for _, tool := range coreTools {
+		if !strings.Contains(instructions, tool) {
+			t.Errorf("expected core tool %q in agent instructions", tool)
+		}
+	}
+
+	// Agent deferred tools present
+	agentDeferred := []string{
+		"mem_update", "mem_review", "mem_pin", "mem_unpin", "mem_suggest_topic_key",
+		"mem_session_start", "mem_session_end", "mem_doctor", "mem_capture_passive",
+	}
+	for _, tool := range agentDeferred {
+		if !strings.Contains(instructions, tool) {
+			t.Errorf("expected agent deferred tool %q in agent instructions", tool)
+		}
+	}
+
+	// Conflict surfacing and proactive save rule present
+	if !strings.Contains(instructions, "## CONFLICT SURFACING") {
+		t.Errorf("expected CONFLICT SURFACING in agent instructions")
+	}
+	if !strings.Contains(instructions, "PROACTIVE SAVE RULE:") {
+		t.Errorf("expected PROACTIVE SAVE RULE in agent instructions")
+	}
+
+	// Admin tools MUST NOT be advertised in agent instructions
+	adminTools := []string{"mem_stats", "mem_delete", "mem_timeline", "mem_merge_projects"}
+	for _, tool := range adminTools {
+		if strings.Contains(instructions, tool) {
+			t.Errorf("admin tool %q MUST NOT be advertised in agent instructions", tool)
+		}
+	}
+}
+
+func TestBuildServerInstructions_ProfileAdmin(t *testing.T) {
+	instructions := buildServerInstructions(ProfileAdmin)
+
+	// Admin tools should be present in deferred
+	adminTools := []string{"mem_stats", "mem_delete", "mem_timeline", "mem_merge_projects"}
+	for _, tool := range adminTools {
+		if !strings.Contains(instructions, tool) {
+			t.Errorf("expected admin tool %q in admin instructions", tool)
+		}
+	}
+
+	// CORE TOOLS, PROACTIVE SAVE RULE, CONFLICT SURFACING should NOT be present
+	if strings.Contains(instructions, "CORE TOOLS (always available") {
+		t.Errorf("admin instructions should not include CORE TOOLS section")
+	}
+	if strings.Contains(instructions, "PROACTIVE SAVE RULE:") {
+		t.Errorf("admin instructions should not include PROACTIVE SAVE RULE")
+	}
+	if strings.Contains(instructions, "## CONFLICT SURFACING") {
+		t.Errorf("admin instructions should not include CONFLICT SURFACING section")
+	}
+
+	// Agent-only deferred tools should NOT be present
+	agentOnly := []string{"mem_review", "mem_doctor", "mem_compare", "mem_capture_passive"}
+	for _, tool := range agentOnly {
+		if strings.Contains(instructions, tool) {
+			t.Errorf("agent tool %q should not be in admin instructions", tool)
+		}
+	}
+}
+
+func TestBuildServerInstructions_CustomAndConditional(t *testing.T) {
+	t.Run("only mem_save and mem_update", func(t *testing.T) {
+		allowlist := map[string]bool{
+			"mem_save":   true,
+			"mem_update": true,
+		}
+		instructions := buildServerInstructions(allowlist)
+
+		if !strings.Contains(instructions, "CORE TOOLS") {
+			t.Errorf("expected CORE TOOLS section when mem_save is present")
+		}
+		if !strings.Contains(instructions, "mem_save — ") {
+			t.Errorf("expected mem_save in CORE TOOLS")
+		}
+		if strings.Contains(instructions, "mem_search") {
+			t.Errorf("mem_search should not be present in custom instructions")
+		}
+
+		if !strings.Contains(instructions, "DEFERRED TOOLS") {
+			t.Errorf("expected DEFERRED TOOLS section when mem_update is present")
+		}
+		if !strings.Contains(instructions, "mem_update") {
+			t.Errorf("expected mem_update in DEFERRED TOOLS")
+		}
+		if strings.Contains(instructions, "mem_review") {
+			t.Errorf("mem_review should not be present in custom instructions")
+		}
+
+		if !strings.Contains(instructions, "PROACTIVE SAVE RULE:") {
+			t.Errorf("expected PROACTIVE SAVE RULE when mem_save is present")
+		}
+		if strings.Contains(instructions, "## CONFLICT SURFACING") {
+			t.Errorf("conflict surfacing should not be present when mem_judge is absent")
+		}
+	})
+
+	t.Run("only mem_judge", func(t *testing.T) {
+		allowlist := map[string]bool{
+			"mem_judge": true,
+		}
+		instructions := buildServerInstructions(allowlist)
+
+		if !strings.Contains(instructions, "CORE TOOLS") {
+			t.Errorf("CORE TOOLS should be present when mem_judge (core, eager) is registered")
+		}
+		if !strings.Contains(instructions, "mem_judge — ") {
+			t.Errorf("expected mem_judge in CORE TOOLS when registered")
+		}
+		if strings.Contains(instructions, "DEFERRED TOOLS") {
+			t.Errorf("DEFERRED TOOLS should be absent when no deferred tools are registered")
+		}
+		if strings.Contains(instructions, "PROACTIVE SAVE RULE:") {
+			t.Errorf("PROACTIVE SAVE RULE should be absent when mem_save is absent")
+		}
+		if strings.Contains(instructions, "## CONFLICT SURFACING") {
+			t.Errorf("CONFLICT SURFACING should be absent when mem_save is absent")
+		}
+		if strings.Contains(instructions, "mem_save") {
+			t.Errorf("mem_save should not be mentioned when it is not registered")
+		}
+	})
+
+	t.Run("mem_save and mem_judge", func(t *testing.T) {
+		allowlist := map[string]bool{
+			"mem_save":  true,
+			"mem_judge": true,
+		}
+		instructions := buildServerInstructions(allowlist)
+
+		if !strings.Contains(instructions, "## CONFLICT SURFACING") {
+			t.Errorf("CONFLICT SURFACING should be present when mem_save and mem_judge are registered")
+		}
+		if !strings.Contains(instructions, "After mem_save:") {
+			t.Errorf("conflict guidance should mention mem_save when it is registered")
+		}
+	})
+
+	t.Run("empty allowlist", func(t *testing.T) {
+		instructions := buildServerInstructions(map[string]bool{})
+		expected := "Engram provides persistent memory that survives across sessions and compactions."
+		if instructions != expected {
+			t.Errorf("empty allowlist should only produce header, got %q", instructions)
+		}
+	})
+}
+
 // ─── Tool Annotations ────────────────────────────────────────────────────────
 
 func TestCoreToolsAreNotDeferred(t *testing.T) {
@@ -3179,7 +3381,7 @@ func TestCoreToolsAreNotDeferred(t *testing.T) {
 
 	coreTools := []string{
 		"mem_save", "mem_search", "mem_context", "mem_session_summary",
-		"mem_get_observation", "mem_save_prompt",
+		"mem_get_observation", "mem_save_prompt", "mem_judge", "mem_compare",
 	}
 	for _, name := range coreTools {
 		tool := tools[name]
