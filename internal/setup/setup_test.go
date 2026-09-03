@@ -2988,7 +2988,9 @@ func TestClaudeCodeUserPromptHookWithoutJQTreatsOnlyEmptyObservationsArrayAsNeve
 		t.Fatalf("resolve user prompt hook path: %v", err)
 	}
 
-	naiveUTC := time.Now().UTC().Add(-20 * time.Minute).Format(time.DateTime)
+	now := time.Now().UTC()
+	staleNaiveUTC := now.Add(-20 * time.Minute).Format(time.DateTime)
+	recentNaiveUTC := now.Add(-5 * time.Minute).Format(time.DateTime)
 	tests := []struct {
 		name               string
 		observations       string
@@ -2998,7 +3000,8 @@ func TestClaudeCodeUserPromptHookWithoutJQTreatsOnlyEmptyObservationsArrayAsNeve
 	}{
 		{name: "exact empty array", observations: "[]", wantNudge: true},
 		{name: "whitespace empty array", observations: " \n\t[ \r\n ] \n", wantNudge: true},
-		{name: "timezone-less UTC timestamp under EST5", observations: fmt.Sprintf(`[{"created_at":%q}]`, naiveUTC), timezone: "EST5", wantNudge: true},
+		{name: "timezone-less UTC timestamp under EST5", observations: fmt.Sprintf(`[{"created_at":%q}]`, staleNaiveUTC), timezone: "EST5", wantNudge: true},
+		{name: "recent timezone-less UTC timestamp under JST-9", observations: fmt.Sprintf(`[{"created_at":%q}]`, recentNaiveUTC), timezone: "JST-9", wantNudge: false},
 		{name: "observations non-success response", observations: "[]", observationsStatus: http.StatusInternalServerError, wantNudge: false},
 		{name: "malformed payload", observations: "[{", wantNudge: false},
 		{name: "non-array payload", observations: `{}`, wantNudge: false},
