@@ -2988,13 +2988,18 @@ func TestClaudeCodeUserPromptHookWithoutJQTreatsOnlyEmptyObservationsArrayAsNeve
 		t.Fatalf("resolve user prompt hook path: %v", err)
 	}
 
+	naiveUTC := time.Now().UTC().Add(-20 * time.Minute).Format(time.DateTime)
 	tests := []struct {
-		name         string
-		observations string
-		wantNudge    bool
+		name               string
+		observations       string
+		observationsStatus int
+		timezone           string
+		wantNudge          bool
 	}{
 		{name: "exact empty array", observations: "[]", wantNudge: true},
 		{name: "whitespace empty array", observations: " \n\t[ \r\n ] \n", wantNudge: true},
+		{name: "timezone-less UTC timestamp under EST5", observations: fmt.Sprintf(`[{"created_at":%q}]`, naiveUTC), timezone: "EST5", wantNudge: true},
+		{name: "observations non-success response", observations: "[]", observationsStatus: http.StatusInternalServerError, wantNudge: false},
 		{name: "malformed payload", observations: "[{", wantNudge: false},
 		{name: "non-array payload", observations: `{}`, wantNudge: false},
 		{name: "non-empty array without timestamp", observations: `[{}]`, wantNudge: false},
@@ -3010,6 +3015,9 @@ func TestClaudeCodeUserPromptHookWithoutJQTreatsOnlyEmptyObservationsArrayAsNeve
 				case "/sessions/session-empty-array":
 					_, _ = w.Write([]byte(`{"started_at":"2000-01-01T00:00:00Z"}`))
 				case "/observations":
+					if tt.observationsStatus != 0 {
+						w.WriteHeader(tt.observationsStatus)
+					}
 					_, _ = w.Write([]byte(tt.observations))
 				default:
 					http.NotFound(w, r)
@@ -3021,10 +3029,11 @@ func TestClaudeCodeUserPromptHookWithoutJQTreatsOnlyEmptyObservationsArrayAsNeve
 				t.Fatalf("parse test server URL: %v", err)
 			}
 
-			env := withoutEnv(os.Environ(), "PATH", "TMPDIR", "ENGRAM_PORT", "ENGRAM_CLAUDE_WINDOWS_BASH_SAFE_MODE", "ENGRAM_HOOK_MAX_TIME")
+			env := withoutEnv(os.Environ(), "PATH", "TMPDIR", "TZ", "ENGRAM_PORT", "ENGRAM_CLAUDE_WINDOWS_BASH_SAFE_MODE", "ENGRAM_HOOK_MAX_TIME")
 			env = append(env,
 				"PATH="+strings.Join(pathDirs, string(os.PathListSeparator)),
 				"TMPDIR="+t.TempDir(),
+				"TZ="+tt.timezone,
 				"ENGRAM_PORT="+serverURL.Port(),
 				"ENGRAM_CLAUDE_WINDOWS_BASH_SAFE_MODE=0",
 				"ENGRAM_HOOK_MAX_TIME=1",
