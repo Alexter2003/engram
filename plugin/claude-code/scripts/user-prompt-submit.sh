@@ -302,13 +302,21 @@ user_prompt_submit_without_jq() {
 
   url_encode_without_jq "$project"
   encoded_project="$JSON_VALUE"
-  last_save_json=$(curl -sf "${ENGRAM_URL}/observations?project=${encoded_project}&limit=1&sort=created_at:desc" --max-time "$ENGRAM_HOOK_MAX_TIME" 2>/dev/null)
-  json_string_value_without_jq "created_at" "$last_save_json" && last_save_at="$JSON_VALUE" || last_save_at=""
-  [ -n "$last_save_at" ] || { printf '%s\n' '{}'; return 0; }
-  last_epoch=$(parse_epoch "$last_save_at")
-  [ -n "$last_epoch" ] || { printf '%s\n' '{}'; return 0; }
-  now_epoch=$(date "+%s")
-  elapsed=$(( now_epoch - last_epoch ))
+  last_save_json=$(curl -sf "${ENGRAM_URL}/observations?project=${encoded_project}&limit=1&sort=created_at:desc" --max-time "$ENGRAM_HOOK_MAX_TIME" 2>/dev/null) || {
+    printf '%s\n' '{}'
+    return 0
+  }
+  if [[ "$last_save_json" =~ ^[[:space:]]*\[[[:space:]]*\][[:space:]]*$ ]]; then
+    now_epoch=$(date "+%s")
+    elapsed=901
+  else
+    json_string_value_without_jq "created_at" "$last_save_json" && last_save_at="$JSON_VALUE" || last_save_at=""
+    [ -n "$last_save_at" ] || { printf '%s\n' '{}'; return 0; }
+    last_epoch=$(parse_epoch "$last_save_at")
+    [ -n "$last_epoch" ] || { printf '%s\n' '{}'; return 0; }
+    now_epoch=$(date "+%s")
+    elapsed=$(( now_epoch - last_epoch ))
+  fi
 
   if [ "$elapsed" -gt 900 ]; then
     nudge_cooldown="${ENGRAM_NUDGE_COOLDOWN_SECS:-900}"

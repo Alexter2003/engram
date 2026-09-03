@@ -2977,6 +2977,89 @@ func TestClaudeCodeUserPromptHookWithoutJQPreservesSessionStateAndNudge(t *testi
 	}
 }
 
+func TestClaudeCodeUserPromptHookWithoutJQTreatsOnlyEmptyObservationsArrayAsNeverSaved(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs the Claude Code shell hook as a child process")
+	}
+
+	bashPath, pathDirs := isolatedHookPath(t)
+	scriptPath, err := filepath.Abs(filepath.Join("..", "..", "plugin", "claude-code", "scripts", "user-prompt-submit.sh"))
+	if err != nil {
+		t.Fatalf("resolve user prompt hook path: %v", err)
+	}
+
+	tests := []struct {
+		name         string
+		observations string
+		wantNudge    bool
+	}{
+		{name: "exact empty array", observations: "[]", wantNudge: true},
+		{name: "whitespace empty array", observations: " \n\t[ \r\n ] \n", wantNudge: true},
+		{name: "malformed payload", observations: "[{", wantNudge: false},
+		{name: "non-array payload", observations: `{}`, wantNudge: false},
+		{name: "non-empty array without timestamp", observations: `[{}]`, wantNudge: false},
+		{name: "non-empty array with invalid timestamp", observations: `[{"created_at":"invalid"}]`, wantNudge: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/project/current":
+					_, _ = w.Write([]byte(`{"project":"hook-test","project_source":"config"}`))
+				case "/sessions/session-empty-array":
+					_, _ = w.Write([]byte(`{"started_at":"2000-01-01T00:00:00Z"}`))
+				case "/observations":
+					_, _ = w.Write([]byte(tt.observations))
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			serverURL, err := url.Parse(server.URL)
+			if err != nil {
+				t.Fatalf("parse test server URL: %v", err)
+			}
+
+			env := withoutEnv(os.Environ(), "PATH", "TMPDIR", "ENGRAM_PORT", "ENGRAM_CLAUDE_WINDOWS_BASH_SAFE_MODE", "ENGRAM_HOOK_MAX_TIME")
+			env = append(env,
+				"PATH="+strings.Join(pathDirs, string(os.PathListSeparator)),
+				"TMPDIR="+t.TempDir(),
+				"ENGRAM_PORT="+serverURL.Port(),
+				"ENGRAM_CLAUDE_WINDOWS_BASH_SAFE_MODE=0",
+				"ENGRAM_HOOK_MAX_TIME=1",
+			)
+
+			runHook := func() string {
+				t.Helper()
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				cmd := exec.CommandContext(ctx, bashPath, scriptPath)
+				cmd.Env = env
+				cmd.Stdin = strings.NewReader(`{"cwd":"/workspace","session_id":"session-empty-array"}`)
+				var stdout, stderr bytes.Buffer
+				cmd.Stdout = &stdout
+				cmd.Stderr = &stderr
+				if err := cmd.Run(); err != nil {
+					t.Fatalf("run user prompt hook without jq: %v\nstderr: %s", err, stderr.String())
+				}
+				var response map[string]any
+				if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &response); err != nil {
+					t.Fatalf("user prompt hook emitted invalid JSON %q: %v", stdout.String(), err)
+				}
+				return stdout.String()
+			}
+
+			runHook()
+			output := runHook()
+			gotNudge := strings.Contains(output, "MEMORY REMINDER")
+			if gotNudge != tt.wantNudge {
+				t.Fatalf("second hook invocation nudge = %t, want %t; output: %q", gotNudge, tt.wantNudge, output)
+			}
+		})
+	}
+}
+
 func isolatedHookPath(t *testing.T) (string, []string) {
 	t.Helper()
 	if gitPath, err := exec.LookPath("git"); err == nil {
