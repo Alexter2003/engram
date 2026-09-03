@@ -79,6 +79,24 @@ func TestPluginAssetsDoNotLeakSpanishTriggers(t *testing.T) {
 	}
 }
 
+func TestOpenCodeEmbeddedAssetMatchesCanonicalSource(t *testing.T) {
+	root := repoRoot(t)
+	canonicalPath := filepath.Join(root, "plugin", "opencode", "engram.ts")
+	embeddedPath := filepath.Join(root, "internal", "setup", "plugins", "opencode", "engram.ts")
+
+	canonical, err := os.ReadFile(canonicalPath)
+	if err != nil {
+		t.Fatalf("read canonical OpenCode plugin: %v", err)
+	}
+	embedded, err := os.ReadFile(embeddedPath)
+	if err != nil {
+		t.Fatalf("read embedded OpenCode plugin: %v", err)
+	}
+	if string(embedded) != string(canonical) {
+		t.Fatalf("embedded OpenCode plugin differs from canonical source; run go generate ./internal/setup")
+	}
+}
+
 // marketplaceJSON is the minimal structure of .claude-plugin/marketplace.json
 // needed to extract the version declared for the engram plugin entry.
 type marketplaceJSON struct {
