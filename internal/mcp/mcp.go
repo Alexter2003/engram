@@ -93,7 +93,7 @@ var currentWorkingDirectory = func() string {
 }
 
 func ensureImplicitSessionWithCWD(s *store.Store, sessionID, project string) error {
-	return s.CreateSessionWithOwnershipMode(sessionID, project, currentWorkingDirectory(), store.SessionOwnershipProjectOwned)
+	return s.CreateSession(sessionID, project, currentWorkingDirectory())
 }
 
 // runtimeSessionDirectory derives the worktree-specific key for omitted
@@ -2482,6 +2482,20 @@ func (e *sessionProjectMismatchError) Error() string {
 	return fmt.Sprintf("session %q belongs to project %q, not %q", e.SessionID, e.SessionProject, e.ExplicitProject)
 }
 
+func sessionProjectResolutionError(sessionID, sessionProject, sessionMode, requestedProject string) error {
+	if sessionProject == "" || sessionProject == requestedProject || sessionMode == store.SessionOwnershipShared {
+		return nil
+	}
+	if sessionMode == store.SessionOwnershipProjectOwned {
+		return &sessionProjectMismatchError{
+			SessionID:       sessionID,
+			SessionProject:  sessionProject,
+			ExplicitProject: requestedProject,
+		}
+	}
+	return fmt.Errorf("%w: session %q has unclassified ownership for %q and cannot accept %q", store.ErrProjectOwnershipAmbiguous, sessionID, sessionProject, requestedProject)
+}
+
 // resolveWriteProject detects the current project from the process working
 // directory. Returns ErrAmbiguousProject if cwd is a parent of multiple repos.
 func resolveWriteProject() (projectpkg.DetectionResult, error) {
@@ -2600,6 +2614,7 @@ func resolveSaveWriteProject(s *store.Store, projectChoice string, explicitProje
 	trimmedProjectChoice := strings.TrimSpace(projectChoice)
 	trimmedReason := strings.TrimSpace(reason)
 	var sessionProject string
+	var sessionMode string
 	var sessionPath string
 	if trimmedSessionID != "" {
 		sess, err := s.GetSession(trimmedSessionID)
@@ -2610,6 +2625,7 @@ func resolveSaveWriteProject(s *store.Store, projectChoice string, explicitProje
 		if err != nil {
 			return projectpkg.DetectionResult{}, err
 		}
+		sessionMode = strings.TrimSpace(sess.OwnershipMode)
 		sessionPath = strings.TrimSpace(sess.Directory)
 	}
 
@@ -2643,12 +2659,8 @@ func resolveSaveWriteProject(s *store.Store, projectChoice string, explicitProje
 		if collisionErr := explicitWriteProjectCollision(trimmedProjectChoice, project, sessionProject, cwdRes); collisionErr != nil {
 			return cwdRes, collisionErr
 		}
-		if sessionProject != "" && project != sessionProject {
-			return projectpkg.DetectionResult{}, &sessionProjectMismatchError{
-				SessionID:       trimmedSessionID,
-				SessionProject:  sessionProject,
-				ExplicitProject: project,
-			}
+		if err := sessionProjectResolutionError(trimmedSessionID, sessionProject, sessionMode, project); err != nil {
+			return projectpkg.DetectionResult{}, err
 		}
 
 		exists, err := s.ProjectExists(project)
@@ -2721,12 +2733,8 @@ func resolveSaveWriteProject(s *store.Store, projectChoice string, explicitProje
 			if err != nil {
 				return projectpkg.DetectionResult{}, err
 			}
-			if resolvedProject != sessionProject {
-				return projectpkg.DetectionResult{}, &sessionProjectMismatchError{
-					SessionID:       trimmedSessionID,
-					SessionProject:  sessionProject,
-					ExplicitProject: resolvedProject,
-				}
+			if err := sessionProjectResolutionError(trimmedSessionID, sessionProject, sessionMode, resolvedProject); err != nil {
+				return projectpkg.DetectionResult{}, err
 			}
 		}
 		return res, nil
@@ -3000,6 +3008,9 @@ func writeProjectErrorResult(activity *SessionActivity, sessionID string, res pr
 	if errors.Is(err, store.ErrDatabaseGenerationChanged) {
 		return errorWithMeta("database_generation_changed", err.Error(), res.AvailableProjects)
 	}
+	if errors.Is(err, store.ErrProjectOwnershipAmbiguous) {
+		return errorWithMeta("session_project_ownership_ambiguous", err.Error(), res.AvailableProjects)
+	}
 	if errors.Is(err, projectpkg.ErrRepositoryBinding) {
 		return errorWithMeta(
 			"repository_binding_unavailable",
@@ -3181,6 +3192,8 @@ func errorWithMeta(code, msg string, availableProjects []string) *mcp.CallToolRe
 		envelope["hint"] = "Choose a new session ID and retry mem_session_start; ended sessions cannot be reopened."
 	case "session_project_mismatch":
 		envelope["hint"] = "Use a project that matches the existing session, or omit session_id and write to a different project."
+	case "session_project_ownership_ambiguous":
+		envelope["hint"] = "Use ownership rescue to classify the historical session before writing to a different project."
 	case "project_required":
 		envelope["hint"] = "Use ownership rescue before updating this historical record, then retry the field update."
 	case "project_mismatch":

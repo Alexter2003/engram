@@ -5584,8 +5584,12 @@ func TestMemSave_ExplicitProjectMustMatchExistingSessionProject(t *testing.T) {
 	t.Chdir(dir)
 
 	s := newMCPTestStore(t)
-	if err := s.CreateSession("cross-project-session", "session-owned-project", "/work/session-owned-project"); err != nil {
+	if err := s.CreateSessionWithOwnershipMode("cross-project-session", "session-owned-project", "/work/session-owned-project", store.SessionOwnershipProjectOwned); err != nil {
 		t.Fatalf("create session: %v", err)
+	}
+	var mutationsBefore int
+	if err := s.DB().QueryRow("SELECT COUNT(*) FROM sync_mutations").Scan(&mutationsBefore); err != nil {
+		t.Fatalf("count initial mutations: %v", err)
 	}
 	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
 
@@ -5609,6 +5613,163 @@ func TestMemSave_ExplicitProjectMustMatchExistingSessionProject(t *testing.T) {
 	obs, searchErr := s.Search("cross-project mismatch should fail", store.SearchOptions{Project: "other-project", Limit: 5})
 	if searchErr != nil || len(obs) != 0 {
 		t.Fatalf("mismatched explicit project must not receive write, obs=%d err=%v", len(obs), searchErr)
+	}
+	session, sessionErr := s.GetSession("cross-project-session")
+	if sessionErr != nil || session.Project != "session-owned-project" || session.OwnershipMode != store.SessionOwnershipProjectOwned {
+		t.Fatalf("session ownership after mismatch = %#v, err=%v", session, sessionErr)
+	}
+	var prompts int
+	if err := s.DB().QueryRow("SELECT COUNT(*) FROM user_prompts").Scan(&prompts); err != nil {
+		t.Fatalf("count prompts after mismatch: %v", err)
+	}
+	if prompts != 0 {
+		t.Fatalf("mismatch created prompts=%d, want 0", prompts)
+	}
+	var mutationsAfter int
+	if err := s.DB().QueryRow("SELECT COUNT(*) FROM sync_mutations").Scan(&mutationsAfter); err != nil {
+		t.Fatalf("count mutations after mismatch: %v", err)
+	}
+	if mutationsAfter != mutationsBefore {
+		t.Fatalf("mismatch created mutations=%d, want %d", mutationsAfter, mutationsBefore)
+	}
+}
+
+func TestMemSave_ExplicitProjectAllowsExistingSharedSession(t *testing.T) {
+	dir := t.TempDir()
+	initTestGitRepo(t, dir)
+	t.Chdir(dir)
+
+	s := newMCPTestStore(t)
+	if err := s.CreateSession("shared-session", "session-project", "/work/session-project"); err != nil {
+		t.Fatalf("create shared session: %v", err)
+	}
+	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+
+	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"title":      "shared sessions accept explicit projects",
+		"content":    "must write",
+		"type":       "manual",
+		"project":    "other-project",
+		"session_id": "shared-session",
+	}}})
+	if err != nil || res.IsError {
+		t.Fatalf("shared-session write: err=%v isError=%v text=%q", err, res.IsError, callResultText(t, res))
+	}
+	session, sessionErr := s.GetSession("shared-session")
+	if sessionErr != nil || session.Project != "session-project" || session.OwnershipMode != store.SessionOwnershipShared {
+		t.Fatalf("shared session after explicit write = %#v, err=%v", session, sessionErr)
+	}
+	obs, searchErr := s.Search("shared sessions accept explicit projects", store.SearchOptions{Project: "other-project", Limit: 5})
+	if searchErr != nil || len(obs) != 1 {
+		t.Fatalf("shared-session explicit write observations=%d err=%v, want 1", len(obs), searchErr)
+	}
+}
+
+func TestMemSave_ExplicitProjectRejectsUnclassifiedSessionMismatchWithoutMutation(t *testing.T) {
+	dir := t.TempDir()
+	initTestGitRepo(t, dir)
+	t.Chdir(dir)
+
+	for _, tc := range []struct {
+		name string
+		mode any
+	}{
+		{name: "null mode", mode: nil},
+		{name: "blank mode", mode: " \t"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newMCPTestStore(t)
+			const sessionID = "unclassified-explicit-session"
+			if _, err := s.DB().Exec(`INSERT INTO sessions (id, project, directory, ownership_mode) VALUES (?, ?, ?, ?)`, sessionID, "session-project", "/work/session-project", tc.mode); err != nil {
+				t.Fatalf("seed unclassified session: %v", err)
+			}
+			var observationsBefore, promptsBefore, mutationsBefore int
+			for table, target := range map[string]*int{
+				"observations":   &observationsBefore,
+				"user_prompts":   &promptsBefore,
+				"sync_mutations": &mutationsBefore,
+			} {
+				if err := s.DB().QueryRow(`SELECT count(*) FROM ` + table).Scan(target); err != nil {
+					t.Fatalf("count %s before mismatch: %v", table, err)
+				}
+			}
+
+			res, err := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+				"title":      "unclassified explicit mismatch",
+				"content":    "must not write",
+				"type":       "manual",
+				"project":    "other-project",
+				"session_id": sessionID,
+			}}})
+			if err != nil || !res.IsError {
+				t.Fatalf("explicit mismatch = err=%v isError=%v text=%q", err, res.IsError, callResultText(t, res))
+			}
+			if body := callResultJSON(t, res); body["error_code"] != "session_project_ownership_ambiguous" {
+				t.Fatalf("explicit mismatch envelope = %v", body)
+			}
+			var observationsAfter, promptsAfter, mutationsAfter int
+			for table, target := range map[string]*int{
+				"observations":   &observationsAfter,
+				"user_prompts":   &promptsAfter,
+				"sync_mutations": &mutationsAfter,
+			} {
+				if err := s.DB().QueryRow(`SELECT count(*) FROM ` + table).Scan(target); err != nil {
+					t.Fatalf("count %s after mismatch: %v", table, err)
+				}
+			}
+			if observationsAfter != observationsBefore || promptsAfter != promptsBefore || mutationsAfter != mutationsBefore {
+				t.Fatalf("explicit mismatch changed observations=%d prompts=%d mutations=%d; want %d %d %d", observationsAfter, promptsAfter, mutationsAfter, observationsBefore, promptsBefore, mutationsBefore)
+			}
+		})
+	}
+}
+
+func TestMemSave_AmbiguousRecoveryRejectsUnclassifiedSessionMismatch(t *testing.T) {
+	parent := t.TempDir()
+	for _, name := range []string{"recovery-project-a", "recovery-project-b"} {
+		child := filepath.Join(parent, name)
+		if err := os.MkdirAll(child, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		initTestGitRepo(t, child)
+	}
+	t.Chdir(parent)
+
+	s := newMCPTestStore(t)
+	const sessionID = "unclassified-recovery-session"
+	if _, err := s.DB().Exec(`INSERT INTO sessions (id, project, directory, ownership_mode) VALUES (?, ?, ?, NULL)`, sessionID, "recovery-project-a", "/work/recovery-project-a"); err != nil {
+		t.Fatalf("seed unclassified session: %v", err)
+	}
+	activity := NewSessionActivity(10 * time.Minute)
+	token := activity.IssueAmbiguousProjectRecoveryToken(sessionID, []string{"recovery-project-a", "recovery-project-b"}, parent)
+
+	res, err := handleSave(s, MCPConfig{}, activity)(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"title":                 "unclassified recovery mismatch",
+		"content":               "must not write",
+		"type":                  "manual",
+		"project":               "recovery-project-b",
+		"project_choice_reason": project.SourceUserSelectedAfterAmbiguousProject,
+		"recovery_token":        token,
+		"session_id":            sessionID,
+	}}})
+	if err != nil || !res.IsError {
+		t.Fatalf("ambiguous recovery mismatch = err=%v isError=%v text=%q", err, res.IsError, callResultText(t, res))
+	}
+	if body := callResultJSON(t, res); body["error_code"] != "session_project_ownership_ambiguous" {
+		t.Fatalf("ambiguous recovery mismatch envelope = %v", body)
+	}
+	var observations, prompts, mutations int
+	for table, target := range map[string]*int{
+		"observations":   &observations,
+		"user_prompts":   &prompts,
+		"sync_mutations": &mutations,
+	} {
+		if err := s.DB().QueryRow(`SELECT count(*) FROM ` + table).Scan(target); err != nil {
+			t.Fatalf("count %s after recovery mismatch: %v", table, err)
+		}
+	}
+	if observations != 0 || prompts != 0 || mutations != 0 {
+		t.Fatalf("ambiguous recovery mismatch wrote observations=%d prompts=%d mutations=%d", observations, prompts, mutations)
 	}
 }
 
@@ -5662,7 +5823,7 @@ func TestMemSave_NonAmbiguousExplicitProjectStillFailsSessionMismatchWithStaleRe
 	t.Chdir(dir)
 
 	s := newMCPTestStore(t)
-	if err := s.CreateSession("stale-recovery-mismatch", "session-owned-project", "/work/session-owned-project"); err != nil {
+	if err := s.CreateSessionWithOwnershipMode("stale-recovery-mismatch", "session-owned-project", "/work/session-owned-project", store.SessionOwnershipProjectOwned); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
 	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))

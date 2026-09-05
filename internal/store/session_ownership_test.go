@@ -95,6 +95,170 @@ func TestProjectOwnedSessionRejectsMismatchedWriteWithoutMutation(t *testing.T) 
 	}
 }
 
+func TestProjectOwnedSessionRejectsMismatchedPromptWithoutMutation(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSessionWithOwnershipMode("manual-save-project-a", "project-a", "/tmp/a", SessionOwnershipProjectOwned); err != nil {
+		t.Fatalf("create project-owned session: %v", err)
+	}
+
+	var observationsBefore, promptsBefore, mutationsBefore int
+	if err := s.DB().QueryRow(`SELECT count(*) FROM observations`).Scan(&observationsBefore); err != nil {
+		t.Fatalf("count observations before mismatch: %v", err)
+	}
+	if err := s.DB().QueryRow(`SELECT count(*) FROM user_prompts`).Scan(&promptsBefore); err != nil {
+		t.Fatalf("count prompts before mismatch: %v", err)
+	}
+	if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations`).Scan(&mutationsBefore); err != nil {
+		t.Fatalf("count mutations before mismatch: %v", err)
+	}
+	if _, err := s.AddPrompt(AddPromptParams{SessionID: "manual-save-project-a", Content: "blocked", Project: "project-b"}); !errors.Is(err, ErrSessionOwnershipMismatch) {
+		t.Fatalf("mismatched prompt error = %v, want ErrSessionOwnershipMismatch", err)
+	}
+
+	var observationsAfter, promptsAfter, mutationsAfter int
+	if err := s.DB().QueryRow(`SELECT count(*) FROM observations`).Scan(&observationsAfter); err != nil {
+		t.Fatalf("count observations after mismatch: %v", err)
+	}
+	if err := s.DB().QueryRow(`SELECT count(*) FROM user_prompts`).Scan(&promptsAfter); err != nil {
+		t.Fatalf("count prompts after mismatch: %v", err)
+	}
+	if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations`).Scan(&mutationsAfter); err != nil {
+		t.Fatalf("count mutations after mismatch: %v", err)
+	}
+	if observationsAfter != observationsBefore || promptsAfter != promptsBefore || mutationsAfter != mutationsBefore {
+		t.Fatalf("mismatched prompt wrote observations=%d prompts=%d mutations=%d, want observations=%d prompts=%d mutations=%d", observationsAfter, promptsAfter, mutationsAfter, observationsBefore, promptsBefore, mutationsBefore)
+	}
+	session, err := s.GetSession("manual-save-project-a")
+	if err != nil || session.Project != "project-a" || session.OwnershipMode != SessionOwnershipProjectOwned {
+		t.Fatalf("session after mismatched prompt = %#v, %v", session, err)
+	}
+}
+
+func TestUnclassifiedSessionRejectsMismatchedWritesWithoutMutation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mode any
+	}{
+		{name: "null mode", mode: nil},
+		{name: "blank mode", mode: " \t"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStore(t)
+			const sessionID = "legacy-unclassified"
+			if _, err := s.DB().Exec(`INSERT INTO sessions (id, project, directory, ownership_mode) VALUES (?, ?, ?, ?)`, sessionID, "project-a", "/tmp/a", tc.mode); err != nil {
+				t.Fatalf("seed unclassified session: %v", err)
+			}
+
+			counts := func() (sessions, observations, prompts, mutations int) {
+				t.Helper()
+				for table, target := range map[string]*int{
+					"sessions":       &sessions,
+					"observations":   &observations,
+					"user_prompts":   &prompts,
+					"sync_mutations": &mutations,
+				} {
+					if err := s.DB().QueryRow(`SELECT count(*) FROM ` + table).Scan(target); err != nil {
+						t.Fatalf("count %s: %v", table, err)
+					}
+				}
+				return
+			}
+			sessionsBefore, observationsBefore, promptsBefore, mutationsBefore := counts()
+
+			if err := s.CreateSessionWithOwnershipMode(sessionID, "project-b", "/tmp/b", SessionOwnershipProjectOwned); !errors.Is(err, ErrProjectOwnershipAmbiguous) {
+				t.Fatalf("mismatched CreateSessionWithOwnershipMode error = %v, want ErrProjectOwnershipAmbiguous", err)
+			}
+			if _, err := s.AddObservation(AddObservationParams{SessionID: sessionID, Type: "manual", Title: "blocked", Content: "blocked", Project: "project-b", Scope: "project"}); !errors.Is(err, ErrProjectOwnershipAmbiguous) {
+				t.Fatalf("mismatched observation error = %v, want ErrProjectOwnershipAmbiguous", err)
+			}
+			if _, err := s.AddPrompt(AddPromptParams{SessionID: sessionID, Content: "blocked", Project: "project-b"}); !errors.Is(err, ErrProjectOwnershipAmbiguous) {
+				t.Fatalf("mismatched prompt error = %v, want ErrProjectOwnershipAmbiguous", err)
+			}
+			sessionsAfter, observationsAfter, promptsAfter, mutationsAfter := counts()
+			if sessionsAfter != sessionsBefore || observationsAfter != observationsBefore || promptsAfter != promptsBefore || mutationsAfter != mutationsBefore {
+				t.Fatalf("rejected mismatches changed sessions=%d observations=%d prompts=%d mutations=%d; want %d %d %d %d", sessionsAfter, observationsAfter, promptsAfter, mutationsAfter, sessionsBefore, observationsBefore, promptsBefore, mutationsBefore)
+			}
+
+			if _, err := s.AddObservation(AddObservationParams{SessionID: sessionID, Type: "manual", Title: "allowed", Content: "allowed", Project: "project-a", Scope: "project"}); err != nil {
+				t.Fatalf("same-project observation through unclassified session: %v", err)
+			}
+		})
+	}
+}
+
+func TestCreateSessionWithOwnershipModeClassifiesBlankLegacyMode(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mode any
+	}{
+		{name: "null mode", mode: nil},
+		{name: "blank mode", mode: " \t"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStore(t)
+			const sessionID = "legacy-blank-mode"
+			if _, err := s.DB().Exec(`INSERT INTO sessions (id, project, directory, ownership_mode) VALUES (?, ?, ?, ?)`, sessionID, "project-a", "/tmp/a", tc.mode); err != nil {
+				t.Fatalf("seed blank-mode session: %v", err)
+			}
+
+			if err := s.CreateSessionWithOwnershipMode(sessionID, "project-a", "/tmp/a", SessionOwnershipProjectOwned); err != nil {
+				t.Fatalf("classify blank legacy mode: %v", err)
+			}
+			session, err := s.GetSession(sessionID)
+			if err != nil || session.OwnershipMode != SessionOwnershipProjectOwned {
+				t.Fatalf("classified session = %#v, %v; want project-owned", session, err)
+			}
+		})
+	}
+}
+
+func TestStartSessionRejectsUnclassifiedProjectMismatchWithoutMutation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mode any
+	}{
+		{name: "null mode", mode: nil},
+		{name: "blank mode", mode: " \t"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStore(t)
+			const sessionID = "legacy-start-unclassified"
+			if _, err := s.DB().Exec(`INSERT INTO sessions (id, project, directory, ownership_mode) VALUES (?, ?, ?, ?)`, sessionID, "project-a", "/tmp/a", tc.mode); err != nil {
+				t.Fatalf("seed unclassified session: %v", err)
+			}
+			var mutationsBefore int
+			if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations`).Scan(&mutationsBefore); err != nil {
+				t.Fatalf("count mutations before mismatch: %v", err)
+			}
+
+			if err := s.StartSession(sessionID, "project-b", "/tmp/b"); !errors.Is(err, ErrProjectOwnershipAmbiguous) {
+				t.Fatalf("mismatched StartSession error = %v, want ErrProjectOwnershipAmbiguous", err)
+			}
+			var mutationsAfter int
+			if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations`).Scan(&mutationsAfter); err != nil {
+				t.Fatalf("count mutations after mismatch: %v", err)
+			}
+			if mutationsAfter != mutationsBefore {
+				t.Fatalf("mismatched StartSession changed mutations from %d to %d", mutationsBefore, mutationsAfter)
+			}
+		})
+	}
+}
+
+func TestSharedSessionAllowsCrossProjectWrites(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("runtime-session", "project-a", "/tmp/a"); err != nil {
+		t.Fatalf("create shared session: %v", err)
+	}
+	if _, err := s.AddObservation(AddObservationParams{SessionID: "runtime-session", Type: "manual", Title: "Cross-project write", Content: "content", Project: "project-b", Scope: "project"}); err != nil {
+		t.Fatalf("cross-project write through shared session: %v", err)
+	}
+	session, err := s.GetSession("runtime-session")
+	if err != nil || session.Project != "project-a" || session.OwnershipMode != SessionOwnershipShared {
+		t.Fatalf("shared session after cross-project write = %#v, %v", session, err)
+	}
+}
+
 func TestImportedLegacyModeDoesNotDowngradeProjectOwnedSession(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.CreateSessionWithOwnershipMode("manual-save-project-a", "project-a", "/tmp/a", SessionOwnershipProjectOwned); err != nil {
