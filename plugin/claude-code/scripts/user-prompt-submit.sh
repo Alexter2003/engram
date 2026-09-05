@@ -5,7 +5,7 @@
 # Claude Code to load all engram memory tools (which are deferred by default).
 #
 # On subsequent messages: checks when the last mem_save was for the current
-# project. If it's been > 15 minutes AND the session has been active > 5
+# project. If it's been at least 15 minutes AND the session has been active > 5
 # minutes, injects a nudge reminding the agent to save.
 #
 # The nudge is debounced per session: once shown, it stays quiet for
@@ -110,6 +110,115 @@ json_string_value_without_jq() {
     esac
   done
   JSON_VALUE="$value"
+}
+
+# Validate a complete JSON value using bash builtins. The no-jq hook cannot
+# depend on another runtime, but a 200 response is useful only when it is a
+# valid observations array.
+json_skip_whitespace_without_jq() {
+  while [ "$JSON_PARSE_INDEX" -lt "$JSON_PARSE_LENGTH" ]; do
+    case "${JSON_PARSE_INPUT:JSON_PARSE_INDEX:1}" in
+      ' '|$'\t'|$'\r'|$'\n') JSON_PARSE_INDEX=$(( JSON_PARSE_INDEX + 1 )) ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
+json_parse_string_without_jq() {
+  [ "${JSON_PARSE_INPUT:JSON_PARSE_INDEX:1}" = '"' ] || return 1
+  JSON_PARSE_INDEX=$(( JSON_PARSE_INDEX + 1 ))
+  while [ "$JSON_PARSE_INDEX" -lt "$JSON_PARSE_LENGTH" ]; do
+    local char="${JSON_PARSE_INPUT:JSON_PARSE_INDEX:1}"
+    case "$char" in
+      '"') JSON_PARSE_INDEX=$(( JSON_PARSE_INDEX + 1 )); return 0 ;;
+      $'\\')
+        JSON_PARSE_INDEX=$(( JSON_PARSE_INDEX + 1 ))
+        [ "$JSON_PARSE_INDEX" -lt "$JSON_PARSE_LENGTH" ] || return 1
+        char="${JSON_PARSE_INPUT:JSON_PARSE_INDEX:1}"
+        case "$char" in
+          '"'|$'\\'|/|b|f|n|r|t) JSON_PARSE_INDEX=$(( JSON_PARSE_INDEX + 1 )) ;;
+          u)
+            [[ "${JSON_PARSE_INPUT:JSON_PARSE_INDEX+1:4}" =~ ^[0-9A-Fa-f]{4}$ ]] || return 1
+            JSON_PARSE_INDEX=$(( JSON_PARSE_INDEX + 5 ))
+            ;;
+          *) return 1 ;;
+        esac
+        ;;
+      *)
+        [ "$(printf '%d' "'$char")" -ge 32 ] || return 1
+        JSON_PARSE_INDEX=$(( JSON_PARSE_INDEX + 1 ))
+        ;;
+    esac
+  done
+  return 1
+}
+
+json_parse_value_without_jq() {
+  local char tail
+  json_skip_whitespace_without_jq
+  [ "$JSON_PARSE_INDEX" -lt "$JSON_PARSE_LENGTH" ] || return 1
+  char="${JSON_PARSE_INPUT:JSON_PARSE_INDEX:1}"
+  case "$char" in
+    '"') json_parse_string_without_jq ;;
+    t) [ "${JSON_PARSE_INPUT:JSON_PARSE_INDEX:4}" = "true" ] && JSON_PARSE_INDEX=$(( JSON_PARSE_INDEX + 4 )) ;;
+    f) [ "${JSON_PARSE_INPUT:JSON_PARSE_INDEX:5}" = "false" ] && JSON_PARSE_INDEX=$(( JSON_PARSE_INDEX + 5 )) ;;
+    n) [ "${JSON_PARSE_INPUT:JSON_PARSE_INDEX:4}" = "null" ] && JSON_PARSE_INDEX=$(( JSON_PARSE_INDEX + 4 )) ;;
+    [0-9-])
+      tail="${JSON_PARSE_INPUT:JSON_PARSE_INDEX}"
+      [[ "$tail" =~ ^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)? ]] || return 1
+      JSON_PARSE_INDEX=$(( JSON_PARSE_INDEX + ${#BASH_REMATCH[0]} ))
+      ;;
+    '[')
+      JSON_PARSE_INDEX=$(( JSON_PARSE_INDEX + 1 ))
+      json_skip_whitespace_without_jq
+      if [ "${JSON_PARSE_INPUT:JSON_PARSE_INDEX:1}" = ']' ]; then
+        JSON_PARSE_INDEX=$(( JSON_PARSE_INDEX + 1 ))
+        return 0
+      fi
+      while true; do
+        json_parse_value_without_jq || return 1
+        json_skip_whitespace_without_jq
+        case "${JSON_PARSE_INPUT:JSON_PARSE_INDEX:1}" in
+          ',') JSON_PARSE_INDEX=$(( JSON_PARSE_INDEX + 1 )) ;;
+          ']') JSON_PARSE_INDEX=$(( JSON_PARSE_INDEX + 1 )); return 0 ;;
+          *) return 1 ;;
+        esac
+      done
+      ;;
+    '{')
+      JSON_PARSE_INDEX=$(( JSON_PARSE_INDEX + 1 ))
+      json_skip_whitespace_without_jq
+      if [ "${JSON_PARSE_INPUT:JSON_PARSE_INDEX:1}" = '}' ]; then
+        JSON_PARSE_INDEX=$(( JSON_PARSE_INDEX + 1 ))
+        return 0
+      fi
+      while true; do
+        json_parse_string_without_jq || return 1
+        json_skip_whitespace_without_jq
+        [ "${JSON_PARSE_INPUT:JSON_PARSE_INDEX:1}" = ':' ] || return 1
+        JSON_PARSE_INDEX=$(( JSON_PARSE_INDEX + 1 ))
+        json_parse_value_without_jq || return 1
+        json_skip_whitespace_without_jq
+        case "${JSON_PARSE_INPUT:JSON_PARSE_INDEX:1}" in
+          ',') JSON_PARSE_INDEX=$(( JSON_PARSE_INDEX + 1 )) ;;
+          '}') JSON_PARSE_INDEX=$(( JSON_PARSE_INDEX + 1 )); return 0 ;;
+          *) return 1 ;;
+        esac
+      done
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+json_is_valid_array_without_jq() {
+  JSON_PARSE_INPUT="$1"
+  JSON_PARSE_INDEX=0
+  JSON_PARSE_LENGTH=${#JSON_PARSE_INPUT}
+  json_skip_whitespace_without_jq
+  [ "${JSON_PARSE_INPUT:JSON_PARSE_INDEX:1}" = '[' ] || return 1
+  json_parse_value_without_jq || return 1
+  json_skip_whitespace_without_jq
+  [ "$JSON_PARSE_INDEX" -eq "$JSON_PARSE_LENGTH" ]
 }
 
 utf8_from_codepoint_without_jq() {
@@ -306,9 +415,14 @@ user_prompt_submit_without_jq() {
     printf '%s\n' '{}'
     return 0
   }
+  json_is_valid_array_without_jq "$last_save_json" || {
+    printf '%s\n' '{}'
+    return 0
+  }
   if [[ "$last_save_json" =~ ^[[:space:]]*\[[[:space:]]*\][[:space:]]*$ ]]; then
+    [ -n "$session_age_secs" ] || { printf '%s\n' '{}'; return 0; }
     now_epoch=$(date "+%s")
-    elapsed=901
+    elapsed="$session_age_secs"
   else
     json_string_value_without_jq "created_at" "$last_save_json" && last_save_at="$JSON_VALUE" || last_save_at=""
     [ -n "$last_save_at" ] || { printf '%s\n' '{}'; return 0; }
@@ -318,7 +432,7 @@ user_prompt_submit_without_jq() {
     elapsed=$(( now_epoch - last_epoch ))
   fi
 
-  if [ "$elapsed" -gt 900 ]; then
+  if [ "$elapsed" -ge 900 ]; then
     nudge_cooldown="${ENGRAM_NUDGE_COOLDOWN_SECS:-900}"
     nudge_state_file="${state_file%-tools-loaded}-last-nudge"
     if [ -f "$nudge_state_file" ]; then
@@ -329,7 +443,7 @@ user_prompt_submit_without_jq() {
     esac
     if [ -z "$last_nudge_epoch" ] || [ "$(( now_epoch - last_nudge_epoch ))" -ge "$nudge_cooldown" ]; then
       printf '%s\n' "$now_epoch" > "$nudge_state_file" 2>/dev/null || true
-      printf '%s\n' '{"systemMessage":"MEMORY REMINDER: It'\''s been over 15 minutes since your last save. If you'\''ve made decisions, discoveries, or completed significant work, call mem_save now."}'
+      printf '%s\n' '{"systemMessage":"MEMORY REMINDER: It'\''s been at least 15 minutes since your last save. If you'\''ve made decisions, discoveries, or completed significant work, call mem_save now."}'
       return 0
     fi
   fi
@@ -522,17 +636,24 @@ if [ -z "$LAST_SAVE_JSON" ]; then
   exit 0
 fi
 
-LAST_SAVE_AT=$(echo "$LAST_SAVE_JSON" | jq -r '.[0].created_at // empty' 2>/dev/null)
+if ! echo "$LAST_SAVE_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
+  # A successful HTTP response still must be a valid observations array.
+  echo "$OUTPUT"
+  exit 0
+fi
+
+LAST_SAVE_AT=$(echo "$LAST_SAVE_JSON" | jq -r '.[0].created_at // empty')
 
 NOW_EPOCH=$(date "+%s")
 
 if [ -z "$LAST_SAVE_AT" ]; then
-  # No observations exist yet for this project. This is the "never saved"
-  # case, not "session just started" (session age was already gated to
-  # >= 5 minutes above) — treat it as maximally stale so the nudge can fire
-  # and break the cycle where a project with zero observations can never
-  # reach its first one.
-  ELAPSED=901
+  # No observations exist yet. Use the real session age so the first-save
+  # reminder observes the same 15-minute threshold as existing saves.
+  if [ -z "${SESSION_AGE_SECS:-}" ]; then
+    echo "$OUTPUT"
+    exit 0
+  fi
+  ELAPSED="$SESSION_AGE_SECS"
 else
   # Parse last save timestamp and compare to now
   LAST_EPOCH=$(parse_epoch "$LAST_SAVE_AT")
@@ -543,9 +664,9 @@ else
   ELAPSED=$(( NOW_EPOCH - LAST_EPOCH ))
 fi
 
-# Nudge if last save was > 15 minutes ago (900 seconds), but debounce so we do
+# Nudge if the last save was at least 15 minutes ago (900 seconds), but debounce so we do
 # not repeat the reminder on every message while the agent has nothing to save.
-if [ "$ELAPSED" -gt 900 ]; then
+if [ "$ELAPSED" -ge 900 ]; then
   NUDGE_COOLDOWN="${ENGRAM_NUDGE_COOLDOWN_SECS:-900}"
   NUDGE_STATE_FILE="${STATE_FILE%-tools-loaded}-last-nudge"
 
@@ -561,7 +682,7 @@ if [ "$ELAPSED" -gt 900 ]; then
   if [ -z "$LAST_NUDGE_EPOCH" ] || [ "$(( NOW_EPOCH - LAST_NUDGE_EPOCH ))" -ge "$NUDGE_COOLDOWN" ]; then
     printf '%s' "$NOW_EPOCH" > "$NUDGE_STATE_FILE" 2>/dev/null || true
     OUTPUT=$(jq -n \
-      '{"systemMessage": "MEMORY REMINDER: It'\''s been over 15 minutes since your last save. If you'\''ve made decisions, discoveries, or completed significant work, call mem_save now."}')
+      '{"systemMessage": "MEMORY REMINDER: It'\''s been at least 15 minutes since your last save. If you'\''ve made decisions, discoveries, or completed significant work, call mem_save now."}')
   fi
 fi
 

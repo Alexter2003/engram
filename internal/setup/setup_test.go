@@ -2977,7 +2977,7 @@ func TestClaudeCodeUserPromptHookWithoutJQPreservesSessionStateAndNudge(t *testi
 	}
 }
 
-func TestClaudeCodeUserPromptHookWithoutJQTreatsOnlyEmptyObservationsArrayAsNeverSaved(t *testing.T) {
+func TestClaudeCodeUserPromptHookWithoutJQValidatesObservationArraysAndFirstSaveThreshold(t *testing.T) {
 	if testing.Short() {
 		t.Skip("runs the Claude Code shell hook as a child process")
 	}
@@ -2995,11 +2995,14 @@ func TestClaudeCodeUserPromptHookWithoutJQTreatsOnlyEmptyObservationsArrayAsNeve
 		name               string
 		observations       string
 		observationsStatus int
+		sessionAge         time.Duration
 		timezone           string
 		wantNudge          bool
 	}{
-		{name: "exact empty array", observations: "[]", wantNudge: true},
-		{name: "whitespace empty array", observations: " \n\t[ \r\n ] \n", wantNudge: true},
+		{name: "first save before general gate", observations: "[]", sessionAge: 4 * time.Minute, wantNudge: false},
+		{name: "first save before save threshold", observations: "[]", sessionAge: 10 * time.Minute, wantNudge: false},
+		{name: "first save after save threshold", observations: "[]", sessionAge: 20 * time.Minute, wantNudge: true},
+		{name: "whitespace empty array", observations: " \n\t[ \r\n ] \n", sessionAge: 20 * time.Minute, wantNudge: true},
 		{name: "timezone-less UTC timestamp under EST5", observations: fmt.Sprintf(`[{"created_at":%q}]`, staleNaiveUTC), timezone: "EST5", wantNudge: true},
 		{name: "recent timezone-less UTC timestamp under JST-9", observations: fmt.Sprintf(`[{"created_at":%q}]`, recentNaiveUTC), timezone: "JST-9", wantNudge: false},
 		{name: "observations non-success response", observations: "[]", observationsStatus: http.StatusInternalServerError, wantNudge: false},
@@ -3016,7 +3019,11 @@ func TestClaudeCodeUserPromptHookWithoutJQTreatsOnlyEmptyObservationsArrayAsNeve
 				case "/project/current":
 					_, _ = w.Write([]byte(`{"project":"hook-test","project_source":"config"}`))
 				case "/sessions/session-empty-array":
-					_, _ = w.Write([]byte(`{"started_at":"2000-01-01T00:00:00Z"}`))
+					startedAt := "2000-01-01T00:00:00Z"
+					if tt.sessionAge != 0 {
+						startedAt = time.Now().Add(-tt.sessionAge).UTC().Format(time.DateTime)
+					}
+					_, _ = fmt.Fprintf(w, `{"started_at":%q}`, startedAt)
 				case "/observations":
 					if tt.observationsStatus != 0 {
 						w.WriteHeader(tt.observationsStatus)

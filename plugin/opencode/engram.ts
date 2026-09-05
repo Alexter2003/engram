@@ -220,10 +220,13 @@ function toEpochSecs(ts: string): number | null {
 export function shouldNudgeForObservations(
   observationsResponseOK: boolean,
   observations: unknown,
-  nowSecs: number
+  nowSecs: number,
+  sessionStartEpoch: number | null
 ): boolean {
   if (!observationsResponseOK || !Array.isArray(observations)) return false
-  if (observations.length === 0) return true
+  if (observations.length === 0) {
+    return sessionStartEpoch !== null && sessionStartEpoch > 0 && nowSecs - sessionStartEpoch >= 900
+  }
 
   const createdAt = observations[0]?.created_at
   if (typeof createdAt !== "string") return false
@@ -703,11 +706,11 @@ export const Engram: Plugin = async (ctx) => {
           return
         }
 
-        if (!shouldNudgeForObservations(observationsResponseOK, obsData, nowSecs)) return
+        if (!shouldNudgeForObservations(observationsResponseOK, obsData, nowSecs, sessionStartEpoch)) return
 
         // Append the nudge to the last system message
         const nudge =
-          "\n\nMEMORY REMINDER: It's been over 15 minutes since your last memory save. " +
+          "\n\nMEMORY REMINDER: It's been at least 15 minutes since your last memory save. " +
           "If you've made decisions, discoveries, completed significant work, or found non-obvious things, " +
           "call mem_save now."
         if (output.system.length > 0) {
