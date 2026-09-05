@@ -8,7 +8,7 @@ import (
 func TestRemirrorProjectReplaysCurrentStateWithoutRewritingHistory(t *testing.T) {
 	s := newTestStore(t)
 	const project = "remirror-project"
-	if err := s.CreateSession("remirror-session", project, "/tmp/remirror"); err != nil {
+	if err := s.CreateSessionWithOwnershipMode("remirror-session", project, "/tmp/remirror", SessionOwnershipProjectOwned); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.EnrollProject(project); err != nil {
@@ -76,9 +76,13 @@ func TestRemirrorProjectReplaysCurrentStateWithoutRewritingHistory(t *testing.T)
 		t.Fatal(err)
 	}
 	want := map[string]int{SyncEntitySession: 1, SyncEntityObservation: 3, SyncEntityPrompt: 2, SyncEntityRelation: 1}
+	var sessionMutation SyncMutation
 	for _, mutation := range pending {
 		if mutation.Project != project || !strings.HasPrefix(mutation.Source, "remirror:") {
 			t.Fatalf("remirror included unrelated mutation: %+v", mutation)
+		}
+		if mutation.Entity == SyncEntitySession {
+			sessionMutation = mutation
 		}
 		want[mutation.Entity]--
 	}
@@ -86,6 +90,14 @@ func TestRemirrorProjectReplaysCurrentStateWithoutRewritingHistory(t *testing.T)
 		if count != 0 {
 			t.Fatalf("missing remirror %s mutations: %+v", entity, want)
 		}
+	}
+	peer := newTestStore(t)
+	if err := peer.ApplyPulledMutation(DefaultSyncTargetKey, sessionMutation); err != nil {
+		t.Fatalf("apply remirrored session on recreated peer: %v", err)
+	}
+	remirrored, err := peer.GetSession("remirror-session")
+	if err != nil || remirrored.OwnershipMode != SessionOwnershipProjectOwned {
+		t.Fatalf("remirrored session = %#v, %v; want project-owned ownership", remirrored, err)
 	}
 }
 

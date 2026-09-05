@@ -54,6 +54,7 @@ var sqliteWriteRetryBackoffs = []time.Duration{
 var (
 	ErrSessionNotFound             = errors.New("session not found")
 	ErrSessionIDRequired           = errors.New("session id is required")
+	ErrSessionAlreadyEnded         = errors.New("session has already ended")
 	ErrSessionHasObservations      = errors.New("session still has observations")
 	ErrSessionDeleteBlocked        = errors.New("session deletion is blocked while cloud sync enrollment is active")
 	ErrObservationNotFound         = errors.New("observation not found")
@@ -2493,6 +2494,43 @@ func (s *Store) CreateSessionWithOwnershipMode(id, project, directory, mode stri
 
 	return s.withTx(func(tx *sql.Tx) error {
 		if err := s.createSessionTx(tx, id, project, directory, mode); err != nil {
+			return err
+		}
+		var persisted Session
+		// sessions.project is read through ifnull() because a database upgraded from
+		// the schema where the column was nullable still carries rows that identify no
+		// project, and no migration rewrites them.
+		if err := tx.QueryRow(`SELECT id, ifnull(project, ''), ifnull(ownership_mode, ''), directory, started_at, ended_at, summary FROM sessions WHERE id = ?`, id).Scan(
+			&persisted.ID, &persisted.Project, &persisted.OwnershipMode, &persisted.Directory, &persisted.StartedAt, &persisted.EndedAt, &persisted.Summary,
+		); err != nil {
+			return err
+		}
+		return s.enqueueSyncMutationTx(tx, SyncEntitySession, persisted.ID, SyncOpUpsert, syncSessionPayload{
+			ID:            persisted.ID,
+			Project:       persisted.Project,
+			OwnershipMode: persisted.OwnershipMode,
+			Directory:     persisted.Directory,
+			StartedAt:     persisted.StartedAt,
+			EndedAt:       persisted.EndedAt,
+			Summary:       persisted.Summary,
+		})
+	})
+}
+
+// StartSession registers a new session or idempotently starts an active one.
+// It refuses to reuse an ended session ID so MCP callers cannot silently strand
+// later writes on a fallback session.
+func (s *Store) StartSession(id, project, directory string) error {
+	if err := validateSessionID(id); err != nil {
+		return err
+	}
+	project, _ = NormalizeProject(project)
+	if strings.TrimSpace(project) == "" {
+		return ErrProjectRequired
+	}
+
+	return s.withTx(func(tx *sql.Tx) error {
+		if err := s.startSessionTx(tx, id, project, directory, SessionOwnershipShared); err != nil {
 			return err
 		}
 		var persisted Session
@@ -6877,6 +6915,29 @@ func (s *Store) createSessionTx(tx *sql.Tx, id, project, directory, mode string)
 	return err
 }
 
+func (s *Store) startSessionTx(tx *sql.Tx, id, project, directory, mode string) error {
+	result, err := s.execHook(tx,
+		`INSERT INTO sessions (id, project, ownership_mode, directory) VALUES (?, ?, ?, ?)
+		 ON CONFLICT(id) DO UPDATE SET
+		   project   = CASE WHEN sessions.project = '' THEN excluded.project ELSE sessions.project END,
+		   ownership_mode = CASE WHEN sessions.ownership_mode IS NULL THEN excluded.ownership_mode ELSE sessions.ownership_mode END,
+		   directory = CASE WHEN sessions.directory = '' THEN excluded.directory ELSE sessions.directory END
+		 WHERE sessions.ended_at IS NULL`,
+		id, project, mode, directory,
+	)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return ErrSessionAlreadyEnded
+	}
+	return nil
+}
+
 func validSessionOwnershipMode(mode string) bool {
 	return mode == SessionOwnershipShared || mode == SessionOwnershipProjectOwned
 }
@@ -7278,7 +7339,7 @@ func (s *Store) backfillSessionSyncMutationsTx(tx *sql.Tx, project string, sourc
 	// backfill transaction. The predicate must stay identical to the COUNT in
 	// projectNeedsBackfill and to isBlankSessionID.
 	rows, err := s.queryItHook(tx, `
-		SELECT id, project, directory, started_at, ended_at, summary
+		SELECT id, project, ifnull(ownership_mode, ''), directory, started_at, ended_at, summary
 		FROM sessions
 		WHERE project = ?
 		  AND `+sqlSessionIDNotBlank("id")+`
@@ -7304,7 +7365,7 @@ func (s *Store) backfillSessionSyncMutationsTx(tx *sql.Tx, project string, sourc
 	var pending []syncSessionPayload
 	for rows.Next() {
 		var payload syncSessionPayload
-		if err := rows.Scan(&payload.ID, &payload.Project, &payload.Directory, &payload.StartedAt, &payload.EndedAt, &payload.Summary); err != nil {
+		if err := rows.Scan(&payload.ID, &payload.Project, &payload.OwnershipMode, &payload.Directory, &payload.StartedAt, &payload.EndedAt, &payload.Summary); err != nil {
 			return closeRowsWithError(rows, err)
 		}
 		pending = append(pending, payload)

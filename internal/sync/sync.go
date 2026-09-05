@@ -426,9 +426,6 @@ func (sy *Syncer) Export(createdBy string, project string) (*SyncResult, error) 
 	if err != nil {
 		return nil, fmt.Errorf("inspect session ownership modes: %w", err)
 	}
-	if projectOwned && len(manifest.Chunks) > 0 && manifest.Version < ownershipModeManifestVersion {
-		return nil, fmt.Errorf("sync downgrade is unsupported after project-owned sessions exist; peer manifest version %d does not support ownership modes", manifest.Version)
-	}
 	knownChunks := make(map[string]bool, len(locallySyncedChunks))
 	for chunkID, ok := range locallySyncedChunks {
 		if ok {
@@ -456,6 +453,9 @@ func (sy *Syncer) Export(createdBy string, project string) (*SyncResult, error) 
 	}
 	if projectOwned && manifest.Version < ownershipModeManifestVersion {
 		manifest.Version = ownershipModeManifestVersion
+		if err := sy.writeManifest(manifest); err != nil {
+			return nil, fmt.Errorf("write manifest: %w", err)
+		}
 	}
 	if sy.cloudMode {
 		chunk, mutationSeqs, err := sy.filterByPendingMutations(data, project)
@@ -1378,14 +1378,13 @@ func (sy *Syncer) ensureChunkOwnershipCompatibility(manifestVersion int, chunk C
 			addProject(payload.Project)
 
 		case store.SyncEntityObservation, store.SyncEntityPrompt:
-			if mutation.Op != store.SyncOpUpsert {
-				continue
-			}
 			var payload struct {
 				Project *string `json:"project"`
 			}
-			if err := decodeSyncPayloadForProject([]byte(mutation.Payload), &payload); err != nil {
-				return fmt.Errorf("decode %s ownership payload: %w", mutation.Entity, err)
+			if mutation.Op == store.SyncOpUpsert || strings.TrimSpace(mutation.Payload) != "" {
+				if err := decodeSyncPayloadForProject([]byte(mutation.Payload), &payload); err != nil {
+					return fmt.Errorf("decode %s ownership payload: %w", mutation.Entity, err)
+				}
 			}
 			project := mutation.Project
 			if strings.TrimSpace(project) == "" && payload.Project != nil {
