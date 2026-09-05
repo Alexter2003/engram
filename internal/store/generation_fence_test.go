@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	sqlite "modernc.org/sqlite"
 )
 
 func TestDatabaseGeneration(t *testing.T) {
@@ -32,21 +34,15 @@ func TestDatabaseGeneration(t *testing.T) {
 			assertGenerationChanged(t, generation.check())
 		})
 
-		t.Run("handles disappearance "+sidecarName(sidecar), func(t *testing.T) {
+		t.Run("detects disappearance "+sidecarName(sidecar), func(t *testing.T) {
 			generation, dbPath := newTestDatabaseGeneration(t, sidecar == "-wal", sidecar == "-shm")
 			if err := os.Remove(dbPath + sidecar); err != nil {
 				t.Fatalf("remove generation file: %v", err)
 			}
-			if sidecar == "" {
+			assertGenerationChanged(t, generation.check())
+			if sidecar != "" {
+				writeTestFile(t, dbPath+sidecar)
 				assertGenerationChanged(t, generation.check())
-				return
-			}
-			if err := generation.check(); err != nil {
-				t.Fatalf("check after sidecar disappearance: %v", err)
-			}
-			writeTestFile(t, dbPath+sidecar)
-			if err := generation.check(); err != nil {
-				t.Fatalf("adopt replacement sidecar: %v", err)
 			}
 		})
 	}
@@ -108,6 +104,24 @@ func TestGenerationFenceRejectsUnsafeOperations(t *testing.T) {
 		}
 		assertGenerationChanged(t, rows.Next(make([]driver.Value, 1)))
 	})
+}
+
+func TestGenerationConnExposesFileControlForPrimeConnection(t *testing.T) {
+	generation, _ := newTestDatabaseGeneration(t, false, false)
+	base := &testFenceFileControlConn{}
+	conn := generationConn{Conn: base, generation: generation}
+
+	fc, ok := any(conn).(sqlite.FileControl)
+	if !ok {
+		t.Fatal("generation connection does not expose sqlite.FileControl")
+	}
+	mode, err := fc.FileControlPersistWAL("main", 1)
+	if err != nil {
+		t.Fatalf("FileControlPersistWAL: %v", err)
+	}
+	if mode != 1 || base.dbName != "main" || base.mode != 1 {
+		t.Fatalf("persist WAL = (%d, %q, %d), want (1, main, 1)", mode, base.dbName, base.mode)
+	}
 }
 
 func TestNewRejectsGenerationChangedBeforeSQLiteOpens(t *testing.T) {
@@ -207,6 +221,17 @@ func assertGenerationChanged(t *testing.T, err error) {
 type testFenceConn struct {
 	exec func()
 	rows *testFenceRows
+}
+
+type testFenceFileControlConn struct {
+	testFenceConn
+	dbName string
+	mode   int
+}
+
+func (c *testFenceFileControlConn) FileControlPersistWAL(dbName string, mode int) (int, error) {
+	c.dbName, c.mode = dbName, mode
+	return mode, nil
 }
 
 func (c *testFenceConn) Prepare(string) (driver.Stmt, error) { return testFenceStmt{}, nil }

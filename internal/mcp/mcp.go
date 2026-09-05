@@ -413,7 +413,7 @@ Examples:
 					mcp.Description("Short-lived token returned by an ambiguous_project error. Required with project_choice_reason=user_selected_after_ambiguous_project."),
 				),
 				mcp.WithBoolean("capture_prompt",
-					mcp.Description("Automatically capture the current user prompt when available (default: true). Set false for SDD artifacts or automated saves."),
+					mcp.Description("Automatically capture the current user prompt when available (default: true). Set false for automated saves."),
 				),
 			),
 			queuedWriteHandler(writeQueue, handleSave(s, cfg, activity)),
@@ -944,11 +944,11 @@ PARAMS:
 
 BEHAVIOR:
   - Persists the verdict via JudgeBySemantic with system provenance (marked_by_actor="engram").
-  - not_conflict: no row is inserted; tool returns success with empty sync_id (the verdict is recorded but not stored — it means "we evaluated these and they do not conflict").
+  - not_conflict: persists a judged relation and returns its sync_id, so future scans do not re-evaluate the pair.
   - Idempotent: calling again for the same pair updates the existing row.
   - Cross-project pairs are rejected.
 
-SUCCESS: Returns { "sync_id": "rel-..." } on persist, { "sync_id": "" } on not_conflict.
+SUCCESS: Returns { "sync_id": "rel-..." } on every persisted verdict.
 ERROR: Returns IsError=true if IDs are unknown, relation is invalid, or cross-project pair.`),
 				mcp.WithTitleAnnotation("Compare Memory Pair (Persist Semantic Verdict)"),
 				mcp.WithReadOnlyHintAnnotation(false),
@@ -1189,7 +1189,7 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
 			fmt.Fprintf(&b, "---\nResults above are previews (300 chars). To read the full content of a specific memory, call mem_get_observation(id: <ID>).\n")
 		}
 
-		if nudge := activity.NudgeIfNeeded(sessionID); nudge != "" {
+		if nudge := activity.NudgeIfNeededForProject(sessionID, project); nudge != "" {
 			b.WriteString(nudge)
 		}
 
@@ -1347,7 +1347,7 @@ func handleSave(s *store.Store, cfg MCPConfig, activity *SessionActivity) server
 		}
 
 		if activity != nil {
-			activity.RecordSave(sessionID)
+			activity.RecordSaveForProject(sessionID, project)
 		}
 
 		msg := fmt.Sprintf("Memory saved: %q (%s)", title, typ)
@@ -1823,7 +1823,7 @@ func handleContext(s *store.Store, cfg MCPConfig, activity *SessionActivity) ser
 		result := fmt.Sprintf("%s\n---\nMemory stats: %d sessions, %d observations across projects: %s",
 			contextResult, stats.TotalSessions, stats.TotalObservations, projects)
 
-		if nudge := activity.NudgeIfNeeded(sessionID); nudge != "" {
+		if nudge := activity.NudgeIfNeededForProject(sessionID, project); nudge != "" {
 			result += nudge
 		}
 
@@ -1840,10 +1840,13 @@ func handleStats(s *store.Store, cfg MCPConfig, activities ...*SessionActivity) 
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		projectOverride, _ := req.GetArguments()["project"].(string)
 
-		// Resolve project: validate override or auto-detect (REQ-310, REQ-311, REQ-314)
-		detRes, err := resolveReadProjectWithProcessOverride(s, projectOverride, cfg.DefaultProject)
-		if err != nil {
-			return readProjectErrorResult(activity, detRes, err), nil
+		detRes := projectpkg.DetectionResult{Source: projectpkg.SourceAllProjects}
+		if strings.TrimSpace(projectOverride) != "" || strings.TrimSpace(cfg.DefaultProject) != "" {
+			var err error
+			detRes, err = resolveReadProjectWithProcessOverride(s, projectOverride, cfg.DefaultProject)
+			if err != nil {
+				return readProjectErrorResult(activity, detRes, err), nil
+			}
 		}
 
 		stats, err := loadMCPStats(s)
@@ -2084,6 +2087,7 @@ func handleSessionSummary(s *store.Store, cfg MCPConfig, activity *SessionActivi
 		if err != nil {
 			return mcp.NewToolResultError("Failed to save session summary: " + err.Error()), nil
 		}
+		activity.RecordProjectSave(project)
 
 		msg := fmt.Sprintf("Session summary saved for project %q", project)
 		if score := activity.ActivityScore(defaultSessionID(project)); score != "" {
@@ -2111,7 +2115,16 @@ func handleSessionStart(s *store.Store, cfg MCPConfig, activity *SessionActivity
 		activity.RecordToolCall(defaultSessionID(project))
 		resolvedDirectory = runtimeSessionDirectory(resolvedDirectory)
 
-		if err := s.CreateSession(id, project, resolvedDirectory); err != nil {
+		if err := s.StartSession(id, project, resolvedDirectory); err != nil {
+			if errors.Is(err, store.ErrSessionAlreadyEnded) {
+				result := errorWithMeta(
+					"session_already_ended",
+					fmt.Sprintf("Session %q has already ended. Choose a new session ID and retry mem_session_start.", id),
+					nil,
+				)
+				addErrorMetadata(result, map[string]any{"session_id": id})
+				return result, nil
+			}
 			return mcp.NewToolResultError("Failed to start session: " + err.Error()), nil
 		}
 
@@ -2346,7 +2359,6 @@ func handleCompare(s *store.Store, _ *SessionActivity) server.ToolHandlerFunc {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		// syncID is "" when relation == "not_conflict" (JudgeBySemantic no-op).
 		envelope := map[string]any{
 			"sync_id": syncID,
 		}
@@ -2470,6 +2482,20 @@ func (e *sessionProjectMismatchError) Error() string {
 	return fmt.Sprintf("session %q belongs to project %q, not %q", e.SessionID, e.SessionProject, e.ExplicitProject)
 }
 
+func sessionProjectResolutionError(sessionID, sessionProject, sessionMode, requestedProject string) error {
+	if sessionProject == "" || sessionProject == requestedProject || sessionMode == store.SessionOwnershipShared {
+		return nil
+	}
+	if sessionMode == store.SessionOwnershipProjectOwned {
+		return &sessionProjectMismatchError{
+			SessionID:       sessionID,
+			SessionProject:  sessionProject,
+			ExplicitProject: requestedProject,
+		}
+	}
+	return fmt.Errorf("%w: session %q has unclassified ownership for %q and cannot accept %q", store.ErrProjectOwnershipAmbiguous, sessionID, sessionProject, requestedProject)
+}
+
 // resolveWriteProject detects the current project from the process working
 // directory. Returns ErrAmbiguousProject if cwd is a parent of multiple repos.
 func resolveWriteProject() (projectpkg.DetectionResult, error) {
@@ -2588,6 +2614,7 @@ func resolveSaveWriteProject(s *store.Store, projectChoice string, explicitProje
 	trimmedProjectChoice := strings.TrimSpace(projectChoice)
 	trimmedReason := strings.TrimSpace(reason)
 	var sessionProject string
+	var sessionMode string
 	var sessionPath string
 	if trimmedSessionID != "" {
 		sess, err := s.GetSession(trimmedSessionID)
@@ -2598,6 +2625,7 @@ func resolveSaveWriteProject(s *store.Store, projectChoice string, explicitProje
 		if err != nil {
 			return projectpkg.DetectionResult{}, err
 		}
+		sessionMode = strings.TrimSpace(sess.OwnershipMode)
 		sessionPath = strings.TrimSpace(sess.Directory)
 	}
 
@@ -2631,12 +2659,8 @@ func resolveSaveWriteProject(s *store.Store, projectChoice string, explicitProje
 		if collisionErr := explicitWriteProjectCollision(trimmedProjectChoice, project, sessionProject, cwdRes); collisionErr != nil {
 			return cwdRes, collisionErr
 		}
-		if sessionProject != "" && project != sessionProject {
-			return projectpkg.DetectionResult{}, &sessionProjectMismatchError{
-				SessionID:       trimmedSessionID,
-				SessionProject:  sessionProject,
-				ExplicitProject: project,
-			}
+		if err := sessionProjectResolutionError(trimmedSessionID, sessionProject, sessionMode, project); err != nil {
+			return projectpkg.DetectionResult{}, err
 		}
 
 		exists, err := s.ProjectExists(project)
@@ -2709,12 +2733,8 @@ func resolveSaveWriteProject(s *store.Store, projectChoice string, explicitProje
 			if err != nil {
 				return projectpkg.DetectionResult{}, err
 			}
-			if resolvedProject != sessionProject {
-				return projectpkg.DetectionResult{}, &sessionProjectMismatchError{
-					SessionID:       trimmedSessionID,
-					SessionProject:  sessionProject,
-					ExplicitProject: resolvedProject,
-				}
+			if err := sessionProjectResolutionError(trimmedSessionID, sessionProject, sessionMode, resolvedProject); err != nil {
+				return projectpkg.DetectionResult{}, err
 			}
 		}
 		return res, nil
@@ -2988,6 +3008,9 @@ func writeProjectErrorResult(activity *SessionActivity, sessionID string, res pr
 	if errors.Is(err, store.ErrDatabaseGenerationChanged) {
 		return errorWithMeta("database_generation_changed", err.Error(), res.AvailableProjects)
 	}
+	if errors.Is(err, store.ErrProjectOwnershipAmbiguous) {
+		return errorWithMeta("session_project_ownership_ambiguous", err.Error(), res.AvailableProjects)
+	}
 	if errors.Is(err, projectpkg.ErrRepositoryBinding) {
 		return errorWithMeta(
 			"repository_binding_unavailable",
@@ -3165,8 +3188,12 @@ func errorWithMeta(code, msg string, availableProjects []string) *mcp.CallToolRe
 		envelope["hint"] = "Use a non-empty project name, not a path."
 	case "unknown_session":
 		envelope["hint"] = "Start the session first, omit session_id, or retry with an existing session_id."
+	case "session_already_ended":
+		envelope["hint"] = "Choose a new session ID and retry mem_session_start; ended sessions cannot be reopened."
 	case "session_project_mismatch":
 		envelope["hint"] = "Use a project that matches the existing session, or omit session_id and write to a different project."
+	case "session_project_ownership_ambiguous":
+		envelope["hint"] = "Use ownership rescue to classify the historical session before writing to a different project."
 	case "project_required":
 		envelope["hint"] = "Use ownership rescue before updating this historical record, then retry the field update."
 	case "project_mismatch":
