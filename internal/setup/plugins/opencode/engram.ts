@@ -210,8 +210,9 @@ function stripPrivateTags(str: string): string {
 // the thresholds are correct in every timezone.
 function toEpochSecs(ts: string): number | null {
   if (!ts) return null
-  const normalized = ts.includes("T") ? ts : ts.replace(" ", "T") + "Z"
-  const ms = new Date(normalized).getTime()
+  const normalized = ts.replace(" ", "T")
+  const utcTimestamp = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(normalized) ? normalized : `${normalized}Z`
+  const ms = new Date(utcTimestamp).getTime()
   return Number.isNaN(ms) ? null : Math.floor(ms / 1000)
 }
 

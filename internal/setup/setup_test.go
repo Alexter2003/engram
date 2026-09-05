@@ -3297,12 +3297,15 @@ func TestClaudeCodeUserPromptHookWithoutJQValidatesObservationArraysAndFirstSave
 		{name: "first save before save threshold", observations: "[]", sessionAge: 10 * time.Minute, wantNudge: false},
 		{name: "first save after save threshold", observations: "[]", sessionAge: 20 * time.Minute, wantNudge: true},
 		{name: "whitespace empty array", observations: " \n\t[ \r\n ] \n", sessionAge: 20 * time.Minute, wantNudge: true},
+		{name: "whitespace after object comma", observations: fmt.Sprintf("[{\"created_at\":%q, \n\t\"type\":\"bugfix\"}]", staleNaiveUTC), timezone: "EST5", wantNudge: true},
 		{name: "timezone-less UTC timestamp under EST5", observations: fmt.Sprintf(`[{"created_at":%q}]`, staleNaiveUTC), timezone: "EST5", wantNudge: true},
 		{name: "recent timezone-less UTC timestamp under JST-9", observations: fmt.Sprintf(`[{"created_at":%q}]`, recentNaiveUTC), timezone: "JST-9", wantNudge: false},
 		{name: "observations non-success response", observations: "[]", observationsStatus: http.StatusInternalServerError, wantNudge: false},
 		{name: "malformed payload", observations: "[{", wantNudge: false},
 		{name: "non-array payload", observations: `{}`, wantNudge: false},
 		{name: "non-empty array without timestamp", observations: `[{}]`, wantNudge: false},
+		{name: "non-empty array with null timestamp", observations: `[{"created_at":null}]`, wantNudge: false},
+		{name: "non-empty array with non-string timestamp", observations: `[{"created_at":42}]`, wantNudge: false},
 		{name: "non-empty array with invalid timestamp", observations: `[{"created_at":"invalid"}]`, wantNudge: false},
 	}
 
@@ -3367,6 +3370,93 @@ func TestClaudeCodeUserPromptHookWithoutJQValidatesObservationArraysAndFirstSave
 			output := runHook()
 			gotNudge := strings.Contains(output, "MEMORY REMINDER")
 			if gotNudge != tt.wantNudge {
+				t.Fatalf("second hook invocation nudge = %t, want %t; output: %q", gotNudge, tt.wantNudge, output)
+			}
+		})
+	}
+}
+
+func TestClaudeCodeUserPromptHookWithoutJQFirstSaveThresholdIsExact(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs the Claude Code shell hook as a child process")
+	}
+
+	const sessionID = "session-first-save-boundary"
+	fixedNow := time.Date(2025, time.January, 1, 0, 0, 0, 0, time.UTC)
+	bashEnvPath := filepath.Join(t.TempDir(), "fixed-date.sh")
+	bashEnv := fmt.Sprintf(`date() {
+case "$*" in
+  "+%%s") printf '%%d\n' %d ;;
+  *"2024-12-31 23:45:01"*) printf '%%d\n' %d ;;
+  *"2024-12-31 23:45:00"*) printf '%%d\n' %d ;;
+  *) return 1 ;;
+esac
+}
+`, fixedNow.Unix(), fixedNow.Add(-899*time.Second).Unix(), fixedNow.Add(-900*time.Second).Unix())
+	if err := os.WriteFile(bashEnvPath, []byte(bashEnv), 0o600); err != nil {
+		t.Fatalf("write fixed date environment: %v", err)
+	}
+
+	bashPath, pathDirs := isolatedHookPath(t)
+	scriptPath, err := filepath.Abs(filepath.Join("..", "..", "plugin", "claude-code", "scripts", "user-prompt-submit.sh"))
+	if err != nil {
+		t.Fatalf("resolve user prompt hook path: %v", err)
+	}
+
+	for _, tt := range []struct {
+		name      string
+		startedAt string
+		wantNudge bool
+	}{
+		{name: "899 seconds", startedAt: "2024-12-31 23:45:01", wantNudge: false},
+		{name: "900 seconds", startedAt: "2024-12-31 23:45:00", wantNudge: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/project/current":
+					_, _ = io.WriteString(w, `{"project":"hook-test","project_source":"config"}`)
+				case "/sessions/" + sessionID:
+					_, _ = fmt.Fprintf(w, `{"started_at":%q}`, tt.startedAt)
+				case "/observations":
+					_, _ = io.WriteString(w, "[]")
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			serverURL, err := url.Parse(server.URL)
+			if err != nil {
+				t.Fatalf("parse test server URL: %v", err)
+			}
+
+			env := withoutEnv(os.Environ(), "PATH", "TMPDIR", "BASH_ENV", "ENGRAM_PORT", "ENGRAM_CLAUDE_WINDOWS_BASH_SAFE_MODE", "ENGRAM_HOOK_MAX_TIME")
+			env = append(env,
+				"PATH="+strings.Join(pathDirs, string(os.PathListSeparator)),
+				"TMPDIR="+t.TempDir(),
+				"BASH_ENV="+bashEnvPath,
+				"ENGRAM_PORT="+serverURL.Port(),
+				"ENGRAM_CLAUDE_WINDOWS_BASH_SAFE_MODE=0",
+				"ENGRAM_HOOK_MAX_TIME=1",
+			)
+			runHook := func() string {
+				t.Helper()
+				cmd := exec.Command(bashPath, scriptPath)
+				cmd.Env = env
+				cmd.Stdin = strings.NewReader(`{"cwd":"/workspace","session_id":"` + sessionID + `"}`)
+				output, err := cmd.CombinedOutput()
+				if err != nil {
+					t.Fatalf("run user prompt hook without jq: %v\noutput: %s", err, output)
+				}
+				if !json.Valid(output) {
+					t.Fatalf("user prompt hook emitted invalid JSON %q", output)
+				}
+				return string(output)
+			}
+
+			runHook()
+			output := runHook()
+			if gotNudge := strings.Contains(output, "MEMORY REMINDER"); gotNudge != tt.wantNudge {
 				t.Fatalf("second hook invocation nudge = %t, want %t; output: %q", gotNudge, tt.wantNudge, output)
 			}
 		})

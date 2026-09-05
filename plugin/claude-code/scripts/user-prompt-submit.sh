@@ -205,6 +205,7 @@ json_parse_value_without_jq() {
         return 0
       fi
       while true; do
+        json_skip_whitespace_without_jq
         json_parse_string_without_jq || return 1
         json_skip_whitespace_without_jq
         [ "${JSON_PARSE_INPUT:JSON_PARSE_INDEX:1}" = ':' ] || return 1
@@ -654,11 +655,9 @@ if ! echo "$LAST_SAVE_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
   exit 0
 fi
 
-LAST_SAVE_AT=$(echo "$LAST_SAVE_JSON" | jq -r '.[0].created_at // empty')
-
 NOW_EPOCH=$(date "+%s")
 
-if [ -z "$LAST_SAVE_AT" ]; then
+if [ "$(echo "$LAST_SAVE_JSON" | jq 'length')" -eq 0 ]; then
   # No observations exist yet. Use the real session age so the first-save
   # reminder observes the same 15-minute threshold as existing saves.
   if [ -z "${SESSION_AGE_SECS:-}" ]; then
@@ -667,6 +666,12 @@ if [ -z "$LAST_SAVE_AT" ]; then
   fi
   ELAPSED="$SESSION_AGE_SECS"
 else
+  LAST_SAVE_AT=$(echo "$LAST_SAVE_JSON" | jq -r '.[0].created_at | if type == "string" then . else empty end')
+  if [ -z "$LAST_SAVE_AT" ]; then
+    # A non-empty response without a timestamp is incomplete, not a first save.
+    echo "$OUTPUT"
+    exit 0
+  fi
   # Parse last save timestamp and compare to now
   LAST_EPOCH=$(parse_epoch "$LAST_SAVE_AT")
   if [ -z "$LAST_EPOCH" ]; then

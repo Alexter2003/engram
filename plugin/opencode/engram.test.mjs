@@ -197,6 +197,9 @@ test("save nudge fails closed for malformed and non-array observation responses"
   for (const scenario of [
     { name: "malformed JSON", error: new SyntaxError("unexpected end of JSON input") },
     { name: "non-array JSON", response: { observations: [] } },
+    { name: "non-empty observation without timestamp", response: [{}] },
+    { name: "non-empty observation with null timestamp", response: [{ created_at: null }] },
+    { name: "non-empty observation with non-string timestamp", response: [{ created_at: 42 }] },
   ]) {
     await t.test(scenario.name, async (t) => {
       const runtime = await createRuntime(t, {
